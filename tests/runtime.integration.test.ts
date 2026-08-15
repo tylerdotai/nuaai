@@ -1756,6 +1756,81 @@ describe('agent runtime orchestration', () => {
     expect(requests[2]?.messages.at(-1)).toMatchObject({ role: 'system' });
   });
 
+  it('keeps a non-empty final response when tool activity reaches the turn limit', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let requests = 0;
+    const provider = makeAgentProvider('bounded-final', async function* () {
+      requests += 1;
+      if (requests === 1) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'workspace.list', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'The workspace inspection is complete.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...defaults,
+        limits: { ...defaults.limits, maxTurns: 2 },
+      },
+      store,
+      providers: providerMap({ 'bounded-final': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Bounded final response');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect the workspace',
+      provider: 'bounded-final',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'The workspace inspection is complete.',
+    });
+  });
+
+  it('fails with an explicit message when tool activity reaches the turn limit without final text', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = makeAgentProvider('turn-limit', async function* () {
+      yield { type: 'tool_call', id: 'tool-1', name: 'workspace.list', arguments: {} };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...defaults,
+        limits: { ...defaults.limits, maxTurns: 2 },
+      },
+      store,
+      providers: providerMap({ 'turn-limit': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Turn limit failure');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'keep working forever',
+      provider: 'turn-limit',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output:
+        'NUAAI could not verify completion: the tool-turn limit was reached before a final response.',
+    });
+  });
+
   it('fails a run when a tool error remains unresolved instead of reporting success', async () => {
     const root = await makeRoot();
     const store = makeStore(root);

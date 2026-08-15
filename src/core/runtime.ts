@@ -50,6 +50,12 @@ function isCapabilityRefusal(value: string): boolean {
   );
 }
 
+function looksLikeFutureIntent(value: string): boolean {
+  return /\b(?:i['’]ll|i will|let me)\s+(?:run|check|inspect|verify|try|look|explore|do)\b/i.test(
+    value,
+  );
+}
+
 export class AgentRuntime {
   private readonly listeners = new Set<RuntimeListener>();
   private readonly controllers = new Map<string, AbortController>();
@@ -313,6 +319,7 @@ export class AgentRuntime {
         },
       );
       let output = '';
+      let finalResponseAccepted = false;
       let toolCalls = 0;
       let toolActivity = false;
       let finalizationRequested = false;
@@ -496,7 +503,11 @@ export class AgentRuntime {
             );
             return;
           }
-          if (toolActivity && !finalizationRequested) {
+          if (
+            toolActivity &&
+            !finalizationRequested &&
+            (!turnOutput.text.trim() || looksLikeFutureIntent(turnOutput.text))
+          ) {
             output = '';
             finalizationRequested = true;
             messages.push({
@@ -507,6 +518,7 @@ export class AgentRuntime {
             continue;
           }
           output = turnOutput.text;
+          finalResponseAccepted = Boolean(output.trim()) && !looksLikeFutureIntent(output);
           break;
         }
         messages.push({
@@ -579,6 +591,24 @@ export class AgentRuntime {
             );
           }
         }
+      }
+      if (!finalResponseAccepted) {
+        output = toolActivity
+          ? 'NUAAI could not verify completion: the tool-turn limit was reached before a final response.'
+          : 'NUAAI could not produce a non-empty final response.';
+        this.options.store.addMessage(thread.id, 'assistant', output, provider.name, model);
+        this.options.store.updateRun(run.id, { status: 'failed', output });
+        this.emit(
+          'run.failed',
+          { error: output },
+          {
+            sessionId: thread.sessionId,
+            threadId: thread.id,
+            runId: run.id,
+            correlationId: run.correlationId,
+          },
+        );
+        return;
       }
       this.options.store.addMessage(thread.id, 'assistant', output, provider.name, model);
       this.options.store.updateRun(run.id, { status: 'completed', output });
