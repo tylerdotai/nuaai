@@ -4,7 +4,7 @@
   "description": "NUAAI — not ur avg ai",
   "type": "module",
   "bin": {
-    "nuaai": "./dist/cli.js"
+    "nuaai": "./scripts/nuaai.mjs"
   },
   "files": ["dist", "scripts", "deploy", "docs", "README.md", "LICENSE"],
   "repository": {

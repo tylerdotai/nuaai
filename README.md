@@ -82,7 +82,10 @@ cd nuaai
 npm install
 npm run build
 npm run build:web
+npm link
 ```
+
+`npm link` installs the checkout's executable wrapper into the local npm bin directory, making `nuaai tui`, `nuaai status`, and `nuaai run <input>` available from SSH shells. The direct checkout equivalent is `node scripts/nuaai.mjs tui`.
 
 ### One-line GitHub onboarding
 
