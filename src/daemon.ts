@@ -8,6 +8,7 @@ import { AgentRuntime } from './core/runtime.js';
 import { Scheduler } from './core/scheduler.js';
 import { acquireDaemonLock } from './gateway/lock.js';
 import { ensureRuntimeIdentity } from './gateway/runtime.js';
+import { LocalAudioBridge, handleAudioCommand } from './integrations/audio.js';
 import { MatrixBridge, matrixHelpText, parseMatrixCommand } from './integrations/matrix.js';
 import { McpManager } from './integrations/mcp.js';
 import {
@@ -133,6 +134,23 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
           workspaceRoot: resolvedRoot,
         })
       : undefined;
+  const audio = new LocalAudioBridge({
+    pythonCommand: effectiveConfig.audio.pythonCommand,
+    scriptPath: resolve(resolvedRoot, effectiveConfig.audio.scriptPath),
+    allowedRoot: resolvedRoot,
+    outputDirectory: resolve(resolvedRoot, effectiveConfig.audio.outputDirectory),
+    model: effectiveConfig.audio.model,
+    device: effectiveConfig.audio.device,
+    computeType: effectiveConfig.audio.computeType,
+    voice: effectiveConfig.audio.voice,
+    kokoroModelPath: effectiveConfig.audio.kokoroModelPath,
+    kokoroVoicesPath: effectiveConfig.audio.kokoroVoicesPath,
+    timeoutMs: effectiveConfig.audio.timeoutMs,
+  });
+  const voiceState = {
+    voiceEnabled: effectiveConfig.audio.voiceEnabled,
+    ttsEnabled: effectiveConfig.audio.ttsEnabled,
+  };
   const scheduledRuns = new Map<string, string>();
   const scheduler = new Scheduler(
     store,
@@ -256,6 +274,11 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
         const sourceKey = `matrix:${message.roomId}:${message.sender}`;
         const command = parseMatrixCommand(message.body);
         if (command) {
+          const audioCommandResponse = handleAudioCommand(command.name, command.args, voiceState);
+          if (audioCommandResponse) {
+            await matrix.sendText(message.roomId, audioCommandResponse);
+            return;
+          }
           if (command.name === 'help' || command.name === 'start') {
             await matrix.sendText(message.roomId, matrixHelpText());
             return;
@@ -330,7 +353,31 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
         progressByThread.set(created.thread.id, progress);
         await flushProgress(progress);
         const images: ProviderImage[] = [];
+        const transcriptions: string[] = [];
         for (const attachment of message.attachments ?? []) {
+          const isSpeechMedia =
+            attachment.mimeType?.startsWith('audio/') || attachment.mimeType?.startsWith('video/');
+          if (isSpeechMedia) {
+            if (!attachment.localPath) {
+              attachment.error = 'Speech media was not downloaded';
+              continue;
+            }
+            if (!voiceState.voiceEnabled) {
+              attachment.error = 'Voice input is disabled; use /voice on';
+              continue;
+            }
+            try {
+              const transcript = await audio.transcribe(attachment.localPath);
+              if (transcript.text) {
+                transcriptions.push(`Transcript from ${attachment.name}: ${transcript.text}`);
+              } else {
+                attachment.error = 'No speech was detected';
+              }
+            } catch (error) {
+              attachment.error = error instanceof Error ? error.message : String(error);
+            }
+            continue;
+          }
           if (
             !attachment.localPath ||
             attachment.error ||
@@ -356,14 +403,17 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
           attachment.localPath && !attachment.error
             ? attachment.mimeType?.startsWith('image/')
               ? `Attachment ${attachment.name}: image available to the vision model.`
-              : `Attachment ${attachment.name}: ${attachment.localPath}`
+              : attachment.mimeType?.startsWith('audio/') ||
+                  attachment.mimeType?.startsWith('video/')
+                ? `Attachment ${attachment.name}: speech media was transcribed below.`
+                : `Attachment ${attachment.name}: ${attachment.localPath}`
             : `Attachment ${attachment.name}: unavailable (${attachment.error ?? 'not downloaded'})`,
         );
         let runId: string | undefined;
         try {
           const run = runtime.startRun({
             threadId: created.thread.id,
-            input: [message.body, ...(attachmentContext ?? [])].join('\n'),
+            input: [message.body, ...(attachmentContext ?? []), ...transcriptions].join('\n'),
             permissions: {
               approved: new Set(['read', 'write', 'execute']),
               capabilities: { filesystem: true, subprocess: true, network: true },
@@ -386,6 +436,14 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
           );
           await flushProgress(progress);
           await matrix.sendOutput(message.roomId, output.slice(0, 60_000));
+          if (voiceState.ttsEnabled && completed.status === 'completed') {
+            try {
+              const speech = await audio.synthesize(output.slice(0, 20_000));
+              await matrix.sendAudio(message.roomId, speech.path);
+            } catch (error) {
+              reportMatrixSignalFailure('voice response', error);
+            }
+          }
         } finally {
           if (progress.timer) clearTimeout(progress.timer);
           progressByThread.delete(created.thread.id);

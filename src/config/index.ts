@@ -30,6 +30,21 @@ const matrixSchema = z.object({
   pollTimeoutMs: z.number().int().positive().max(120_000).default(25_000),
 });
 
+const audioSchema = z.object({
+  voiceEnabled: z.boolean().default(false),
+  ttsEnabled: z.boolean().default(false),
+  pythonCommand: z.string().default('python3'),
+  scriptPath: z.string().default('scripts/voice-bridge.py'),
+  outputDirectory: z.string().default('.nuaai/audio'),
+  model: z.string().default('small'),
+  device: z.string().default('cpu'),
+  computeType: z.string().default('int8'),
+  voice: z.string().default('af_sarah'),
+  kokoroModelPath: z.string().default(''),
+  kokoroVoicesPath: z.string().default(''),
+  timeoutMs: z.number().int().positive().max(600_000).default(180_000),
+});
+
 const featureSchema = z.object({
   ollama: z.boolean().default(true),
   codex: z.boolean().default(true),
@@ -68,6 +83,7 @@ export const runtimeConfigSchema = z.object({
     .default({}),
   search: searchSchema.default({}),
   matrix: matrixSchema.default({}),
+  audio: audioSchema.default({}),
   mcp: z
     .object({
       enabled: z.boolean().default(false),

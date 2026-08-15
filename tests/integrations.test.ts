@@ -1,9 +1,14 @@
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import {
+  LocalAudioBridge,
+  LocalTranscriber,
+  handleAudioCommand,
+} from '../src/integrations/audio.js';
 import {
   MatrixBridge,
   extractMatrixMessages,
@@ -28,6 +33,177 @@ function response(body: unknown, status = 200): Response {
     headers: { 'content-type': 'application/json' },
   });
 }
+
+describe('audio integration', () => {
+  it('keeps voice and TTS controls independent and command-driven', () => {
+    const state = { voiceEnabled: false, ttsEnabled: false };
+    expect(handleAudioCommand('voice', ['status'], state)).toBe('voice is off.');
+    expect(handleAudioCommand('voice', ['on'], state)).toBe('voice enabled.');
+    expect(state).toEqual({ voiceEnabled: true, ttsEnabled: false });
+    expect(handleAudioCommand('tts', ['enable'], state)).toBe('tts enabled.');
+    expect(state).toEqual({ voiceEnabled: true, ttsEnabled: true });
+    expect(handleAudioCommand('tts', ['off'], state)).toBe('tts disabled.');
+    expect(handleAudioCommand('unknown', ['on'], state)).toBeUndefined();
+  });
+  it('runs the configured local transcriber and parses its JSON result', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuaai-audio-'));
+    const helper = join(root, 'transcriber.mjs');
+    const input = join(root, 'sample.wav');
+    await writeFile(
+      helper,
+      `process.stdout.write(JSON.stringify({ text: 'local transcript', language: 'en', segments: [] }));\n`,
+    );
+    await chmod(helper, 0o755);
+    await writeFile(input, 'audio');
+    const transcriber = new LocalTranscriber({
+      pythonCommand: process.execPath,
+      scriptPath: helper,
+      allowedRoot: root,
+      outputDirectory: root,
+      model: 'small',
+      device: 'cpu',
+      computeType: 'int8',
+      voice: 'af_sarah',
+      kokoroModelPath: 'model.onnx',
+      kokoroVoicesPath: 'voices.bin',
+      timeoutMs: 5_000,
+    });
+
+    await expect(transcriber.transcribe(input)).resolves.toEqual({
+      text: 'local transcript',
+      language: 'en',
+      segments: [],
+    });
+  });
+
+  it('rejects transcriber paths outside the configured attachment root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuaai-audio-'));
+    const helper = join(root, 'transcriber.mjs');
+    await writeFile(helper, `process.stdout.write(JSON.stringify({ text: 'unexpected' }));\n`);
+    await chmod(helper, 0o755);
+    const transcriber = new LocalTranscriber({
+      pythonCommand: process.execPath,
+      scriptPath: helper,
+      allowedRoot: root,
+      outputDirectory: root,
+      model: 'small',
+      device: 'cpu',
+      computeType: 'int8',
+      voice: 'af_sarah',
+      kokoroModelPath: 'model.onnx',
+      kokoroVoicesPath: 'voices.bin',
+      timeoutMs: 5_000,
+    });
+
+    await expect(transcriber.transcribe('/tmp/outside.wav')).rejects.toThrow(
+      'Transcription input escapes the allowed root',
+    );
+  });
+  it('runs the configured TTS helper and verifies the output artifact', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuaai-audio-'));
+    const helper = join(root, 'voice-bridge.mjs');
+    await writeFile(
+      helper,
+      `import { writeFile } from 'node:fs/promises';
+const output = process.argv[process.argv.indexOf('--output') + 1];
+await writeFile(output, 'wav');
+process.stdout.write(JSON.stringify({ path: output, mimeType: 'audio/wav' }));
+`,
+    );
+    await chmod(helper, 0o755);
+    const bridge = new LocalAudioBridge({
+      pythonCommand: process.execPath,
+      scriptPath: helper,
+      allowedRoot: root,
+      outputDirectory: join(root, 'audio'),
+      model: 'small',
+      device: 'cpu',
+      computeType: 'int8',
+      voice: 'af_sarah',
+      kokoroModelPath: 'model.onnx',
+      kokoroVoicesPath: 'voices.bin',
+      timeoutMs: 5_000,
+    });
+
+    const result = await bridge.synthesize('speak this');
+    expect(result.mimeType).toBe('audio/wav');
+    await expect(readFile(result.path, 'utf8')).resolves.toBe('wav');
+  });
+  it('rejects invalid helper output, helper failures, timeouts, and missing inputs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuaai-audio-errors-'));
+    const input = join(root, 'sample.wav');
+    await writeFile(input, 'audio');
+    let helperIndex = 0;
+    const makeTranscriber = async (body: string, timeoutMs = 5_000) => {
+      const helper = join(root, `helper-${helperIndex++}.mjs`);
+      await writeFile(helper, body);
+      await chmod(helper, 0o755);
+      return new LocalTranscriber({
+        pythonCommand: process.execPath,
+        scriptPath: helper,
+        allowedRoot: root,
+        outputDirectory: root,
+        model: 'small',
+        device: 'cpu',
+        computeType: 'int8',
+        voice: 'af_sarah',
+        kokoroModelPath: 'model.onnx',
+        kokoroVoicesPath: 'voices.bin',
+        timeoutMs,
+      });
+    };
+
+    await expect(
+      (await makeTranscriber("process.stderr.write('boom'); process.exit(3);\n")).transcribe(input),
+    ).rejects.toThrow('Audio helper failed: boom');
+    await expect(
+      (await makeTranscriber("process.stdout.write('not json');\n")).transcribe(input),
+    ).rejects.toThrow('Audio helper returned invalid JSON');
+    await expect(
+      (await makeTranscriber("process.stdout.write('[]');\n")).transcribe(input),
+    ).rejects.toThrow('Audio helper returned a non-object result');
+    await expect(
+      (await makeTranscriber('setTimeout(() => {}, 1000);\n', 10)).transcribe(input),
+    ).rejects.toThrow('Audio helper timed out');
+    await expect(
+      (await makeTranscriber("process.stdout.write('x'.repeat(2000001));\n")).transcribe(input),
+    ).rejects.toThrow('Audio helper output exceeded');
+    await expect(
+      (await makeTranscriber('{}')).transcribe(join(root, 'missing.wav')),
+    ).rejects.toThrow('not a regular file');
+  });
+
+  it('rejects unsafe output configuration and invalid speech requests', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuaai-audio-invalid-'));
+    const helper = join(root, 'helper.mjs');
+    await writeFile(helper, "process.stdout.write('{}');\n");
+    await chmod(helper, 0o755);
+    const config = {
+      pythonCommand: process.execPath,
+      scriptPath: helper,
+      allowedRoot: root,
+      outputDirectory: join(root, 'audio'),
+      model: 'small',
+      device: 'cpu',
+      computeType: 'int8',
+      voice: 'af_sarah',
+      kokoroModelPath: 'model.onnx',
+      kokoroVoicesPath: 'voices.bin',
+      timeoutMs: 5_000,
+    };
+    expect(() => new LocalAudioBridge({ ...config, outputDirectory: join(root, '..') })).toThrow(
+      'Audio output directory escapes the allowed root',
+    );
+    const bridge = new LocalAudioBridge(config);
+    await expect(bridge.synthesize('   ')).rejects.toThrow('Cannot synthesize empty text');
+    await expect(bridge.synthesize('x'.repeat(20_001))).rejects.toThrow(
+      'Speech input exceeds the configured limit',
+    );
+    await expect(bridge.synthesize('missing output')).rejects.toThrow(
+      'Audio helper did not produce a WAV file',
+    );
+  });
+});
 
 describe('search integration', () => {
   it('normalizes local SearXNG JSON results', async () => {
@@ -452,6 +628,31 @@ describe('Matrix integration', () => {
       msgtype: 'm.file',
       body: 'AGENTS.md',
       url: 'mxc://matrix.test/uploaded',
+    });
+  });
+
+  it('uploads synthesized voice responses as Matrix audio events', async () => {
+    const calls: Array<{ method?: string; body?: string }> = [];
+    const bridge = new MatrixBridge(
+      {
+        homeserverUrl: 'https://matrix.test',
+        accessToken: 'token',
+        userId: '@bot:example.org',
+        workspaceRoot: process.cwd(),
+      },
+      async (_url, init) => {
+        calls.push({ method: init?.method, body: String(init?.body ?? '') });
+        return init?.method === 'POST'
+          ? response({ content_uri: 'mxc://matrix.test/audio' })
+          : response({ event_id: '$audio-sent' });
+      },
+    );
+
+    await bridge.sendAudio('!room:example.org', join(process.cwd(), 'AGENTS.md'));
+    expect(JSON.parse(calls[1].body ?? '{}')).toMatchObject({
+      msgtype: 'm.audio',
+      url: 'mxc://matrix.test/audio',
+      info: { mimetype: 'audio/wav' },
     });
   });
 

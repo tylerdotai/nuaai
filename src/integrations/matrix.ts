@@ -51,6 +51,8 @@ export function matrixHelpText(): string {
     '`/sessions` — list sessions available in this room',
     '`/new [title]` — start a fresh session',
     '`/switch <session-id>` — switch the active session',
+    '`/voice on|off|status` — control microphone/audio transcription',
+    '`/tts on|off|status` — control spoken responses',
     '',
     'Send any other text to run it through NUAAI.',
   ].join('\n');
@@ -411,7 +413,11 @@ export class MatrixBridge {
     assertOk(response);
   }
 
-  async sendFile(roomId: string, path: string): Promise<{ eventId: string }> {
+  async sendFile(
+    roomId: string,
+    path: string,
+    options: { msgtype?: 'm.file' | 'm.audio'; mimeType?: string } = {},
+  ): Promise<{ eventId: string }> {
     const root = this.config.workspaceRoot ? resolve(this.config.workspaceRoot) : undefined;
     const target = resolve(path);
     if (root && target !== root && !target.startsWith(`${root}${sep}`))
@@ -446,17 +452,24 @@ export class MatrixBridge {
         'content-type': 'application/json',
       },
       body: JSON.stringify({
-        msgtype: 'm.file',
+        msgtype: options.msgtype ?? 'm.file',
         body: basename(target),
         filename: basename(target),
         url: uploaded.content_uri,
-        info: { size: bytes.byteLength },
+        info: {
+          size: bytes.byteLength,
+          ...(options.mimeType ? { mimetype: options.mimeType } : {}),
+        },
       }),
     });
     assertOk(sendResponse);
     const sent = (await sendResponse.json()) as { event_id?: string };
     if (!sent.event_id) throw new Error('Matrix file send response did not include event_id');
     return { eventId: sent.event_id };
+  }
+
+  async sendAudio(roomId: string, path: string): Promise<{ eventId: string }> {
+    return this.sendFile(roomId, path, { msgtype: 'm.audio', mimeType: 'audio/wav' });
   }
 
   async sendOutput(roomId: string, output: string): Promise<void> {

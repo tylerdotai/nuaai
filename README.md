@@ -50,8 +50,9 @@ The default path is local Ollama. Optional integrations are explicit: Codex uses
 - Ollama chat and embedding adapters through the local HTTP API.
 - Optional Codex CLI adapter using `codex exec --json`.
 - Matrix bridge with invite auto-join and outbound replies.
-- Matrix source-bound sessions with `/help`, `/status`, `/sessions`, `/new [title]`, and `/switch <session-id>` commands.
+- Matrix source-bound sessions with `/help`, `/status`, `/sessions`, `/new [title]`, `/switch <session-id>`, `/voice on|off|status`, and `/tts on|off|status` commands.
 - Matrix file, image, audio, video, and sticker ingestion with bounded private staging and `MEDIA:` file delivery.
+- Optional local voice input/output: Matrix audio and video attachments can use Faster-Whisper transcription, and completed responses can return Kokoro WAV audio. Text remains primary; voice input and TTS are independently disabled by default and require explicit runtime commands.
 - Local web search through SearXNG with DuckDuckGo fallback.
 - Local page extraction through Crawl4AI → Playwright → FlareSolverr fallback order.
 - Headless Playwright browser automation with HTTP/HTTPS URL validation.
@@ -188,7 +189,7 @@ Network-backed tools require the runtime network capability. Tool registration f
 
 The command tool is intentionally allowlisted rather than an unrestricted shell. MCP and computer-use servers are disabled by default and require explicit local configuration plus matching permissions.
 
-For Matrix sessions, ordinary messages from the same room and sender reuse the same durable source-bound session. Use `/help` for the command list, `/status` for the active session, `/new [title]` to create a fresh session, `/sessions` to list the room's sessions, and `/switch <session-id>` to change the active session. Unknown slash commands return help instead of being sent to the model.
+For Matrix sessions, ordinary messages from the same room and sender reuse the same durable source-bound session. Use `/help` for the command list, `/status` for the active session, `/new [title]` to create a fresh session, `/sessions` to list the room's sessions, and `/switch <session-id>` to change the active session. Voice input and TTS are independent optional features: `/voice on|off|status` controls microphone/audio/video transcription, while `/tts on|off|status` controls spoken response delivery. Unknown slash commands return help instead of being sent to the model.
 
 ## Phone access
 
@@ -228,6 +229,7 @@ Then open `http://127.0.0.1:$PORT` in a browser on the phone while the tunnel is
 7. Create a room with encryption disabled. NUAAI currently reads standard `m.room.message` events and does not decrypt E2EE rooms.
 8. Invite the NUAAI bot ID printed by the local setup command. The bridge automatically joins invited rooms.
 9. Send a normal text message and wait for the daemon-backed response.
+10. To use voice messages, send `/voice on`; to receive spoken responses, send `/tts on`. Both features start disabled and can be turned off with the matching `off` command.
 
 Do not use Tailscale Funnel or a public internet bind for this setup. Serve is intended to keep Matrix inside the tailnet.
 
@@ -272,9 +274,24 @@ The daemon is the source of truth. Clients do not call providers directly or mai
     "search": true,
     "browser": true,
     "telemetry": false
+  },
+  "audio": {
+    "voiceEnabled": false,
+    "ttsEnabled": false,
+    "pythonCommand": "/path/to/voice-agent/.venv/bin/python",
+    "scriptPath": "scripts/voice-bridge.py",
+    "outputDirectory": ".nuaai/audio",
+    "model": "small",
+    "device": "cpu",
+    "computeType": "int8",
+    "voice": "af_sarah",
+    "kokoroModelPath": "/path/to/kokoro-v1.0.onnx",
+    "kokoroVoicesPath": "/path/to/voices-v1.0.bin"
   }
 }
 ```
+
+The audio paths are local configuration examples only. Do not commit host-specific paths or model assets. `voiceEnabled` and `ttsEnabled` are independent startup defaults; Matrix commands can toggle either feature for the running daemon.
 
 NUAAI generates distinct high loopback ports for the daemon, Synapse, SearXNG, Crawl4AI, and FlareSolverr during initialization. The generated values are written to `.nuaai/config.json` and the ignored Docker environment file; do not copy fixed service-port examples into production configuration.
 
