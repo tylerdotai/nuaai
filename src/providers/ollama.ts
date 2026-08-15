@@ -1,6 +1,7 @@
 import type {
   ProviderAdapter,
   ProviderHealth,
+  ProviderMessage,
   ProviderRequest,
   ProviderStreamEvent,
 } from './types.js';
@@ -10,6 +11,34 @@ interface OllamaConfig {
   model: string;
   embeddingModel: string;
 }
+
+interface OllamaToolCall {
+  id?: string;
+  type?: string;
+  function?: {
+    index?: number;
+    name?: string;
+    arguments?: Record<string, unknown> | string;
+  };
+}
+
+interface OllamaMessage {
+  content?: string;
+  tool_calls?: OllamaToolCall[];
+}
+
+interface OllamaChatChunk {
+  message?: OllamaMessage;
+  done?: boolean;
+  error?: string;
+}
+
+type CollectedToolCall = {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  rawArguments: string;
+};
 
 function withAbort(
   signal: AbortSignal | undefined,
@@ -31,6 +60,38 @@ function withAbort(
   };
 }
 
+function ollamaMessage(message: ProviderMessage): Record<string, unknown> {
+  return {
+    role: message.role,
+    content: message.content,
+    ...(message.toolName ? { tool_name: message.toolName } : {}),
+    ...(message.toolCalls?.length
+      ? {
+          tool_calls: message.toolCalls.map((call, index) => ({
+            type: 'function',
+            function: {
+              index,
+              name: call.name,
+              arguments: call.arguments,
+            },
+          })),
+        }
+      : {}),
+  };
+}
+
+function parseToolArguments(tool: CollectedToolCall): Record<string, unknown> {
+  if (!tool.rawArguments) return tool.arguments;
+  try {
+    const parsed = JSON.parse(tool.rawArguments) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 export class OllamaProvider implements ProviderAdapter {
   readonly name = 'ollama';
   readonly model: string;
@@ -47,25 +108,68 @@ export class OllamaProvider implements ProviderAdapter {
 
   async *stream(request: ProviderRequest): AsyncIterable<ProviderStreamEvent> {
     const requestControl = withAbort(request.signal, this.timeoutMs);
+    const toolCalls = new Map<string, CollectedToolCall>();
+    let fallbackIndex = 0;
     try {
       const response = await fetch(`${this.baseUrl}/api/chat`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           model: request.model || this.model,
-          messages: request.messages,
+          messages: request.messages.map(ollamaMessage),
           stream: true,
-          ...(request.tools?.length ? { tools: request.tools } : {}),
+          ...(request.tools?.length
+            ? {
+                tools: request.tools.map((tool) => ({
+                  type: 'function',
+                  function: {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                  },
+                })),
+              }
+            : {}),
         }),
         signal: requestControl.signal,
       });
-      if (!response.ok || !response.body) {
+      if (!response.ok || !response.body)
         throw new Error(`Ollama chat failed: ${response.status} ${await response.text()}`);
-      }
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let pending = '';
       let output = '';
+      const collect = (calls: OllamaToolCall[]): void => {
+        for (const call of calls) {
+          const functionCall = call.function;
+          if (!functionCall?.name) continue;
+          const index = functionCall.index;
+          const key =
+            index === undefined ? (call.id ?? `fallback:${fallbackIndex++}`) : `index:${index}`;
+          const existing = toolCalls.get(key) ?? {
+            id: call.id ?? crypto.randomUUID(),
+            name: functionCall.name,
+            arguments: {},
+            rawArguments: '',
+          };
+          existing.name = functionCall.name;
+          if (typeof functionCall.arguments === 'string')
+            existing.rawArguments += functionCall.arguments;
+          else if (functionCall.arguments) existing.arguments = functionCall.arguments;
+          toolCalls.set(key, existing);
+        }
+      };
+      const consume = (line: string): string => {
+        if (!line.trim()) return '';
+        const value = JSON.parse(line) as OllamaChatChunk;
+        if (value.error) throw new Error(`Ollama error: ${value.error}`);
+        const content = value.message?.content ?? '';
+        if (content) {
+          output += content;
+        }
+        collect(value.message?.tool_calls ?? []);
+        return content;
+      };
       while (true) {
         const chunk = await reader.read();
         if (chunk.done) break;
@@ -73,44 +177,23 @@ export class OllamaProvider implements ProviderAdapter {
         const lines = pending.split('\n');
         pending = lines.pop() ?? '';
         for (const line of lines) {
-          if (!line.trim()) continue;
-          const value = JSON.parse(line) as {
-            message?: {
-              content?: string;
-              tool_calls?: Array<{
-                function?: { name?: string; arguments?: Record<string, unknown> };
-              }>;
-            };
-            done?: boolean;
-            error?: string;
-          };
-          if (value.error) throw new Error(`Ollama error: ${value.error}`);
-          const content = value.message?.content ?? '';
-          if (content) {
-            output += content;
-            yield { type: 'delta', text: content };
-          }
-          for (const tool of value.message?.tool_calls ?? []) {
-            if (tool.function?.name)
-              yield {
-                type: 'tool_call',
-                id: crypto.randomUUID(),
-                name: tool.function.name,
-                arguments: tool.function.arguments ?? {},
-              };
-          }
-          if (value.done) yield { type: 'done', text: output };
+          const content = consume(line);
+          if (content) yield { type: 'delta', text: content };
         }
       }
+      pending += decoder.decode();
       if (pending.trim()) {
-        const value = JSON.parse(pending) as { message?: { content?: string }; done?: boolean };
-        const content = value.message?.content ?? '';
-        if (content) {
-          output += content;
-          yield { type: 'delta', text: content };
-        }
-        if (value.done) yield { type: 'done', text: output };
+        const content = consume(pending);
+        if (content) yield { type: 'delta', text: content };
       }
+      for (const tool of toolCalls.values())
+        yield {
+          type: 'tool_call',
+          id: tool.id,
+          name: tool.name,
+          arguments: parseToolArguments(tool),
+        };
+      yield { type: 'done', text: output };
     } finally {
       requestControl.cleanup();
     }

@@ -4,6 +4,14 @@ export interface ProviderMessage {
   role: MessageRole;
   content: string;
   toolCallId?: string;
+  toolName?: string;
+  toolCalls?: ProviderToolCall[];
+}
+
+export interface ProviderToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
 }
 
 export interface ProviderTool {

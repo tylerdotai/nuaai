@@ -11,6 +11,8 @@ test('built web client creates a session and renders a live daemon run', async (
   await expect(page.locator('.session')).toHaveCount(initialSessionCount + 1);
   await expect(page.locator('.session.selected strong')).toHaveText(/Session \d+/);
   await expect(page.locator('.session.selected')).toBeVisible();
+  const createdSessionTitle = await page.locator('.session.selected strong').textContent();
+  expect(createdSessionTitle).toBeTruthy();
   await expect(page.getByText('ACTIVE THREAD', { exact: true })).toBeVisible();
 
   const composer = page.getByPlaceholder('Ask NUAAI anything…');
@@ -38,6 +40,10 @@ test('built web client creates a session and renders a live daemon run', async (
   await expect(page.getByRole('button', { name: 'Cancel run' })).toHaveCount(0);
 
   await page.reload();
+  await page
+    .locator('.session')
+    .filter({ hasText: createdSessionTitle ?? '' })
+    .click();
   await expect(page.locator('.message.user').filter({ hasText: 'browser smoke' })).toHaveCount(1);
   await expect(page.getByText('persistent', { exact: true })).toBeVisible();
 

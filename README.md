@@ -197,12 +197,13 @@ Then open `http://127.0.0.1:$PORT` in a browser on the phone while the tunnel is
 
 1. Complete onboarding with Matrix and Tailscale Serve enabled.
 2. Confirm the local Synapse container is healthy.
-3. Open Element on iOS and select **Sign in** or **Create account**.
-4. Use the Tailscale HTTPS hostname shown by `tailscale serve status` as the homeserver URL.
-5. Create or sign in to a local Matrix account.
-6. Create a room with encryption disabled. NUAAI currently reads standard `m.room.message` events and does not decrypt E2EE rooms.
-7. Invite the NUAAI bot ID printed by the local setup command. The bridge automatically joins invited rooms.
-8. Send a normal text message and wait for the daemon-backed response.
+3. Install and open **Element Classic** on iOS. Element X requires Matrix Authentication Service (MAS), which is not part of the local Synapse deployment.
+4. Select **Sign in** or **Create account**.
+5. Use the Tailscale HTTPS hostname shown by `tailscale serve status` as the homeserver URL.
+6. Create or sign in to a local Matrix account.
+7. Create a room with encryption disabled. NUAAI currently reads standard `m.room.message` events and does not decrypt E2EE rooms.
+8. Invite the NUAAI bot ID printed by the local setup command. The bridge automatically joins invited rooms.
+9. Send a normal text message and wait for the daemon-backed response.
 
 Do not use Tailscale Funnel or a public internet bind for this setup. Serve is intended to keep Matrix inside the tailnet.
 

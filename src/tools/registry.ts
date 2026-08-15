@@ -165,12 +165,18 @@ export class ToolRegistry {
   list(): ToolDefinition[] {
     return [...this.tools.values()].sort((left, right) => left.name.localeCompare(right.name));
   }
-  schemas(): Array<{ name: string; description: string; parameters: Record<string, unknown> }> {
-    return this.list().map(({ name, description, parameters }) => ({
-      name,
-      description,
-      parameters,
-    }));
+  schemas(permissions?: PermissionContext): Array<{
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  }> {
+    return this.list()
+      .filter((tool) => !permissions || permissions.approved.has(tool.permission))
+      .map(({ name, description, parameters }) => ({
+        name,
+        description,
+        parameters,
+      }));
   }
   async execute(name: string, input: unknown, context: ToolContext): Promise<unknown> {
     const tool = this.tools.get(name);

@@ -249,6 +249,30 @@ export class AgentRuntime {
       } catch {
         memoryContext = '';
       }
+      const availableTools = this.options.tools.schemas(permissions);
+      const messages: ProviderMessage[] = [
+        {
+          role: 'system',
+          content: [
+            'You are NUAAI, a persistent local-first personal agent.',
+            `The active provider is ${provider.name} and the active model is ${model}.`,
+            'You are running an agent loop with real tools.',
+            availableTools.length
+              ? `Available tools:\n${availableTools.map((tool) => `- ${tool.name}: ${tool.description}`).join('\n')}`
+              : 'No tools are available for this run.',
+            'When a user asks for information or an action that an available tool can perform, call that tool instead of claiming the tool is unavailable.',
+            'Only tools listed above are available. Report permission errors honestly.',
+            ...(memoryContext ? [`Relevant persisted memory:\n${memoryContext}`] : []),
+          ].join('\n'),
+        },
+        ...this.options.store
+          .listMessages(thread.id, 200)
+          .filter((message) => message.role !== 'tool')
+          .map((message) => ({
+            role: message.role as ProviderMessage['role'],
+            content: message.content,
+          })),
+      ];
       for (let turn = 0; turn < this.options.config.limits.maxTurns; turn += 1) {
         const current = this.options.store.getRun(run.id);
         if (!current || current.cancelRequested || controller.signal.aborted) {
@@ -265,16 +289,6 @@ export class AgentRuntime {
           );
           return;
         }
-        const messages: ProviderMessage[] = [
-          {
-            role: 'system',
-            content: `You are NUAAI, a persistent local-first personal agent. Use available tools only when needed. Be precise and report unavailable capabilities honestly.${memoryContext ? `\nRelevant persisted memory:\n${memoryContext}` : ''}`,
-          },
-          ...this.options.store.listMessages(thread.id, 200).map((message) => ({
-            role: message.role as ProviderMessage['role'],
-            content: message.content,
-          })),
-        ];
         const turnOutput = {
           text: '',
           calls: [] as Array<{ id: string; name: string; arguments: Record<string, unknown> }>,
@@ -292,7 +306,7 @@ export class AgentRuntime {
         for await (const event of provider.stream({
           model,
           messages,
-          tools: this.options.tools.schemas(),
+          tools: availableTools,
           signal: controller.signal,
         })) {
           if (event.type === 'delta') {
@@ -310,7 +324,16 @@ export class AgentRuntime {
                 correlationId: run.correlationId,
               },
             );
-          } else if (event.type === 'tool_call') turnOutput.calls.push(event);
+          } else if (event.type === 'tool_call')
+            turnOutput.calls.push({
+              id: event.id,
+              name: event.name,
+              arguments: event.arguments,
+            });
+          else if (event.type === 'done' && !turnOutput.text && event.text) {
+            turnOutput.text = event.text;
+            output += event.text;
+          }
         }
         const currentAfterStream = this.options.store.getRun(run.id);
         if (currentAfterStream?.cancelRequested || controller.signal.aborted) {
@@ -338,6 +361,11 @@ export class AgentRuntime {
           },
         );
         if (!turnOutput.calls.length) break;
+        messages.push({
+          role: 'assistant',
+          content: turnOutput.text,
+          toolCalls: turnOutput.calls,
+        });
         for (const call of turnOutput.calls) {
           toolCalls += 1;
           if (toolCalls > this.options.config.limits.maxToolCalls)
@@ -358,7 +386,14 @@ export class AgentRuntime {
               permissions,
               timeoutMs: this.options.config.limits.toolTimeoutMs,
             });
-            this.options.store.addMessage(thread.id, 'tool', JSON.stringify(result));
+            const toolContent = JSON.stringify(result);
+            this.options.store.addMessage(thread.id, 'tool', toolContent);
+            messages.push({
+              role: 'tool',
+              content: toolContent,
+              toolCallId: call.id,
+              toolName: call.name,
+            });
             this.emit(
               'tool.completed',
               { name: call.name, result },
@@ -371,7 +406,14 @@ export class AgentRuntime {
             );
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            this.options.store.addMessage(thread.id, 'tool', JSON.stringify({ error: message }));
+            const toolContent = JSON.stringify({ error: message });
+            this.options.store.addMessage(thread.id, 'tool', toolContent);
+            messages.push({
+              role: 'tool',
+              content: toolContent,
+              toolCallId: call.id,
+              toolName: call.name,
+            });
             this.emit(
               'tool.failed',
               { name: call.name, error: message },

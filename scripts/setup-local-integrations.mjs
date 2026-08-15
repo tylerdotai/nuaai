@@ -287,6 +287,10 @@ async function enableDaemonMatrix(serverName, synapsePort) {
     homeserverUrl: `http://127.0.0.1:${synapsePort}`,
     userId: `@nuaai:${serverName}`,
   };
+  config.features = {
+    ...(config.features ?? {}),
+    matrix: true,
+  };
   await mkdir(dirname(configFile), { recursive: true });
   await writeFile(configFile, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 }

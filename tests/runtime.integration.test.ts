@@ -956,6 +956,62 @@ describe('providers and scheduler', () => {
     }
   });
 
+  it('serializes Ollama tools using the official shape and aggregates streamed tool calls', async () => {
+    const originalFetch = globalThis.fetch;
+    let requestBody: Record<string, unknown> | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return responseStream([
+        JSON.stringify({
+          message: {
+            tool_calls: [
+              {
+                id: 'call-1',
+                function: { index: 0, name: 'workspace.list', arguments: {} },
+              },
+            ],
+          },
+        }),
+        JSON.stringify({ message: { content: '' }, done: true }),
+      ]);
+    }) as typeof fetch;
+    try {
+      const provider = new OllamaProvider(
+        { baseUrl: 'http://ollama.local', model: 'chat-model', embeddingModel: 'embed-model' },
+        5_000,
+      );
+      const events: ProviderStreamEvent[] = [];
+      for await (const event of provider.stream({
+        model: 'chat-model',
+        messages: [{ role: 'user', content: 'list files' }],
+        tools: [
+          {
+            name: 'workspace.list',
+            description: 'List files',
+            parameters: { type: 'object', properties: {} },
+          },
+        ],
+      }))
+        events.push(event);
+      expect(requestBody?.tools).toEqual([
+        {
+          type: 'function',
+          function: {
+            name: 'workspace.list',
+            description: 'List files',
+            parameters: { type: 'object', properties: {} },
+          },
+        },
+      ]);
+      expect(events).toEqual([
+        { type: 'tool_call', id: 'call-1', name: 'workspace.list', arguments: {} },
+        { type: 'done', text: '' },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('executes Codex through a real subprocess boundary', async () => {
     const root = await makeRoot();
     const executable = join(root, 'codex-fake.mjs');
@@ -1385,6 +1441,94 @@ describe('agent runtime orchestration', () => {
     });
     await expect(readWorkspaceFile(root, 'tool.txt')).resolves.toBe('tool output');
     expect(events).toContain('tool.completed');
+  });
+
+  it('preserves the assistant tool call and named tool result for the next Ollama turn', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('tools', async function* (request) {
+      requests.push(request);
+      if (requests.length === 1) {
+        yield {
+          type: 'tool_call',
+          id: 'tool-1',
+          name: 'workspace.list',
+          arguments: {},
+        };
+        return;
+      }
+      yield { type: 'done', text: 'files inspected' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ tools: provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Tool protocol');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect files',
+      provider: 'tools',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'files inspected',
+    });
+    expect(requests[1]?.messages).toEqual(
+      expect.arrayContaining([
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'tool-1', name: 'workspace.list', arguments: {} }],
+        },
+        {
+          role: 'tool',
+          content: expect.any(String),
+          toolCallId: 'tool-1',
+          toolName: 'workspace.list',
+        },
+      ]),
+    );
+  });
+
+  it('only advertises tools allowed by the run permission context', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let request: ProviderRequest | undefined;
+    const provider = makeAgentProvider('tools', async function* (value) {
+      request = value;
+      yield { type: 'done', text: 'ok' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ tools: provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Tool permissions');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'read files',
+      provider: 'tools',
+      permissions: { approved: new Set(['read']), capabilities: { filesystem: true } },
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({ status: 'completed' });
+    const names = request?.tools?.map((tool) => tool.name) ?? [];
+    expect(names).toContain('workspace.list');
+    expect(names).toContain('workspace.read');
+    expect(names).not.toContain('workspace.write');
+    expect(names).not.toContain('workspace.command');
   });
 
   it('cancels a running stream and records provider failures truthfully', async () => {
