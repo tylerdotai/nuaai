@@ -1500,6 +1500,88 @@ describe('agent runtime orchestration', () => {
     expect(events).toContain('tool.completed');
   });
 
+  it('requires a verified final response after tool activity instead of accepting future intent', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('finalization', async function* (request) {
+      requests.push(request);
+      if (requests.length === 1) {
+        yield {
+          type: 'tool_call',
+          id: 'tool-1',
+          name: 'workspace.list',
+          arguments: {},
+        };
+        return;
+      }
+      if (requests.length === 2) {
+        yield { type: 'done', text: "I'll run a verification suite next." };
+        return;
+      }
+      yield { type: 'done', text: 'Verified the workspace results and completed the request.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ finalization: provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Finalization contract');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'verify the workspace',
+      provider: 'finalization',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Verified the workspace results and completed the request.',
+    });
+    expect(requests).toHaveLength(3);
+    expect(requests[2]?.messages.at(-1)).toMatchObject({ role: 'system' });
+  });
+
+  it('fails a run when a tool error remains unresolved instead of reporting success', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = makeAgentProvider('unresolved', async function* (request) {
+      const toolCalls = request.messages.filter((message) => message.role === 'assistant').length;
+      if (toolCalls === 0) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'missing.tool', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: "I'll deal with that later." };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ unresolved: provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Unresolved tool error');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'complete the missing tool task',
+      provider: 'unresolved',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('could not verify completion'),
+    });
+  });
+
   it('preserves the assistant tool call and named tool result for the next Ollama turn', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
@@ -1563,6 +1645,10 @@ describe('agent runtime orchestration', () => {
       turn += 1;
       if (turn === 1) {
         yield { type: 'tool_call', id: 'tool-1', name: 'missing.tool', arguments: {} };
+        return;
+      }
+      if (turn === 2) {
+        yield { type: 'tool_call', id: 'tool-2', name: 'mcp.local.echo', arguments: {} };
         return;
       }
       yield { type: 'done', text: 'recovered from tool failure' };

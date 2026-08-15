@@ -295,6 +295,10 @@ export class AgentRuntime {
       );
       let output = '';
       let toolCalls = 0;
+      let toolActivity = false;
+      let finalizationRequested = false;
+      let recoveryRequested = false;
+      const unresolvedToolFailures: string[] = [];
       let memoryContext = '';
       try {
         const embedding = await this.options.providers.get('ollama').embed(run.input);
@@ -444,7 +448,45 @@ export class AgentRuntime {
             correlationId: run.correlationId,
           },
         );
-        if (!turnOutput.calls.length) break;
+        if (!turnOutput.calls.length) {
+          if (unresolvedToolFailures.length) {
+            if (!recoveryRequested) {
+              recoveryRequested = true;
+              messages.push({
+                role: 'system',
+                content:
+                  'A previous tool call failed and remains unresolved. Retry the failed action with corrected arguments, or state plainly that the requested action could not be completed. Do not claim success and do not describe future work without performing it.',
+              });
+              continue;
+            }
+            output = `NUAAI could not verify completion because a tool failed: ${unresolvedToolFailures.join('; ')}`;
+            this.options.store.addMessage(thread.id, 'assistant', output, provider.name, model);
+            this.options.store.updateRun(run.id, { status: 'failed', output });
+            this.emit(
+              'run.failed',
+              { error: output },
+              {
+                sessionId: thread.sessionId,
+                threadId: thread.id,
+                runId: run.id,
+                correlationId: run.correlationId,
+              },
+            );
+            return;
+          }
+          if (toolActivity && !finalizationRequested) {
+            output = '';
+            finalizationRequested = true;
+            messages.push({
+              role: 'system',
+              content:
+                'Tool execution has ended. Provide the final answer now using only verified tool results. Do not describe future work, promise to run another action, or claim success without evidence. If the request was not completed, say so plainly.',
+            });
+            continue;
+          }
+          output = turnOutput.text;
+          break;
+        }
         messages.push({
           role: 'assistant',
           content: turnOutput.text,
@@ -452,6 +494,7 @@ export class AgentRuntime {
         });
         for (const call of turnOutput.calls) {
           toolCalls += 1;
+          toolActivity = true;
           if (toolCalls > this.options.config.limits.maxToolCalls)
             throw new Error('Run tool-call limit exceeded');
           this.emit(
@@ -473,6 +516,7 @@ export class AgentRuntime {
                   timeoutMs: this.options.config.limits.toolTimeoutMs,
                 });
             const toolContent = JSON.stringify(result);
+            if (unresolvedToolFailures.length) unresolvedToolFailures.shift();
             this.options.store.addMessage(thread.id, 'tool', toolContent);
             messages.push({
               role: 'tool',
@@ -493,6 +537,7 @@ export class AgentRuntime {
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             const toolContent = JSON.stringify({ error: message });
+            unresolvedToolFailures.push(`${call.name}: ${message}`);
             this.options.store.addMessage(thread.id, 'tool', toolContent);
             messages.push({
               role: 'tool',
