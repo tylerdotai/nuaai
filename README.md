@@ -13,7 +13,7 @@
   </p>
 </div>
 
-[![Node.js >=20](https://img.shields.io/badge/node-%3E%3D20-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![Node.js >=22](https://img.shields.io/badge/node-%3E%3D22-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 [![Local first](https://img.shields.io/badge/runtime-local--first-6f42c1?style=for-the-badge)](#privacy-and-telemetry)
@@ -62,7 +62,7 @@ The default path is local Ollama. Optional integrations are explicit: Codex uses
 
 ### Prerequisites
 
-- Node.js 20 or newer.
+- Node.js 22 or newer.
 - npm.
 - Ollama for the default local provider.
 - Docker Engine and Docker Compose for Synapse, SearXNG, Crawl4AI, and FlareSolverr.
