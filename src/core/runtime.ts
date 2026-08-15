@@ -4,7 +4,7 @@ import type { RuntimeConfig } from '../config/index.js';
 import type { McpManager } from '../integrations/mcp.js';
 import type { DatabaseStore, RunRow, SessionRow, ThreadRow } from '../memory/db.js';
 import type { ProviderRegistry } from '../providers/registry.js';
-import type { ProviderAdapter, ProviderMessage } from '../providers/types.js';
+import type { ProviderAdapter, ProviderImage, ProviderMessage } from '../providers/types.js';
 import type { PermissionContext } from '../security/permissions.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import { type EventRecord, createEvent } from './events.js';
@@ -21,6 +21,7 @@ export interface RuntimeOptions {
 export interface RunRequest {
   threadId: string;
   input: string;
+  images?: ProviderImage[];
   provider?: string;
   model?: string;
   permissions?: PermissionContext;
@@ -210,6 +211,7 @@ export class AgentRuntime {
         approved: new Set(['read', 'write', 'execute']),
         capabilities: { filesystem: true, subprocess: true, network: true },
       },
+      request.images,
     );
     return run;
   }
@@ -271,6 +273,7 @@ export class AgentRuntime {
     run: RunRow,
     provider: ProviderAdapter,
     permissions: PermissionContext,
+    images?: ProviderImage[],
   ): Promise<void> {
     const controller = new AbortController();
     this.controllers.set(run.id, controller);
@@ -322,6 +325,13 @@ export class AgentRuntime {
         ...this.options.tools.schemas(permissions),
         ...(this.options.mcp?.schemas(permissions) ?? []),
       ];
+      const contextMessages = selectContextMessages(
+        this.options.store.listMessages(thread.id, 400),
+        this.options.config.limits.maxContextBytes,
+      ).filter((message) => message.role !== 'tool');
+      const currentInputMessage = [...contextMessages]
+        .reverse()
+        .find((message) => message.role === 'user' && message.content === run.input);
       const messages: ProviderMessage[] = [
         {
           role: 'system',
@@ -351,15 +361,11 @@ export class AgentRuntime {
             ...(memoryContext ? [`Relevant persisted memory:\n${memoryContext}`] : []),
           ].join('\n'),
         },
-        ...selectContextMessages(
-          this.options.store.listMessages(thread.id, 400),
-          this.options.config.limits.maxContextBytes,
-        )
-          .filter((message) => message.role !== 'tool')
-          .map((message) => ({
-            role: message.role as ProviderMessage['role'],
-            content: message.content,
-          })),
+        ...contextMessages.map((message) => ({
+          role: message.role as ProviderMessage['role'],
+          content: message.content,
+          ...(message === currentInputMessage && images?.length ? { images } : {}),
+        })),
       ];
       for (let turn = 0; turn < this.options.config.limits.maxTurns; turn += 1) {
         const current = this.options.store.getRun(run.id);

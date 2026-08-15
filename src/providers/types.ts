@@ -1,8 +1,15 @@
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
 
+export interface ProviderImage {
+  name?: string;
+  mimeType?: string;
+  data: string;
+}
+
 export interface ProviderMessage {
   role: MessageRole;
   content: string;
+  images?: ProviderImage[];
   toolCallId?: string;
   toolName?: string;
   toolCalls?: ProviderToolCall[];

@@ -64,6 +64,7 @@ function ollamaMessage(message: ProviderMessage): Record<string, unknown> {
   return {
     role: message.role,
     content: message.content,
+    ...(message.images?.length ? { images: message.images.map((image) => image.data) } : {}),
     ...(message.toolName ? { tool_name: message.toolName } : {}),
     ...(message.toolCalls?.length
       ? {

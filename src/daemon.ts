@@ -19,6 +19,7 @@ import {
 import { DatabaseStore, openAppDatabase } from './memory/db.js';
 import { PluginRegistry } from './plugins/registry.js';
 import { ProviderRegistry } from './providers/registry.js';
+import type { ProviderImage } from './providers/types.js';
 import { SecretsManager } from './security/secrets.js';
 import { type GatewayHandle, startServer } from './server.js';
 import { loadFilesystemSkills } from './skills/loader.js';
@@ -36,6 +37,8 @@ export interface DaemonHandle {
   mcp: McpManager;
   stop(): Promise<void>;
 }
+
+const maxOllamaImageBytes = 10_000_000;
 
 export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
   const resolvedRoot = resolve(root);
@@ -326,9 +329,34 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
         };
         progressByThread.set(created.thread.id, progress);
         await flushProgress(progress);
+        const images: ProviderImage[] = [];
+        for (const attachment of message.attachments ?? []) {
+          if (
+            !attachment.localPath ||
+            attachment.error ||
+            !attachment.mimeType?.startsWith('image/')
+          )
+            continue;
+          try {
+            const bytes = await readFile(attachment.localPath);
+            if (bytes.byteLength > maxOllamaImageBytes) {
+              attachment.error = 'Image exceeds the Ollama vision size limit';
+              continue;
+            }
+            images.push({
+              name: attachment.name,
+              mimeType: attachment.mimeType,
+              data: bytes.toString('base64'),
+            });
+          } catch (error) {
+            attachment.error = error instanceof Error ? error.message : String(error);
+          }
+        }
         const attachmentContext = message.attachments?.map((attachment) =>
-          attachment.localPath
-            ? `Attachment ${attachment.name}: ${attachment.localPath}`
+          attachment.localPath && !attachment.error
+            ? attachment.mimeType?.startsWith('image/')
+              ? `Attachment ${attachment.name}: image available to the vision model.`
+              : `Attachment ${attachment.name}: ${attachment.localPath}`
             : `Attachment ${attachment.name}: unavailable (${attachment.error ?? 'not downloaded'})`,
         );
         let runId: string | undefined;
@@ -340,6 +368,7 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
               approved: new Set(['read', 'write', 'execute']),
               capabilities: { filesystem: true, subprocess: true, network: true },
             },
+            ...(images.length ? { images } : {}),
           });
           runId = run.id;
           progressByRun.set(run.id, progress);

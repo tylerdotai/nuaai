@@ -35,6 +35,7 @@ import { DeterministicProvider } from '../src/providers/test.js';
 import type {
   ProviderAdapter,
   ProviderHealth,
+  ProviderImage,
   ProviderRequest,
   ProviderStreamEvent,
 } from '../src/providers/types.js';
@@ -1042,6 +1043,44 @@ describe('providers and scheduler', () => {
     }
   });
 
+  it('serializes image content using Ollama native vision payloads', async () => {
+    const originalFetch = globalThis.fetch;
+    let requestBody: Record<string, unknown> | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return responseStream([
+        JSON.stringify({ message: { content: 'image inspected' }, done: true }),
+      ]);
+    }) as typeof fetch;
+    try {
+      const provider = new OllamaProvider(
+        { baseUrl: 'http://ollama.local', model: 'vision-model', embeddingModel: 'embed-model' },
+        5_000,
+      );
+      for await (const _event of provider.stream({
+        model: 'vision-model',
+        messages: [
+          {
+            role: 'user',
+            content: 'What is in this image?',
+            images: [{ name: 'photo.png', mimeType: 'image/png', data: 'aGVsbG8=' }],
+          },
+        ],
+      })) {
+        // Drain the provider stream so the request completes.
+      }
+      expect(requestBody?.messages).toEqual([
+        {
+          role: 'user',
+          content: 'What is in this image?',
+          images: ['aGVsbG8='],
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('executes Codex through a real subprocess boundary', async () => {
     const root = await makeRoot();
     const executable = join(root, 'codex-fake.mjs');
@@ -1426,6 +1465,53 @@ describe('agent runtime orchestration', () => {
       status: 'failed',
     });
     unsubscribe();
+  });
+
+  it('passes active-run images to the provider without persisting image bytes', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('vision', async function* (request) {
+      requests.push(request);
+      yield { type: 'done', text: 'Image inspected.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ vision: provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Vision runtime');
+    const image: ProviderImage = {
+      name: 'photo.png',
+      mimeType: 'image/png',
+      data: 'aGVsbG8=',
+    };
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect this image',
+      provider: 'vision',
+      images: [image],
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Image inspected.',
+    });
+    expect(requests[0]?.messages.at(-1)).toMatchObject({
+      role: 'user',
+      content: 'inspect this image',
+      images: [image],
+    });
+    expect(
+      store
+        .listMessages(created.thread.id)
+        .every((message) => !message.content.includes('aGVsbG8=')),
+    ).toBe(true);
   });
 
   it('routes source keys across resumed, new, and switched sessions', async () => {
