@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,6 +16,7 @@ import { compileSkill, generateSkillSource } from '../src/skills/synthesizer.js'
 import { getVersion, readPackageMetadata } from '../src/version.js';
 import {
   initWorkspace,
+  isProtectedWorkspaceFile,
   listWorkspaceFiles,
   readWorkspaceFile,
   runWorkspaceCommand,
@@ -160,11 +161,19 @@ describe('NUAAI foundation', () => {
     const root = await mkdtemp(join(tmpdir(), 'nuaai-workspace-'));
     const directory = await initWorkspace(root);
     expect(directory).toBe(join(root, '.nuaai'));
-    expect(JSON.parse(await readWorkspaceFile(root, 'config.json'))).toMatchObject({
-      name: 'NUAAI',
-    });
+    await expect(readWorkspaceFile(root, 'config.json')).rejects.toThrow(
+      'Protected workspace file',
+    );
     await initWorkspace(root);
-    expect(await listWorkspaceFiles(root)).toEqual(['config.json']);
+    await writeFile(join(directory, 'matrix.env'), 'ACCESS_TOKEN=secret');
+    await writeFile(join(directory, 'secrets', 'master.key'), 'secret');
+    await writeFile(join(directory, 'memory.db'), 'database');
+    expect(await listWorkspaceFiles(root)).toEqual([]);
+    expect(isProtectedWorkspaceFile('config.json')).toBe(true);
+    expect(isProtectedWorkspaceFile('runtime.json')).toBe(true);
+    expect(isProtectedWorkspaceFile('matrix.env')).toBe(true);
+    expect(isProtectedWorkspaceFile('secrets/master.key')).toBe(true);
+    await expect(readWorkspaceFile(root, 'matrix.env')).rejects.toThrow('Protected workspace file');
     expect(() => safePath(directory, '../escape')).toThrow('escapes workspace');
     const command = await runWorkspaceCommand(
       process.execPath,
@@ -172,6 +181,28 @@ describe('NUAAI foundation', () => {
       root,
     );
     expect(command).toMatchObject({ exitCode: 0, stdout: 'ok', stderr: '' });
+    await expect(runWorkspaceCommand('echo', ['hello'], root)).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: 'hello',
+    });
+    for (const commandLine of ['uname -a', 'df -h', 'free -h', 'lscpu', 'cat /etc/os-release']) {
+      await expect(runWorkspaceCommand(commandLine, [], root)).resolves.toMatchObject({
+        exitCode: 0,
+      });
+    }
+    await expect(runWorkspaceCommand("printf 'hello world'", [], root)).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: 'hello world',
+    });
+    await expect(runWorkspaceCommand('echo hello; pwd', [], root)).rejects.toThrow(
+      'Shell operators are not supported',
+    );
+    await expect(runWorkspaceCommand('cat', ['.nuaai/runtime.json'], root)).rejects.toThrow(
+      'Protected workspace file',
+    );
+    await expect(runWorkspaceCommand('python3', ['-c', 'print(1)'], root)).rejects.toThrow(
+      'Inline interpreter execution is not supported',
+    );
     expect(textDiff('one\n', 'two\n').map((change) => change.value)).toEqual(['one\n', 'two\n']);
     await rm(root, { recursive: true, force: true });
   });

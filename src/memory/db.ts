@@ -30,6 +30,8 @@ export interface SessionRow {
   id: string;
   title: string;
   status: string;
+  sourceKey: string | null;
+  context: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -102,6 +104,8 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       status TEXT NOT NULL,
+      source_key TEXT UNIQUE,
+      context TEXT NOT NULL DEFAULT '',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -246,6 +250,14 @@ function openRaw(root: string, loadVector = false): MemoryDatabase {
   db.pragma('journal_mode = WAL');
   if (loadVector) loadSqliteVec(db);
   createSchema(db, loadVector);
+  const sessionColumns = db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
+  if (!sessionColumns.some((column) => column.name === 'source_key'))
+    db.exec('ALTER TABLE sessions ADD COLUMN source_key TEXT');
+  if (!sessionColumns.some((column) => column.name === 'context'))
+    db.exec("ALTER TABLE sessions ADD COLUMN context TEXT NOT NULL DEFAULT ''");
+  db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS sessions_source_key_idx ON sessions(source_key) WHERE source_key IS NOT NULL',
+  );
   return db;
 }
 
@@ -324,11 +336,15 @@ export class DatabaseStore {
   createSession(
     title = 'New session',
     now = Date.now(),
+    context = '',
+    sourceKey: string | null = null,
   ): { session: SessionRow; thread: ThreadRow } {
     const session: SessionRow = {
       id: randomUUID(),
       title,
       status: 'active',
+      sourceKey,
+      context,
       createdAt: now,
       updatedAt: now,
     };
@@ -342,9 +358,9 @@ export class DatabaseStore {
     const transaction = this.database.raw.transaction(() => {
       this.database.raw
         .prepare(
-          'INSERT INTO sessions (id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+          'INSERT INTO sessions (id, title, status, source_key, context, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
         )
-        .run(session.id, session.title, session.status, now, now);
+        .run(session.id, session.title, session.status, sourceKey, context, now, now);
       this.database.raw
         .prepare(
           'INSERT INTO threads (id, session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
@@ -358,9 +374,17 @@ export class DatabaseStore {
   listSessions(): SessionRow[] {
     return this.database.raw
       .prepare(
-        'SELECT id, title, status, created_at AS createdAt, updated_at AS updatedAt FROM sessions ORDER BY updated_at DESC',
+        'SELECT id, title, status, source_key AS sourceKey, context, created_at AS createdAt, updated_at AS updatedAt FROM sessions ORDER BY updated_at DESC',
       )
       .all() as SessionRow[];
+  }
+
+  getSessionBySource(sourceKey: string): SessionRow | undefined {
+    return this.database.raw
+      .prepare(
+        'SELECT id, title, status, source_key AS sourceKey, context, created_at AS createdAt, updated_at AS updatedAt FROM sessions WHERE source_key = ?',
+      )
+      .get(sourceKey) as SessionRow | undefined;
   }
 
   createThread(sessionId: string, title = 'New thread', now = Date.now()): ThreadRow {
@@ -383,9 +407,21 @@ export class DatabaseStore {
   getSession(id: string): SessionRow | undefined {
     return this.database.raw
       .prepare(
-        'SELECT id, title, status, created_at AS createdAt, updated_at AS updatedAt FROM sessions WHERE id = ?',
+        'SELECT id, title, status, source_key AS sourceKey, context, created_at AS createdAt, updated_at AS updatedAt FROM sessions WHERE id = ?',
       )
       .get(id) as SessionRow | undefined;
+  }
+
+  updateSessionContext(id: string, context: string, now = Date.now()): void {
+    this.database.raw
+      .prepare('UPDATE sessions SET context = ?, updated_at = ? WHERE id = ?')
+      .run(context, now, id);
+  }
+
+  setSessionSourceKey(id: string, sourceKey: string | null, now = Date.now()): void {
+    this.database.raw
+      .prepare('UPDATE sessions SET source_key = ?, updated_at = ? WHERE id = ?')
+      .run(sourceKey, now, id);
   }
 
   getThread(id: string): ThreadRow | undefined {

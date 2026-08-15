@@ -1,12 +1,15 @@
+import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadRuntimeConfig } from './config/index.js';
+import { loadRuntimeConfig, workspaceDirectory } from './config/index.js';
+import { loadSessionIdentity } from './core/identity.js';
 import { AgentRuntime } from './core/runtime.js';
 import { Scheduler } from './core/scheduler.js';
 import { acquireDaemonLock } from './gateway/lock.js';
 import { ensureRuntimeIdentity } from './gateway/runtime.js';
-import { MatrixBridge } from './integrations/matrix.js';
+import { MatrixBridge, matrixHelpText, parseMatrixCommand } from './integrations/matrix.js';
+import { McpManager } from './integrations/mcp.js';
 import {
   Crawl4AiClient,
   FlareSolverrClient,
@@ -30,12 +33,29 @@ export interface DaemonHandle {
   store: DatabaseStore;
   token: string;
   matrix?: MatrixBridge;
+  mcp: McpManager;
   stop(): Promise<void>;
 }
 
 export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
   const resolvedRoot = resolve(root);
   await initWorkspace(resolvedRoot);
+  const matrixSincePath = resolve(workspaceDirectory(resolvedRoot), 'matrix-since.txt');
+  let matrixSince: string | undefined;
+  try {
+    matrixSince = (await readFile(matrixSincePath, 'utf8')).trim() || undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  let matrixSinceWrite = Promise.resolve();
+  const persistMatrixSince = (since: string): void => {
+    matrixSinceWrite = matrixSinceWrite
+      .catch(() => undefined)
+      .then(() => writeFile(matrixSincePath, since, { encoding: 'utf8', mode: 0o600 }));
+    void matrixSinceWrite.catch((error: unknown) => {
+      process.stderr.write(`Matrix sync state unavailable: ${String(error)}\n`);
+    });
+  };
   const config = await loadRuntimeConfig(resolvedRoot);
   const effectiveConfig =
     process.env.NUAAI_TEST_MODE === '1'
@@ -45,6 +65,7 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
         }
       : config;
   const identity = ensureRuntimeIdentity(resolvedRoot);
+  const sessionIdentity = loadSessionIdentity(resolvedRoot);
   const store = new DatabaseStore(openAppDatabase(resolvedRoot));
   const secrets = new SecretsManager(store, resolvedRoot);
   const providers = new ProviderRegistry({
@@ -70,6 +91,8 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
   const tools = new ToolRegistry(resolvedRoot, search, {
     browserEnabled: effectiveConfig.features.browser,
   });
+  const mcp = new McpManager(effectiveConfig.mcp);
+  await mcp.start();
   const skills = new SkillRegistry();
   skills.register({
     name: 'workspace-status',
@@ -88,6 +111,8 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     store,
     providers,
     tools,
+    identityContext: sessionIdentity,
+    mcp,
   });
   const matrix =
     effectiveConfig.features.matrix &&
@@ -99,6 +124,10 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
           accessToken: effectiveConfig.matrix.accessToken,
           userId: effectiveConfig.matrix.userId,
           pollTimeoutMs: effectiveConfig.matrix.pollTimeoutMs,
+          since: matrixSince,
+          onSince: persistMatrixSince,
+          downloadDirectory: resolve(workspaceDirectory(resolvedRoot), 'attachments', 'incoming'),
+          workspaceRoot: resolvedRoot,
         })
       : undefined;
   const scheduledRuns = new Map<string, string>();
@@ -142,8 +171,10 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
       skills,
       plugins,
       secrets,
+      mcp,
     });
   } catch (error) {
+    mcp.stop();
     scheduler.stop();
     await daemonLock.release();
     store.close();
@@ -153,28 +184,209 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     process.stderr.write(
       'Matrix integration disabled: configure NUAAI_MATRIX_ACCESS_TOKEN and matrix.userId.\n',
     );
+  let unsubscribeMatrixRuntime: (() => void) | undefined;
   if (matrix) {
-    void matrix.start(async (message) => {
-      if (effectiveConfig.matrix.roomId && effectiveConfig.matrix.roomId !== message.roomId) return;
-      const created = runtime.createSession(`Matrix ${message.roomId}`);
-      const run = runtime.startRun({
-        threadId: created.thread.id,
-        input: message.body,
-        permissions: {
-          approved: new Set(['read']),
-          capabilities: { filesystem: true, network: true },
-        },
-      });
-      const completed = await runtime.waitForRun(run.id);
-      const output = completed.output?.trim() || 'NUAAI completed the run without text output.';
-      await matrix.sendText(message.roomId, output.slice(0, 60_000));
+    type MatrixProgress = {
+      roomId: string;
+      eventId?: string;
+      pending?: string;
+      timer?: ReturnType<typeof setTimeout>;
+      unavailable?: boolean;
+    };
+    const progressByThread = new Map<string, MatrixProgress>();
+    const progressByRun = new Map<string, MatrixProgress>();
+    const reportMatrixSignalFailure = (kind: string, error: unknown): void => {
+      process.stderr.write(
+        `[Matrix] ${kind} unavailable: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    };
+    const bestEffortMatrix = async (kind: string, action: () => Promise<void>): Promise<void> => {
+      try {
+        await action();
+      } catch (error) {
+        reportMatrixSignalFailure(kind, error);
+      }
+    };
+    const flushProgress = async (progress: MatrixProgress): Promise<void> => {
+      if (progress.timer) {
+        clearTimeout(progress.timer);
+        progress.timer = undefined;
+      }
+      if (progress.unavailable || !progress.pending) return;
+      const body = progress.pending;
+      try {
+        if (progress.eventId) await matrix.editText(progress.roomId, progress.eventId, body);
+        else progress.eventId = (await matrix.sendText(progress.roomId, body)).eventId;
+        if (progress.pending === body) progress.pending = undefined;
+      } catch (error) {
+        progress.unavailable = true;
+        reportMatrixSignalFailure('progress message', error);
+      }
+    };
+    const scheduleProgress = (progress: MatrixProgress, body: string): void => {
+      if (progress.unavailable) return;
+      progress.pending = body;
+      if (progress.timer) return;
+      progress.timer = setTimeout(() => {
+        progress.timer = undefined;
+        void flushProgress(progress);
+      }, 2_000);
+    };
+    const unsubscribe = runtime.subscribe((event) => {
+      if (!['tool.started', 'tool.completed', 'tool.failed'].includes(event.type)) return;
+      const progress =
+        (event.runId ? progressByRun.get(event.runId) : undefined) ??
+        (event.threadId ? progressByThread.get(event.threadId) : undefined);
+      if (!progress) return;
+      const name = typeof event.payload.name === 'string' ? event.payload.name : 'tool';
+      if (event.type === 'tool.started') scheduleProgress(progress, `🔧 Running ${name}…`);
+      else if (event.type === 'tool.completed') scheduleProgress(progress, `✅ ${name} complete`);
+      else scheduleProgress(progress, `⚠️ ${name} failed`);
     });
+    void matrix.start(async (message) => {
+      try {
+        if (effectiveConfig.matrix.roomId && effectiveConfig.matrix.roomId !== message.roomId)
+          return;
+        await bestEffortMatrix('read receipt', () =>
+          matrix.sendReceipt(message.roomId, message.eventId),
+        );
+        const sourceKey = `matrix:${message.roomId}:${message.sender}`;
+        const command = parseMatrixCommand(message.body);
+        if (command) {
+          if (command.name === 'help' || command.name === 'start') {
+            await matrix.sendText(message.roomId, matrixHelpText());
+            return;
+          }
+          if (command.name === 'status') {
+            const session = runtime
+              .listSessions()
+              .find((candidate) => candidate.sourceKey === sourceKey);
+            await matrix.sendText(
+              message.roomId,
+              session
+                ? `Active session: **${session.title}**\nID: \`${session.id}\``
+                : 'No active session for this room and sender. Send a normal message to create one.',
+            );
+            return;
+          }
+          if (command.name === 'sessions') {
+            const sessions = runtime
+              .listSessions()
+              .filter((session) => session.sourceKey?.startsWith(`matrix:${message.roomId}:`));
+            await matrix.sendText(
+              message.roomId,
+              sessions.length
+                ? sessions.map((session) => `- ${session.id} — ${session.title}`).join('\n')
+                : 'No Matrix sessions found for this room.',
+            );
+            return;
+          }
+          if (command.name === 'new') {
+            const title = command.args.join(' ').trim() || 'New Matrix session';
+            const created = runtime.startNewSession(sourceKey, title);
+            await matrix.sendText(
+              message.roomId,
+              `Started session **${created.session.title}** (${created.session.id}).`,
+            );
+            return;
+          }
+          if (command.name === 'switch') {
+            if (command.args.length !== 1) {
+              await matrix.sendText(message.roomId, 'Usage: `/switch <session-id>`');
+              return;
+            }
+            try {
+              const switched = runtime.switchSession(sourceKey, command.args[0]);
+              await matrix.sendText(
+                message.roomId,
+                `Switched to **${switched.session.title}** (${switched.session.id}).`,
+              );
+            } catch (error) {
+              await matrix.sendText(
+                message.roomId,
+                `Session switch failed: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+            return;
+          }
+          await matrix.sendText(
+            message.roomId,
+            `Unknown command: "/${command.name}"\n\n${matrixHelpText()}`,
+          );
+          return;
+        }
+        const created = runtime.getOrCreateSession(sourceKey, `Matrix ${message.roomId}`);
+        process.stdout.write(
+          `[Matrix] received room=${message.roomId} sender=${message.sender} event=${message.eventId}\n`,
+        );
+        await bestEffortMatrix('typing notification', () => matrix.setTyping(message.roomId, true));
+        const progress: MatrixProgress = {
+          roomId: message.roomId,
+          pending: '🧠 NUAAI is working on this…',
+        };
+        progressByThread.set(created.thread.id, progress);
+        await flushProgress(progress);
+        const attachmentContext = message.attachments?.map((attachment) =>
+          attachment.localPath
+            ? `Attachment ${attachment.name}: ${attachment.localPath}`
+            : `Attachment ${attachment.name}: unavailable (${attachment.error ?? 'not downloaded'})`,
+        );
+        let runId: string | undefined;
+        try {
+          const run = runtime.startRun({
+            threadId: created.thread.id,
+            input: [message.body, ...(attachmentContext ?? [])].join('\n'),
+            permissions: {
+              approved: new Set(['read', 'write', 'execute']),
+              capabilities: { filesystem: true, subprocess: true, network: true },
+            },
+          });
+          runId = run.id;
+          progressByRun.set(run.id, progress);
+          const completed = await runtime.waitForRun(run.id);
+          process.stdout.write(
+            `[Matrix] run=${run.id} status=${completed.status} outputChars=${completed.output.length}\n`,
+          );
+          const output =
+            completed.status === 'completed'
+              ? completed.output.trim() || 'NUAAI completed the run without text output.'
+              : `NUAAI run ${completed.status}. The run did not complete successfully.`;
+          scheduleProgress(
+            progress,
+            completed.status === 'completed' ? '✅ NUAAI finished' : `⚠️ NUAAI ${completed.status}`,
+          );
+          await flushProgress(progress);
+          await matrix.sendOutput(message.roomId, output.slice(0, 60_000));
+        } finally {
+          if (progress.timer) clearTimeout(progress.timer);
+          progressByThread.delete(created.thread.id);
+          if (runId) progressByRun.delete(runId);
+          await bestEffortMatrix('typing notification', () =>
+            matrix.setTyping(message.roomId, false),
+          );
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        process.stderr.write(
+          `[Matrix] message delivery failed room=${message.roomId} event=${message.eventId}: ${detail}\n`,
+        );
+        await bestEffortMatrix('error response', async () => {
+          await matrix.sendText(
+            message.roomId,
+            'NUAAI could not complete or deliver this response.',
+          );
+        });
+      }
+    });
+    unsubscribeMatrixRuntime = unsubscribe;
   }
   let stopped = false;
   const stop = async () => {
     if (stopped) return;
     stopped = true;
     matrix?.stop();
+    unsubscribeMatrixRuntime?.();
+    mcp.stop();
     scheduler.stop();
     await gateway.close();
     store.close();
@@ -189,7 +401,7 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
   process.stdout.write(
     `NUAAI daemon listening on http://${effectiveConfig.host}:${gateway.port}\n`,
   );
-  return { gateway, runtime, scheduler, store, token: identity.token, matrix, stop };
+  return { gateway, runtime, scheduler, store, token: identity.token, matrix, mcp, stop };
 }
 
 const isEntrypoint = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

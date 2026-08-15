@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { SearchStack } from '../integrations/search.js';
 import { type PermissionContext, assertPermission } from '../security/permissions.js';
 import {
+  inspectWorkspaceFile,
   listWorkspaceFiles,
   readWorkspaceFile,
   runWorkspaceCommand,
@@ -35,7 +36,7 @@ export class ToolRegistry {
   constructor(root: string, searchStack?: SearchStack, options: { browserEnabled?: boolean } = {}) {
     this.register({
       name: 'workspace.list',
-      description: 'List files in the NUAAI workspace',
+      description: 'List non-protected files in the NUAAI workspace',
       permission: 'read',
       parameters: { type: 'object', properties: {} },
       input: empty,
@@ -49,6 +50,20 @@ export class ToolRegistry {
       input: z.object({ path: z.string().min(1) }),
       execute: async (input, context) =>
         readWorkspaceFile(context.root, (input as { path: string }).path),
+    });
+    this.register({
+      name: 'workspace.inspect',
+      description:
+        'Inspect any non-protected workspace file type and return metadata plus a bounded text preview when the format is text-readable',
+      permission: 'read',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+      },
+      input: z.object({ path: z.string().min(1) }),
+      execute: async (input, context) =>
+        inspectWorkspaceFile(context.root, (input as { path: string }).path),
     });
     this.register({
       name: 'workspace.write',
@@ -81,7 +96,8 @@ export class ToolRegistry {
     });
     this.register({
       name: 'workspace.command',
-      description: 'Run an explicitly allowlisted workspace command',
+      description:
+        'Run one explicitly allowlisted workspace command (cat, date, df, echo, file, free, hostname, head, lscpu, ls, lsblk, lspci, lsusb, printf, ps, pwd, stat, tail, uname, uptime, wc, which, whoami, node, npm, npx, git, ollama, codex, python, or python3). Put arguments in args. Protected runtime files remain inaccessible, inline Python/Node execution is rejected, and shell operators such as &&, ;, |, and redirects are rejected; issue separate tool calls instead of chaining commands.',
       permission: 'execute',
       parameters: {
         type: 'object',

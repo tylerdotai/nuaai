@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
 import { access, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, resolve, sep } from 'node:path';
+import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import { type Change, diffLines } from 'diff';
 import { execa } from 'execa';
@@ -9,6 +9,27 @@ import fg from 'fast-glob';
 import { defaultRuntimeConfig, workspaceDirectory } from '../config/index.js';
 
 const SAFE_COMMANDS = new Set([
+  'cat',
+  'df',
+  'echo',
+  'free',
+  'hostname',
+  'lscpu',
+  'ls',
+  'lsblk',
+  'lspci',
+  'lsusb',
+  'printf',
+  'ps',
+  'pwd',
+  'date',
+  'file',
+  'head',
+  'stat',
+  'tail',
+  'uname',
+  'wc',
+  'which',
   'node',
   'npm',
   'npx',
@@ -17,7 +38,23 @@ const SAFE_COMMANDS = new Set([
   'codex',
   'python',
   'python3',
+  'uptime',
+  'whoami',
 ]);
+
+const PROTECTED_WORKSPACE_FILE =
+  /(?:^|\/)(?:config\.json|runtime\.json|daemon\.lock|matrix-since\.txt|secrets(?:\/|$)|(?:[^/]*\.(?:env|key|pem|p12|pfx)|[^/]*(?:pass(?:word)?|token|secret|since)[^/]*|[^/]*\.db(?:-(?:shm|wal))?|[^/]*\.sqlite(?:-(?:shm|wal))?|[^/]*\.lock))$/i;
+const PATH_READING_COMMANDS = new Set(['cat', 'file', 'head', 'stat', 'tail', 'wc']);
+const INLINE_INTERPRETER_FLAGS = new Set(['-c', '--eval', '-e', '--print', '-p']);
+
+export function isProtectedWorkspaceFile(relativePath: string): boolean {
+  return PROTECTED_WORKSPACE_FILE.test(relativePath.replaceAll('\\', '/'));
+}
+
+function assertAgentWorkspaceFile(relativePath: string): void {
+  if (isProtectedWorkspaceFile(relativePath))
+    throw new Error(`Protected workspace file: ${relativePath}`);
+}
 
 export function safePath(root: string, target: string): string {
   const base = resolve(root);
@@ -59,10 +96,79 @@ export async function initWorkspace(root = process.cwd()): Promise<string> {
 }
 
 export async function readWorkspaceFile(root: string, relativePath: string): Promise<string> {
+  assertAgentWorkspaceFile(relativePath);
   const path = await assertSafeExistingPath(workspaceDirectory(root), relativePath);
   const stats = await lstat(path);
   if (!stats.isFile()) throw new Error(`Not a regular file: ${relativePath}`);
   return readFile(path, 'utf8');
+}
+
+export async function inspectWorkspaceFile(
+  root: string,
+  relativePath: string,
+): Promise<{
+  path: string;
+  size: number;
+  extension: string;
+  mimeType: string;
+  textPreview?: string;
+}> {
+  assertAgentWorkspaceFile(relativePath);
+  const path = await assertSafeExistingPath(workspaceDirectory(root), relativePath);
+  const stats = await lstat(path);
+  if (!stats.isFile()) throw new Error(`Not a regular file: ${relativePath}`);
+  const extension = extname(relativePath).toLowerCase();
+  const textLike = new Set([
+    '.c',
+    '.cfg',
+    '.css',
+    '.csv',
+    '.html',
+    '.ini',
+    '.js',
+    '.json',
+    '.md',
+    '.mjs',
+    '.py',
+    '.sh',
+    '.sql',
+    '.svg',
+    '.toml',
+    '.ts',
+    '.tsx',
+    '.txt',
+    '.yaml',
+    '.yml',
+  ]);
+  const mimeTypes: Record<string, string> = {
+    '.csv': 'text/csv',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.gif': 'image/gif',
+    '.html': 'text/html',
+    '.jpeg': 'image/jpeg',
+    '.jpg': 'image/jpeg',
+    '.json': 'application/json',
+    '.mp3': 'audio/mpeg',
+    '.mp4': 'video/mp4',
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.txt': 'text/plain',
+    '.wav': 'audio/wav',
+    '.webp': 'image/webp',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.xml': 'application/xml',
+    '.yaml': 'application/yaml',
+    '.yml': 'application/yaml',
+  };
+  return {
+    path: relativePath,
+    size: stats.size,
+    extension,
+    mimeType: mimeTypes[extension] ?? 'application/octet-stream',
+    ...(textLike.has(extension)
+      ? { textPreview: (await readFile(path, 'utf8')).slice(0, 16_000) }
+      : {}),
+  };
 }
 
 export async function writeWorkspaceFile(
@@ -70,6 +176,7 @@ export async function writeWorkspaceFile(
   relativePath: string,
   content: string,
 ): Promise<void> {
+  assertAgentWorkspaceFile(relativePath);
   const path = safePath(workspaceDirectory(root), relativePath);
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, content, { encoding: 'utf8', mode: 0o600 });
@@ -83,7 +190,9 @@ export async function listWorkspaceFiles(root: string): Promise<string[]> {
       onlyFiles: true,
       followSymbolicLinks: false,
     })
-  ).sort();
+  )
+    .filter((file) => !isProtectedWorkspaceFile(file))
+    .sort();
 }
 
 export async function searchWorkspace(
@@ -108,13 +217,65 @@ export async function runWorkspaceCommand(
   root = process.cwd(),
   options: { timeoutMs?: number; allowedCommands?: Set<string> } = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  if (isAbsolute(command) && command !== process.execPath)
-    throw new Error(`Absolute command is not allowlisted: ${command}`);
-  const name = command.split(/[\\/]/).pop() ?? command;
+  const tokens: string[] = [];
+  let token = '';
+  let quote: 'single' | 'double' | undefined;
+  let escaped = false;
+  for (const character of command.trim()) {
+    if (escaped) {
+      token += character;
+      escaped = false;
+    } else if (character === '\\') {
+      escaped = true;
+    } else if (quote === 'single' && character === "'") {
+      quote = undefined;
+    } else if (quote === 'double' && character === '"') {
+      quote = undefined;
+    } else if (!quote && character === "'") {
+      quote = 'single';
+    } else if (!quote && character === '"') {
+      quote = 'double';
+    } else if (!quote && /[;&|<>]/.test(character)) {
+      throw new Error('Shell operators are not supported; pass command arguments separately');
+    } else if (!quote && /\s/.test(character)) {
+      if (token) {
+        tokens.push(token);
+        token = '';
+      }
+    } else {
+      token += character;
+    }
+  }
+  if (escaped || quote) throw new Error('Unterminated command escape or quote');
+  if (token) tokens.push(token);
+  const executable = tokens.shift();
+  if (!executable) throw new Error('Command is required');
+  const invocationArgs = [...tokens, ...args];
+  if (isAbsolute(executable) && executable !== process.execPath)
+    throw new Error(`Absolute command is not allowlisted: ${executable}`);
+  const name = executable.split(/[\\/]/).pop() ?? executable;
   const allowed = options.allowedCommands ?? SAFE_COMMANDS;
-  if (command !== process.execPath && !allowed.has(name))
+  if (executable !== process.execPath && !allowed.has(name))
     throw new Error(`Command is not allowlisted: ${name}`);
-  const result = await execa(command, args, {
+  if (
+    executable !== process.execPath &&
+    (name === 'node' || name === 'python' || name === 'python3') &&
+    invocationArgs.some((argument) => INLINE_INTERPRETER_FLAGS.has(argument))
+  )
+    throw new Error('Inline interpreter execution is not supported; use workspace file tools');
+  if (PATH_READING_COMMANDS.has(name)) {
+    const workspace = resolve(workspaceDirectory(root));
+    for (const argument of invocationArgs) {
+      if (!argument || argument.startsWith('-')) continue;
+      const candidate = isAbsolute(argument) ? resolve(argument) : resolve(root, argument);
+      if (candidate === workspace || candidate.startsWith(`${workspace}${sep}`)) {
+        const relativePath = relative(workspace, candidate);
+        if (relativePath && isProtectedWorkspaceFile(relativePath))
+          throw new Error(`Protected workspace file: ${relativePath}`);
+      }
+    }
+  }
+  const result = await execa(executable, invocationArgs, {
     cwd: resolve(root),
     reject: false,
     timeout: options.timeoutMs ?? 30_000,

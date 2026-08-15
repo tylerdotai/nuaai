@@ -39,6 +39,19 @@ const featureSchema = z.object({
   telemetry: z.literal(false).default(false),
 });
 
+const mcpServerSchema = z.object({
+  command: z.string().min(1),
+  args: z.array(z.string()).default([]),
+  env: z.record(z.string()).default({}),
+  permission: z.enum(['read', 'write', 'execute']).default('read'),
+});
+
+const computerSchema = z.object({
+  enabled: z.boolean().default(false),
+  command: z.string().default('cua-driver'),
+  args: z.array(z.string()).default(['mcp']),
+});
+
 export const runtimeConfigSchema = z.object({
   version: z.literal(1).default(1),
   name: z.string().default('NUAAI'),
@@ -55,6 +68,13 @@ export const runtimeConfigSchema = z.object({
     .default({}),
   search: searchSchema.default({}),
   matrix: matrixSchema.default({}),
+  mcp: z
+    .object({
+      enabled: z.boolean().default(false),
+      servers: z.record(mcpServerSchema).default({}),
+      computer: computerSchema.default({}),
+    })
+    .default({}),
   features: featureSchema.default({}),
   limits: z
     .object({
@@ -64,6 +84,7 @@ export const runtimeConfigSchema = z.object({
       runTimeoutMs: z.number().int().positive().max(3_600_000).default(300_000),
       providerTimeoutMs: z.number().int().positive().max(600_000).default(180_000),
       toolTimeoutMs: z.number().int().positive().max(120_000).default(30_000),
+      maxContextBytes: z.number().int().positive().max(2_000_000).default(120_000),
     })
     .default({}),
 });

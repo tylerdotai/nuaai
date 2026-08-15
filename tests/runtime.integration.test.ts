@@ -14,6 +14,7 @@ import {
   workspaceDirectory,
 } from '../src/config/index.js';
 import { createEvent } from '../src/core/events.js';
+import { loadSessionIdentity } from '../src/core/identity.js';
 import { AgentRuntime } from '../src/core/runtime.js';
 import { Scheduler, nextCronRun } from '../src/core/scheduler.js';
 import { acquireDaemonLock, daemonLockExists } from '../src/gateway/lock.js';
@@ -199,6 +200,24 @@ describe('runtime configuration and security primitives', () => {
     await unlink(lockPath);
     expect(await daemonLockExists(root)).toBe(false);
   });
+
+  it('loads both identity files once and bounds oversized instructions', async () => {
+    const root = await makeRoot();
+    await writeFile(join(root, 'AGENTS.md'), 'workspace rules');
+    await writeFile(join(root, 'SOUL.md'), 'agent identity');
+    expect(loadSessionIdentity(root)).toContain('## AGENTS.md\nworkspace rules');
+    expect(loadSessionIdentity(root)).toContain('## SOUL.md\nagent identity');
+
+    await writeFile(join(root, 'SOUL.md'), 'x'.repeat(12_001));
+    const bounded = loadSessionIdentity(root);
+    expect(bounded).toContain('[truncated by NUAAI]');
+    expect(Buffer.byteLength(bounded, 'utf8')).toBeGreaterThan(12_000);
+  });
+
+  it('returns a truthful empty identity when workspace instruction files are absent', async () => {
+    const root = await makeRoot();
+    expect(loadSessionIdentity(root)).toBe('No AGENTS.md or SOUL.md was present at session start.');
+  });
 });
 
 describe('SQLite persistence and vector memory', () => {
@@ -383,7 +402,7 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
   it('executes secure workspace tools and enforces permissions', async () => {
     const root = await makeRoot();
     const tools = new ToolRegistry(root);
-    expect(tools.list()).toHaveLength(5);
+    expect(tools.list()).toHaveLength(6);
     expect(tools.schemas().map((tool) => tool.name)).toContain('workspace.command');
     await tools.execute(
       'workspace.write',
@@ -508,6 +527,17 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
     await expect(searchWorkspace(root, '   ')).rejects.toThrow('Search query is required');
     await expect(runWorkspaceCommand('/bin/sh', [], root)).rejects.toThrow(
       'Absolute command is not allowlisted',
+    );
+    await expect(runWorkspaceCommand('printf "hello world"', [], root)).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: 'hello world',
+    });
+    await expect(runWorkspaceCommand('printf hello\\ world', [], root)).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: 'hello world',
+    });
+    await expect(runWorkspaceCommand('printf hi > output.txt', [], root)).rejects.toThrow(
+      'Shell operators are not supported',
     );
     await expect(
       runWorkspaceCommand(process.execPath, ['-e', 'process.exit(3)'], root),
@@ -1398,6 +1428,33 @@ describe('agent runtime orchestration', () => {
     unsubscribe();
   });
 
+  it('routes source keys across resumed, new, and switched sessions', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = new DeterministicProvider();
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ deterministic: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const first = runtime.getOrCreateSession('matrix:room', 'First');
+    expect(runtime.getOrCreateSession('matrix:room', 'Ignored').session.id).toBe(first.session.id);
+    const second = runtime.startNewSession('matrix:room');
+    expect(second.session.title).toBe('New session');
+    expect(runtime.switchSession('matrix:room', first.session.id).session.id).toBe(
+      first.session.id,
+    );
+    const third = runtime.createSession('Third');
+    expect(runtime.switchSession('matrix:room', third.session.id).session.id).toBe(
+      third.session.id,
+    );
+    expect(runtime.switchSession('matrix:room', third.session.id).session.id).toBe(
+      third.session.id,
+    );
+  });
+
   it('executes a real workspace tool call and records tool completion', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
@@ -1496,6 +1553,218 @@ describe('agent runtime orchestration', () => {
         },
       ]),
     );
+  });
+
+  it('reports tool failures, enforces tool-call limits, and executes MCP tools', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let turn = 0;
+    const provider = makeAgentProvider('tools', async function* () {
+      turn += 1;
+      if (turn === 1) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'missing.tool', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'recovered from tool failure' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const events: string[] = [];
+    const mcp = {
+      schemas: () => [
+        {
+          name: 'mcp.local.echo',
+          description: 'Echo through MCP',
+          parameters: { type: 'object' },
+        },
+      ],
+      execute: async () => ({ echoed: true }),
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ tools: provider, ollama }),
+      tools: new ToolRegistry(root),
+      mcp: mcp as never,
+    });
+    runtime.subscribe((event) => events.push(event.type));
+    const created = runtime.createSession('Tool failure');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'recover',
+      provider: 'tools',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'recovered from tool failure',
+    });
+    expect(events).toContain('tool.failed');
+    expect(
+      store
+        .listMessages(created.thread.id)
+        .some((message) => message.content.includes('Unknown tool')),
+    ).toBe(true);
+
+    let mcpTurn = 0;
+    const mcpProvider = makeAgentProvider('mcp-tools', async function* () {
+      mcpTurn += 1;
+      if (mcpTurn === 1) {
+        yield { type: 'tool_call', id: 'mcp-1', name: 'mcp.local.echo', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'MCP complete' };
+    });
+    const mcpRuntime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'mcp-tools': mcpProvider, ollama }),
+      tools: new ToolRegistry(root),
+      mcp: mcp as never,
+    });
+    const mcpSession = mcpRuntime.createSession('MCP runtime');
+    const mcpRun = mcpRuntime.startRun({
+      threadId: mcpSession.thread.id,
+      input: 'use MCP',
+      provider: 'mcp-tools',
+      permissions: permissive,
+    });
+    await expect(mcpRuntime.waitForRun(mcpRun.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'MCP complete',
+    });
+
+    let limitedTurn = 0;
+    const limitedProvider = makeAgentProvider('limited', async function* () {
+      limitedTurn += 1;
+      if (limitedTurn === 1) {
+        yield { type: 'tool_call', id: 'limited-1', name: 'workspace.list', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'unexpected' };
+    });
+    const limitedRuntime = new AgentRuntime({
+      root,
+      config: {
+        ...defaultRuntimeConfig(root),
+        limits: { ...defaultRuntimeConfig(root).limits, maxToolCalls: 0 },
+      },
+      store,
+      providers: providerMap({ limited: limitedProvider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const limitedSession = limitedRuntime.createSession('Tool limit');
+    const limitedRun = limitedRuntime.startRun({
+      threadId: limitedSession.thread.id,
+      input: 'exceed',
+      provider: 'limited',
+      permissions: permissive,
+    });
+    await expect(limitedRuntime.waitForRun(limitedRun.id)).resolves.toMatchObject({
+      status: 'failed',
+    });
+  });
+
+  it('bounds long context and does not persist capability refusals after embedding failure', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const refusalProvider = makeAgentProvider(
+      'refusal',
+      async function* () {
+        yield { type: 'done', text: "I can't access the requested workspace." };
+      },
+      async () => {
+        throw 'embedding unavailable';
+      },
+    );
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...defaultRuntimeConfig(root),
+        limits: { ...defaultRuntimeConfig(root).limits, maxContextBytes: 80 },
+      },
+      store,
+      providers: providerMap({ refusal: refusalProvider, ollama: refusalProvider }),
+      tools: new ToolRegistry(root),
+      identityContext: 'bounded identity',
+    });
+    const created = runtime.createSession('Bounded context');
+    store.addMessage(created.thread.id, 'user', 'old message '.repeat(20));
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'latest',
+      provider: 'refusal',
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: "I can't access the requested workspace.",
+    });
+    expect(store.searchMemoryRows()).toHaveLength(0);
+  });
+
+  it('reports run timeouts and embedding failures without changing the run result', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const hanging = makeAgentProvider('hanging', async function* (request) {
+      await new Promise<void>((resolvePromise) => {
+        if (request.signal?.aborted) return resolvePromise();
+        request.signal?.addEventListener('abort', () => resolvePromise(), { once: true });
+      });
+      if (request.signal?.aborted) return;
+      yield { type: 'done', text: 'unreachable' };
+    });
+    const timeoutRuntime = new AgentRuntime({
+      root,
+      config: {
+        ...defaultRuntimeConfig(root),
+        limits: { ...defaultRuntimeConfig(root).limits, runTimeoutMs: 10 },
+      },
+      store,
+      providers: providerMap({ hanging, ollama: hanging }),
+      tools: new ToolRegistry(root),
+    });
+    const timeoutSession = timeoutRuntime.createSession('Timeout');
+    const timed = timeoutRuntime.startRun({
+      threadId: timeoutSession.thread.id,
+      input: 'wait',
+      provider: 'hanging',
+    });
+    await expect(timeoutRuntime.waitForRun(timed.id)).resolves.toMatchObject({
+      status: 'cancelled',
+    });
+
+    const events: string[] = [];
+    const embeddingFailure = makeAgentProvider(
+      'embedding-failure',
+      async function* () {
+        yield { type: 'done', text: 'completed output' };
+      },
+      async () => {
+        throw 'embedding unavailable';
+      },
+    );
+    const embeddingRuntime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'embedding-failure': embeddingFailure, ollama: embeddingFailure }),
+      tools: new ToolRegistry(root),
+    });
+    embeddingRuntime.subscribe((event) => events.push(event.type));
+    const embeddingSession = embeddingRuntime.createSession('Embedding failure');
+    const completed = embeddingRuntime.startRun({
+      threadId: embeddingSession.thread.id,
+      input: 'finish',
+      provider: 'embedding-failure',
+    });
+    await expect(embeddingRuntime.waitForRun(completed.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'completed output',
+    });
+    expect(events).toContain('provider.unavailable');
   });
 
   it('only advertises tools allowed by the run permission context', async () => {

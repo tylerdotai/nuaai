@@ -50,12 +50,16 @@ The default path is local Ollama. Optional integrations are explicit: Codex uses
 - Ollama chat and embedding adapters through the local HTTP API.
 - Optional Codex CLI adapter using `codex exec --json`.
 - Matrix bridge with invite auto-join and outbound replies.
+- Matrix source-bound sessions with `/help`, `/status`, `/sessions`, `/new [title]`, and `/switch <session-id>` commands.
+- Matrix file, image, audio, video, and sticker ingestion with bounded private staging and `MEDIA:` file delivery.
 - Local web search through SearXNG with DuckDuckGo fallback.
 - Local page extraction through Crawl4AI → Playwright → FlareSolverr fallback order.
 - Headless Playwright browser automation with HTTP/HTTPS URL validation.
 - AES-256-GCM encrypted secrets and redacted API/UI output.
 - Workspace traversal and symlink protection, command allowlists, subprocess timeouts, and daemon authentication.
+- Bounded workspace file inspection for metadata and text previews; configured MCP servers are namespaced and permission-filtered.
 - Ink TUI, React web dashboard, CLI commands, and authenticated HTTP/WebSocket APIs.
+- Installable private NUAAI PWA with a daemon-backed agent command palette, mobile action bar, offline shell, and authenticated live runtime state.
 - Interactive onboarding with provider, integration, telemetry, Tailscale, and launch choices.
 
 ## Getting started
@@ -103,6 +107,21 @@ node dist/cli.js daemon
 ```
 
 The daemon binds to a generated high loopback port. Read the assigned port from `.nuaai/config.json`; runtime state is ignored by Git.
+
+### NUAAI PWA
+
+The React client is served by the authenticated daemon and can be installed to an iPhone Home Screen from a tailnet-reachable browser. Open the daemon URL, use the browser share menu, and choose **Add to Home Screen**.
+
+The **Agent commands** palette is NUAAI-native, not Element-native. It is available from the `Commands` button, the mobile bottom bar, or `⌘K` / `Ctrl+K`. Commands call the daemon directly:
+
+- **New session** creates and activates a durable session.
+- **Show status** checks the daemon and live provider health.
+- **Browse sessions** returns to the conversation/session surface.
+- **Refresh runtime** reloads sessions, events, providers, memory, and schedules.
+- **Ask NUAAI** focuses the authenticated agent composer.
+- **Cancel active run** requests cancellation for the current run.
+
+The service worker caches only the static shell. `/api/*` and WebSocket traffic are never cached, so sessions and agent state remain live.
 
 ## Onboarding
 
@@ -159,12 +178,17 @@ When enabled, the runtime exposes:
 - `workspace.read`
 - `workspace.write`
 - `workspace.search`
+- `workspace.inspect`
 - `workspace.command`
 - `web.search`
 - `web.fetch`
 - `browser.open`
 
 Network-backed tools require the runtime network capability. Tool registration follows onboarding feature choices.
+
+The command tool is intentionally allowlisted rather than an unrestricted shell. MCP and computer-use servers are disabled by default and require explicit local configuration plus matching permissions.
+
+For Matrix sessions, ordinary messages from the same room and sender reuse the same durable source-bound session. Use `/help` for the command list, `/status` for the active session, `/new [title]` to create a fresh session, `/sessions` to list the room's sessions, and `/switch <session-id>` to change the active session. Unknown slash commands return help instead of being sent to the model.
 
 ## Phone access
 

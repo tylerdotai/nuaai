@@ -10,6 +10,7 @@ import { harnessConfig } from './config/index.js';
 import type { AgentRuntime } from './core/runtime.js';
 import type { Scheduler } from './core/scheduler.js';
 import { validateToken } from './gateway/token.js';
+import type { McpManager } from './integrations/mcp.js';
 import type { DatabaseStore } from './memory/db.js';
 import type { PluginRegistry } from './plugins/registry.js';
 import type { ProviderRegistry } from './providers/registry.js';
@@ -30,6 +31,7 @@ export interface GatewayServices {
   skills: SkillRegistry;
   plugins: PluginRegistry;
   secrets: SecretsManager;
+  mcp?: McpManager;
 }
 
 function tokenFromRequest(request: Request): string | null {
@@ -46,7 +48,10 @@ function contentType(path: string): string {
   if (path.endsWith('.html')) return 'text/html; charset=utf-8';
   if (path.endsWith('.js')) return 'text/javascript; charset=utf-8';
   if (path.endsWith('.css')) return 'text/css; charset=utf-8';
-  if (path.endsWith('.json')) return 'application/json; charset=utf-8';
+  if (path.endsWith('.json') || path.endsWith('.webmanifest'))
+    return path.endsWith('.webmanifest')
+      ? 'application/manifest+json; charset=utf-8'
+      : 'application/json; charset=utf-8';
   if (path.endsWith('.svg')) return 'image/svg+xml';
   return 'application/octet-stream';
 }
@@ -97,6 +102,12 @@ export function createApp(services: GatewayServices): Hono {
     const session = services.runtime.getSession(context.req.param('id'));
     return session
       ? context.json({ session, threads: services.runtime.listThreads(session.id) })
+      : context.json({ error: 'Session not found' }, 404);
+  });
+  app.post('/api/sessions/:id/switch', (context) => {
+    const session = services.runtime.getSession(context.req.param('id'));
+    return session
+      ? context.json({ session, threads: services.runtime.listThreads(session.id), active: true })
       : context.json({ error: 'Session not found' }, 404);
   });
   app.get('/api/threads/:id/messages', (context) =>
@@ -153,6 +164,9 @@ export function createApp(services: GatewayServices): Hono {
   });
   app.get('/api/providers', async (context) =>
     context.json({ providers: await services.runtime.providerHealth() }),
+  );
+  app.get('/api/mcp', (context) =>
+    context.json(services.mcp?.status() ?? { servers: [], failures: {} }),
   );
   app.get('/api/memory', (context) =>
     context.json({
@@ -272,7 +286,7 @@ export function createApp(services: GatewayServices): Hono {
   });
 
   app.get('/*', async (context) => {
-    const webRoot = resolve(services.root, 'dist/web');
+    const webRoot = fileURLToPath(new URL('../dist/web', import.meta.url));
     const requested = context.req.path === '/' ? 'index.html' : context.req.path.replace(/^\//, '');
     const path = resolve(webRoot, requested);
     const safe = path === webRoot || path.startsWith(`${webRoot}/`);
@@ -316,11 +330,15 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       for await (const chunk of request)
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       const url = `http://${request.headers.host ?? `${services.host}:${services.port}`}${request.url ?? '/'}`;
+      const requestUrl = new URL(url);
+      if (requestUrl.pathname === '/nuaai' || requestUrl.pathname.startsWith('/nuaai/')) {
+        requestUrl.pathname = requestUrl.pathname.slice('/nuaai'.length) || '/';
+      }
       const headers = new Headers();
       for (const [key, value] of Object.entries(request.headers))
         if (value) headers.set(key, Array.isArray(value) ? value.join(',') : value);
       const method = request.method ?? 'GET';
-      const webRequest = new Request(url, {
+      const webRequest = new Request(requestUrl, {
         method,
         headers,
         body: method === 'GET' || method === 'HEAD' ? undefined : Buffer.concat(chunks),

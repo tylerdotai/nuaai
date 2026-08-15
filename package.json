@@ -6,14 +6,7 @@
   "bin": {
     "nuaai": "./dist/cli.js"
   },
-  "files": [
-    "dist",
-    "scripts",
-    "deploy",
-    "docs",
-    "README.md",
-    "LICENSE"
-  ],
+  "files": ["dist", "scripts", "deploy", "docs", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
     "url": "https://github.com/tylerdotai/nuaai.git"
@@ -33,7 +26,7 @@
     "lint": "biome lint src tests scripts .config",
     "check": "biome check src tests scripts .config && npm run typecheck",
     "test": "vitest run",
-    "test:e2e": "playwright test",
+    "test:e2e": "node scripts/run-e2e.mjs",
     "test:coverage": "vitest run --coverage",
     "version:check": "node scripts/check-version.mjs",
     "gate": "npm run version:check && npm run check && npm test && npm run build && npm run build:web"

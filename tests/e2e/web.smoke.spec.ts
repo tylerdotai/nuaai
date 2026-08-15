@@ -5,6 +5,21 @@ test('built web client creates a session and renders a live daemon run', async (
   await expect(page.locator('header h1')).toHaveText('NUAAI');
   const status = page.locator('.status');
   await expect(status).toContainText('Connected', { timeout: 30_000 });
+  await expect(page.locator('link[rel="manifest"]')).toHaveAttribute(
+    'href',
+    'manifest.webmanifest',
+  );
+  await page.getByRole('button', { name: /Commands/ }).click();
+  const commandPalette = page.getByRole('dialog', { name: 'Agent commands' });
+  await expect(commandPalette).toBeVisible();
+  await expect(commandPalette.getByRole('button', { name: /New session/ })).toBeVisible();
+  await expect(commandPalette.getByRole('button', { name: /Show status/ })).toBeVisible();
+  await expect(commandPalette.getByRole('button', { name: /Browse sessions/ })).toBeVisible();
+  await expect(commandPalette.getByRole('button', { name: /Refresh runtime/ })).toBeVisible();
+  await expect(commandPalette.getByRole('button', { name: /Ask NUAAI/ })).toBeVisible();
+  await expect(commandPalette.getByRole('button', { name: /Cancel active run/ })).toBeDisabled();
+  await commandPalette.getByRole('button', { name: /Show status/ }).click();
+  await expect(status).toContainText('online');
 
   const initialSessionCount = await page.locator('.session').count();
   await page.getByRole('button', { name: '+ New session' }).click();

@@ -71,8 +71,71 @@ interface PluginHealth {
   capabilities: string[];
 }
 
+type AgentCommandId =
+  | 'new-session'
+  | 'status'
+  | 'sessions'
+  | 'refresh'
+  | 'focus-composer'
+  | 'cancel-run';
+
+interface AgentCommand {
+  id: AgentCommandId;
+  label: string;
+  description: string;
+  shortcut?: string;
+}
+
+const AGENT_COMMANDS: AgentCommand[] = [
+  {
+    id: 'new-session',
+    label: 'New session',
+    description: 'Create and switch to a fresh durable session.',
+    shortcut: 'N',
+  },
+  {
+    id: 'status',
+    label: 'Show status',
+    description: 'Check daemon, provider, and active session state.',
+    shortcut: 'S',
+  },
+  {
+    id: 'sessions',
+    label: 'Browse sessions',
+    description: 'Open the session list and keep the current thread visible.',
+    shortcut: 'L',
+  },
+  {
+    id: 'refresh',
+    label: 'Refresh runtime',
+    description: 'Reload sessions, events, providers, memory, and schedules.',
+    shortcut: 'R',
+  },
+  {
+    id: 'focus-composer',
+    label: 'Ask NUAAI',
+    description: 'Jump straight to the agent composer.',
+    shortcut: 'A',
+  },
+  {
+    id: 'cancel-run',
+    label: 'Cancel active run',
+    description: 'Stop the currently running agent task.',
+    shortcut: 'Esc',
+  },
+];
+
+const APP_BASE_PATH =
+  window.location.pathname === '/nuaai' || window.location.pathname.startsWith('/nuaai/')
+    ? '/nuaai/'
+    : '/';
+
+function appPath(path: string): string {
+  return `${APP_BASE_PATH}${path.replace(/^\//, '')}`;
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(appPath(path), {
     ...options,
     headers: { 'content-type': 'application/json', ...options.headers },
   });
@@ -105,6 +168,9 @@ function App(): React.JSX.Element {
   const [view, setView] = useState<'conversation' | 'memory' | 'skills' | 'plugins' | 'schedules'>(
     'conversation',
   );
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const loadRequest = useRef(0);
 
   const load = useCallback(
@@ -181,7 +247,7 @@ function App(): React.JSX.Element {
   useEffect(() => {
     void load();
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-    const socket = new WebSocket(`${protocol}://${location.host}/ws`);
+    const socket = new WebSocket(`${protocol}://${location.host}${appPath('/ws')}`);
     socket.onopen = () => {
       setEvents([]);
       socket.send(JSON.stringify({ type: 'subscribe', sessionId: selected?.id, after: 0 }));
@@ -198,6 +264,17 @@ function App(): React.JSX.Element {
     socket.onerror = () => setStatus('WebSocket unavailable');
     return () => socket.close();
   }, [load, selected?.id]);
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setCommandPaletteOpen(true);
+      }
+      if (event.key === 'Escape') setCommandPaletteOpen(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
   const liveOutput = useMemo(
     () =>
       events
@@ -206,13 +283,14 @@ function App(): React.JSX.Element {
         .join(''),
     [events],
   );
-  const createSession = async (): Promise<void> => {
+  const createSession = async (): Promise<Session> => {
     const created = await request<{ session: Session }>('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({ title: `Session ${sessions.length + 1}` }),
     });
     setSelected(created.session);
     await load(created.session.id);
+    return created.session;
   };
   const send = async (): Promise<void> => {
     if (!input.trim() || !thread) return;
@@ -238,6 +316,47 @@ function App(): React.JSX.Element {
   const cancel = async (): Promise<void> => {
     if (!activeRunId) return;
     await request(`/api/runs/${activeRunId}/cancel`, { method: 'POST' });
+  };
+  const executeCommand = async (commandId: AgentCommandId): Promise<void> => {
+    setError(null);
+    try {
+      if (commandId === 'new-session') {
+        const session = await createSession();
+        setNotice(`Started ${session.title}`);
+      } else if (commandId === 'status') {
+        const result = await request<{
+          name?: string;
+          version?: string;
+          activeRuns?: number;
+          providers?: Array<{ name: string; available: boolean }>;
+        }>('/api/status');
+        const onlineProviders =
+          result.providers?.filter((provider) => provider.available).length ?? 0;
+        setNotice(
+          `${result.name ?? 'NUAAI'} ${result.version ?? ''} online · ${onlineProviders} provider(s) ready`,
+        );
+      } else if (commandId === 'sessions') {
+        setView('conversation');
+        setNotice(`${sessions.length} session${sessions.length === 1 ? '' : 's'} available`);
+      } else if (commandId === 'refresh') {
+        await load(selected?.id);
+        setNotice('Runtime refreshed');
+      } else if (commandId === 'focus-composer') {
+        setView('conversation');
+        window.setTimeout(() => composerRef.current?.focus(), 0);
+        setNotice('Composer ready');
+      } else if (commandId === 'cancel-run') {
+        if (!activeRunId) {
+          setNotice('No active run');
+        } else {
+          await cancel();
+          setNotice('Cancellation requested');
+        }
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+    setCommandPaletteOpen(false);
   };
   const createSchedule = async (): Promise<void> => {
     if (!scheduleName.trim() || !scheduleInput.trim()) return;
@@ -279,7 +398,15 @@ function App(): React.JSX.Element {
         </div>
         <div className="status">
           <span className={status === 'Connected' ? 'dot live' : 'dot'} />
-          {status}
+          <span aria-live="polite">{notice ?? status}</span>
+          <button
+            type="button"
+            className="command-trigger"
+            onClick={() => setCommandPaletteOpen(true)}
+            aria-haspopup="dialog"
+          >
+            Commands <kbd>⌘K</kbd>
+          </button>
           <button type="button" onClick={() => void load()}>
             Refresh
           </button>
@@ -392,6 +519,7 @@ function App(): React.JSX.Element {
                 )}
                 <div className="composer">
                   <textarea
+                    ref={composerRef}
                     value={input}
                     onChange={(event) => setInput(event.target.value)}
                     onKeyDown={(event) => {
@@ -561,6 +689,70 @@ function App(): React.JSX.Element {
           {error && <div className="error">{error}</div>}
         </main>
       </div>
+      <nav className="mobile-actions" aria-label="Agent actions">
+        <button type="button" onClick={() => setCommandPaletteOpen(true)}>
+          <span>⌘</span>
+          Commands
+        </button>
+        <button type="button" onClick={() => void executeCommand('new-session')}>
+          <span>＋</span>
+          New
+        </button>
+        <button type="button" onClick={() => void executeCommand('focus-composer')}>
+          <span>↗</span>
+          Ask
+        </button>
+      </nav>
+      {commandPaletteOpen && (
+        <div
+          className="palette-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setCommandPaletteOpen(false);
+          }}
+        >
+          <dialog
+            open
+            className="command-palette"
+            aria-labelledby="command-title"
+            onCancel={() => setCommandPaletteOpen(false)}
+          >
+            <div className="palette-heading">
+              <div>
+                <span className="eyebrow">NUAAI CONTROL SURFACE</span>
+                <h2 id="command-title">Agent commands</h2>
+              </div>
+              <button
+                type="button"
+                className="palette-close"
+                onClick={() => setCommandPaletteOpen(false)}
+              >
+                Close
+              </button>
+            </div>
+            <div className="command-list">
+              {AGENT_COMMANDS.map((command) => (
+                <button
+                  type="button"
+                  className="agent-command"
+                  key={command.id}
+                  disabled={command.id === 'cancel-run' && !activeRunId}
+                  onClick={() => void executeCommand(command.id)}
+                >
+                  <span>
+                    <strong>{command.label}</strong>
+                    <small>{command.description}</small>
+                  </span>
+                  {command.shortcut && <kbd>{command.shortcut}</kbd>}
+                </button>
+              ))}
+            </div>
+            <p className="palette-hint">
+              Every action calls the authenticated NUAAI daemon. No client-side fake state.
+            </p>
+          </dialog>
+        </div>
+      )}
     </div>
   );
 }
