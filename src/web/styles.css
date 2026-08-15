@@ -1,0 +1,341 @@
+:root {
+  color-scheme: dark;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  background: #0b0d0f;
+  color: #f3f0e8;
+  font-synthesis: none;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-width: 320px;
+  background: radial-gradient(circle at 80% -10%, #1a322e 0, transparent 34rem), #0b0d0f;
+}
+button,
+textarea {
+  font: inherit;
+}
+button {
+  cursor: pointer;
+}
+.app {
+  min-height: 100vh;
+}
+.topbar {
+  align-items: center;
+  border-bottom: 1px solid #293036;
+  display: flex;
+  justify-content: space-between;
+  padding: 2.2rem clamp(1.2rem, 4vw, 4.5rem) 1.5rem;
+}
+.eyebrow {
+  color: #76e3bf;
+  font: 500 .68rem "DM Mono", monospace;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+}
+h1,
+h2,
+p {
+  margin: 0;
+}
+h1 {
+  font-size: clamp(2.5rem, 6vw, 5.2rem);
+  letter-spacing: -.08em;
+  line-height: 0.9;
+}
+.topbar p {
+  color: #8e9b9e;
+  font: .82rem "DM Mono", monospace;
+  margin-top: .65rem;
+}
+.status {
+  align-items: center;
+  color: #aeb9b9;
+  display: flex;
+  gap: .6rem;
+  font: .76rem "DM Mono", monospace;
+}
+.status button,
+.new-session {
+  background: transparent;
+  border: 1px solid #3e5753;
+  color: #a9eed8;
+  padding: .55rem .8rem;
+}
+.status button {
+  margin-left: .8rem;
+}
+.dot {
+  background: #657176;
+  border-radius: 50%;
+  display: inline-block;
+  height: .5rem;
+  width: .5rem;
+}
+.dot.live {
+  background: #70e0b4;
+  box-shadow: 0 0 12px #70e0b4;
+}
+.layout {
+  display: grid;
+  grid-template-columns: 18rem 1fr;
+  min-height: calc(100vh - 9.5rem);
+}
+.sidebar {
+  border-right: 1px solid #293036;
+  display: flex;
+  flex-direction: column;
+  gap: .65rem;
+  padding: 1.5rem;
+}
+.sidebar h2 {
+  color: #8e9b9e;
+  font: 500 .7rem "DM Mono", monospace;
+  letter-spacing: .14em;
+  margin-top: 1.2rem;
+  text-transform: uppercase;
+}
+.session {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #d8ded9;
+  display: flex;
+  flex-direction: column;
+  gap: .3rem;
+  padding: .7rem;
+  text-align: left;
+}
+.session:hover,
+.session.selected {
+  background: #13231f;
+  border-color: #2e594e;
+}
+.session small,
+.provider small {
+  color: #778486;
+  font: .68rem "DM Mono", monospace;
+}
+.sidebar-footer {
+  border-top: 1px solid #293036;
+  margin-top: auto;
+  padding-top: 1.2rem;
+}
+.sidebar-footer > span {
+  color: #8e9b9e;
+  display: block;
+  font: .68rem "DM Mono", monospace;
+  margin-bottom: .7rem;
+  text-transform: uppercase;
+}
+.provider {
+  align-items: center;
+  display: flex;
+  gap: .45rem;
+  padding: .3rem 0;
+}
+.provider small {
+  margin-left: auto;
+}
+.main {
+  max-width: 1100px;
+  padding: 1rem clamp(1rem, 4vw, 4.5rem) 3rem;
+  width: 100%;
+}
+.tabs {
+  border-bottom: 1px solid #293036;
+  display: flex;
+  gap: .4rem;
+  overflow-x: auto;
+}
+.tabs button {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: #778486;
+  padding: .9rem .8rem;
+  text-transform: capitalize;
+}
+.tabs button.active {
+  border-bottom-color: #72dbb5;
+  color: #f3f0e8;
+}
+.tabs small {
+  color: #72dbb5;
+  margin-left: .35rem;
+}
+.panel {
+  margin-top: 1.5rem;
+}
+.conversation {
+  background: rgba(16, 21, 22, 0.9);
+  border: 1px solid #29383a;
+  min-height: 32rem;
+}
+.panel-heading {
+  align-items: center;
+  border-bottom: 1px solid #293036;
+  display: flex;
+  justify-content: space-between;
+  padding: 1.2rem 1.4rem;
+}
+.panel-heading h2,
+.secondary h2 {
+  font-size: 1.4rem;
+  letter-spacing: -.04em;
+  margin-top: .45rem;
+}
+.chip {
+  border: 1px solid #315b4f;
+  color: #72dbb5;
+  font: .68rem "DM Mono", monospace;
+  padding: .3rem .5rem;
+}
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 24rem;
+  padding: 1.4rem;
+}
+.message {
+  max-width: 75%;
+}
+.message.user {
+  align-self: flex-end;
+  background: #173b32;
+  padding: .8rem 1rem;
+}
+.message.assistant {
+  align-self: flex-start;
+}
+.message.tool {
+  color: #91a09e;
+  font: .78rem "DM Mono", monospace;
+}
+.role {
+  color: #72dbb5;
+  display: block;
+  font: .66rem "DM Mono", monospace;
+  letter-spacing: .1em;
+  margin-bottom: .35rem;
+  text-transform: uppercase;
+}
+.message p {
+  color: #dbe2dc;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.cursor {
+  animation: blink 1s infinite;
+  border-right: 2px solid #72dbb5;
+  margin-left: .2rem;
+}
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+.composer {
+  border-top: 1px solid #293036;
+  display: flex;
+  gap: .7rem;
+  padding: 1rem;
+}
+textarea {
+  background: #0c1112;
+  border: 1px solid #354449;
+  color: #f3f0e8;
+  min-height: 3rem;
+  outline: none;
+  padding: .8rem;
+  resize: vertical;
+  width: 100%;
+}
+textarea:focus {
+  border-color: #72dbb5;
+}
+.composer button {
+  background: #72dbb5;
+  border: 0;
+  color: #0b0d0f;
+  font-weight: 600;
+  padding: 0 1rem;
+}
+.composer button:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+.stats {
+  display: grid;
+  gap: 1px;
+  grid-template-columns: repeat(4, 1fr);
+  margin-top: 1px;
+}
+.stats div {
+  background: #131a1b;
+  padding: 1rem;
+}
+.stats span {
+  color: #778486;
+  display: block;
+  font: .65rem "DM Mono", monospace;
+  text-transform: uppercase;
+}
+.stats strong {
+  display: block;
+  font-size: 1.6rem;
+  margin-top: .35rem;
+}
+.secondary {
+  border: 1px solid #29383a;
+  min-height: 20rem;
+  padding: 2rem;
+}
+.empty {
+  color: #778486;
+  font-size: .8rem;
+  padding: .7rem;
+}
+.empty.large {
+  align-items: center;
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  min-height: 15rem;
+  text-align: center;
+}
+.error {
+  background: #421e24;
+  border: 1px solid #8b4650;
+  color: #ffb5b5;
+  margin-top: 1rem;
+  padding: .8rem 1rem;
+}
+@media (max-width: 760px) {
+  .topbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 1.5rem;
+  }
+  .layout {
+    display: block;
+  }
+  .sidebar {
+    border-bottom: 1px solid #293036;
+    border-right: 0;
+    max-height: 19rem;
+    overflow: auto;
+  }
+  .sidebar-footer {
+    margin-top: 1rem;
+  }
+  .message {
+    max-width: 92%;
+  }
+  .stats {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}

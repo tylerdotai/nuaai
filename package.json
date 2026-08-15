@@ -6,18 +6,23 @@
   "bin": {
     "nuai": "./dist/cli.js"
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "dev": "tsx src/cli.tsx",
     "dev:server": "tsx src/server.ts",
     "dev:web": "vite --config src/web/vite.config.ts",
-    "build": "tsup src/cli.tsx src/server.ts --format esm --clean --out-dir dist",
+    "build": "tsup src/cli.tsx src/server.ts src/daemon.ts --format esm --clean --out-dir dist",
     "build:web": "vite build --config src/web/vite.config.ts",
     "typecheck": "tsc --noEmit",
     "format": "biome format --write src tests scripts .config *.json *.ts",
     "lint": "biome lint src tests scripts .config",
     "check": "biome check src tests scripts .config && npm run typecheck",
     "test": "vitest run",
+    "test:e2e": "playwright test",
     "test:coverage": "vitest run --coverage",
     "version:check": "node scripts/check-version.mjs",
     "gate": "npm run version:check && npm run check && npm test && npm run build && npm run build:web"
@@ -36,11 +41,7 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@ai-sdk/anthropic": "4.0.39",
-    "@ai-sdk/google": "4.0.44",
-    "@ai-sdk/openai": "4.0.42",
     "@hono/node-server": "2.1.1",
-    "ai": "7.0.66",
     "better-sqlite3": "13.0.3",
     "diff": "9.0.0",
     "dotenv": "16.6.1",
@@ -50,16 +51,17 @@
     "fast-glob": "3.3.3",
     "hono": "4.13.2",
     "ink": "7.1.1",
-    "ollama-ai-provider": "1.2.0",
     "pathe": "2.0.3",
     "picocolors": "1.1.1",
     "react": "19.2.8",
+    "react-dom": "^19.2.8",
     "sqlite-vec": "0.1.9",
     "ws": "8.21.3",
     "zod": "3.25.76"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
+    "@playwright/test": "^1.59.1",
     "@types/better-sqlite3": "7.6.12",
     "@types/node": "22.10.0",
     "@types/react": "19.2.18",
@@ -68,9 +70,9 @@
     "@vitest/coverage-v8": "4.1.10",
     "ts-morph": "28.0.0",
     "tsup": "8.5.1",
-    "tsx": "4.19.2",
+    "tsx": "^4.23.12",
     "typescript": "5.7.2",
-    "vite": "6.4.1",
+    "vite": "^6.4.3",
     "vitest": "4.1.10"
   },
   "allowScripts": {
@@ -78,6 +80,12 @@
     "better-sqlite3@13.0.3": true,
     "esbuild@0.25.12": true,
     "esbuild@0.27.7": true,
-    "esbuild@0.23.1": true
+    "esbuild@0.23.1": true,
+    "esbuild@0.28.2": true
+  },
+  "overrides": {
+    "tsup": {
+      "esbuild": "0.28.2"
+    }
   }
 }
