@@ -631,6 +631,23 @@ export class DatabaseStore {
       .filter((memory): memory is NonNullable<typeof memory> => Boolean(memory));
   }
 
+  deleteMemory(id: string): boolean {
+    const reference = this.database.raw
+      .prepare('SELECT vector_rowid FROM memory_vector_refs WHERE memory_id = ?')
+      .get(id) as { vector_rowid: number } | undefined;
+    const transaction = this.database.raw.transaction(() => {
+      if (reference) {
+        this.database.raw
+          .prepare('DELETE FROM memory_vectors WHERE rowid = ?')
+          .run(reference.vector_rowid);
+        this.database.raw.prepare('DELETE FROM memory_vector_refs WHERE memory_id = ?').run(id);
+      }
+      const result = this.database.raw.prepare('DELETE FROM memory_records WHERE id = ?').run(id);
+      return result.changes > 0;
+    });
+    return Boolean(transaction());
+  }
+
   searchMemoryRows(): Array<{
     id: string;
     content: string;

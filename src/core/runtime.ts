@@ -183,11 +183,21 @@ export class AgentRuntime {
     return this.options.store.listMessages(threadId);
   }
 
+  private activeProvider(): { name: string; model: string } {
+    const registry = this.options.providers as ProviderRegistry & {
+      active?: () => { name: string; model: string };
+    };
+    if (registry.active) return registry.active();
+    const name = this.options.config.provider.name;
+    return { name, model: registry.get(name).model };
+  }
+
   startRun(request: RunRequest): RunRow {
     if (!request.input.trim()) throw new Error('Run input is required');
-    const providerName = request.provider ?? this.options.config.provider.name;
+    const active = this.activeProvider();
+    const providerName = request.provider ?? active.name;
     const provider = this.options.providers.get(providerName);
-    const model = request.model ?? provider.model;
+    const model = request.model ?? (providerName === active.name ? active.model : provider.model);
     const thread = this.options.store.getThread(request.threadId);
     if (!thread) throw new Error(`Unknown thread: ${request.threadId}`);
     const correlationId = randomUUID();
@@ -261,11 +271,17 @@ export class AgentRuntime {
   async providerHealth() {
     return this.options.providers.health();
   }
-  status(): { activeRuns: number; sessions: number; providers: string[] } {
+  status(): {
+    activeRuns: number;
+    sessions: number;
+    providers: string[];
+    active: { name: string; model: string };
+  } {
     return {
       activeRuns: this.controllers.size,
       sessions: this.options.store.listSessions().length,
       providers: this.options.providers.list(),
+      active: this.activeProvider(),
     };
   }
 

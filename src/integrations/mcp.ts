@@ -218,10 +218,158 @@ export class McpManager {
     return server.call(tool, argumentsValue);
   }
 
-  status(): { servers: string[]; failures: Record<string, string> } {
-    return { servers: [...this.servers.keys()], failures: Object.fromEntries(this.failures) };
+  status(): {
+    servers: string[];
+    failures: Record<string, string>;
+    tools: Array<{
+      name: string;
+      description: string;
+      permission: PermissionLevel;
+      server: string;
+    }>;
+  } {
+    return {
+      servers: [...this.servers.keys()],
+      failures: Object.fromEntries(this.failures),
+      tools: [...this.servers.values()].flatMap((server) =>
+        server.listTools().map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          permission: tool.permission,
+          server: tool.server,
+        })),
+      ),
+    };
   }
 
+  discover(
+    permissions: PermissionContext,
+  ): Array<Omit<McpToolSchema, 'remoteName' | 'server' | 'permission'>> {
+    return this.schemas(permissions);
+  }
+
+  async executeComputer(
+    action: string,
+    args: Record<string, unknown>,
+    permissions: PermissionContext,
+  ): Promise<unknown> {
+    const actionName = action.trim().toLowerCase();
+    const readActions = new Set(['capture', 'list_apps', 'list_windows']);
+    const requiredPermission: PermissionLevel = readActions.has(actionName) ? 'read' : 'execute';
+    if (!permissions.approved.has(requiredPermission))
+      throw new Error(`Permission required: ${requiredPermission}`);
+    const tools = [...this.servers.values()]
+      .flatMap((server) => server.listTools())
+      .filter((tool) => tool.server === 'computer');
+    if (!tools.length) throw new Error('Computer-use MCP server is unavailable');
+    const byRemoteName = new Map(tools.map((tool) => [tool.remoteName, tool]));
+    const coordinate = Array.isArray(args.coordinate) ? args.coordinate : undefined;
+    const forwarded: Record<string, unknown> = { ...args };
+    if (coordinate?.length === 2) {
+      forwarded.x = coordinate[0];
+      forwarded.y = coordinate[1];
+    }
+    if (args.element !== undefined) forwarded.element_index = args.element;
+    forwarded.action = undefined;
+    forwarded.coordinate = undefined;
+    forwarded.element = undefined;
+    let remoteName: string;
+    switch (actionName) {
+      case 'capture':
+        remoteName =
+          args.app &&
+          ['screen', 'desktop', 'fullscreen', 'all'].includes(String(args.app).toLowerCase())
+            ? 'get_desktop_state'
+            : 'get_window_state';
+        if (remoteName === 'get_window_state') {
+          forwarded.include_screenshot = true;
+          if (args.max_elements !== undefined) forwarded.max_elements = args.max_elements;
+        }
+        break;
+      case 'list_apps':
+      case 'list_windows':
+      case 'click':
+      case 'double_click':
+      case 'right_click':
+      case 'middle_click':
+      case 'drag':
+      case 'scroll':
+      case 'type':
+      case 'set_value':
+        remoteName =
+          actionName === 'type'
+            ? 'type_text'
+            : actionName === 'set_value'
+              ? 'set_value'
+              : actionName;
+        break;
+      case 'key': {
+        const parts = String(args.keys ?? '')
+          .split(/[+\\-]/)
+          .map((part) => part.trim())
+          .filter(Boolean);
+        if (!parts.length) throw new Error('key requires keys');
+        if (parts.length === 1) {
+          remoteName = 'press_key';
+          forwarded.key = parts[0];
+          forwarded.keys = undefined;
+        } else {
+          remoteName = 'hotkey';
+          forwarded.keys = parts;
+        }
+        break;
+      }
+      default:
+        throw new Error(`Unsupported computer-use action: ${actionName}`);
+    }
+    if (actionName === 'double_click') {
+      remoteName = byRemoteName.has('double_click') ? 'double_click' : 'click';
+      if (remoteName === 'click') forwarded.count = 2;
+    }
+    if (actionName === 'right_click' || actionName === 'middle_click') {
+      if (!byRemoteName.has(remoteName)) {
+        remoteName = 'click';
+        forwarded.button = actionName === 'right_click' ? 'right' : 'middle';
+      }
+    }
+    if (actionName === 'type') forwarded.text = args.text ?? '';
+    if (actionName === 'set_value') forwarded.value = args.value ?? '';
+    if (actionName === 'drag') {
+      const from = Array.isArray(args.from_coordinate) ? args.from_coordinate : [];
+      const to = Array.isArray(args.to_coordinate) ? args.to_coordinate : [];
+      if (from.length === 2) {
+        forwarded.from_x = from[0];
+        forwarded.from_y = from[1];
+      }
+      if (to.length === 2) {
+        forwarded.to_x = to[0];
+        forwarded.to_y = to[1];
+      }
+      forwarded.from_coordinate = undefined;
+      forwarded.to_coordinate = undefined;
+    }
+    if (
+      actionName === 'type' &&
+      /(curl|wget)\s+[^|]*\|\s*(bash|sh)|\bsudo\s+rm\s+-[rf]|\brm\s+-rf\s+\u002f\s*$/i.test(
+        String(forwarded.text),
+      )
+    )
+      throw new Error('Blocked dangerous type payload');
+    if (actionName === 'key') {
+      const normalized = String(args.keys ?? '')
+        .toLowerCase()
+        .replace(/[-\s]/g, '+');
+      if (
+        ['win+l', 'ctrl+alt+delete', 'ctrl+alt+del', 'alt+f4', 'cmd+shift+q'].includes(normalized)
+      )
+        throw new Error('Blocked destructive key combination');
+    }
+    const tool = byRemoteName.get(remoteName);
+    if (!tool) throw new Error(`Computer-use MCP tool unavailable: ${remoteName}`);
+    const server = this.servers.get(tool.server);
+    if (!server) throw new Error(`Computer-use MCP server unavailable: ${tool.server}`);
+    return server.call(tool, forwarded);
+  }
   stop(): void {
     for (const server of this.servers.values()) server.stop();
     this.servers.clear();

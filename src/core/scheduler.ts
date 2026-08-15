@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import type { DatabaseStore } from '../memory/db.js';
+import type { DatabaseStore, TaskRow } from '../memory/db.js';
 import type { EventType } from './events.js';
 
 export type ScheduleType = 'once' | 'interval' | 'cron' | 'manual' | 'startup';
@@ -223,6 +223,35 @@ export class Scheduler {
     return this.store.listTasks();
   }
 
+  createTask(agentInput: string, name = 'Background task'): TaskRow {
+    if (!agentInput.trim()) throw new Error('Background task input is required');
+    const task = this.store.createTask(
+      'background.run',
+      {
+        name: name.trim() || 'Background task',
+        agentInput,
+        attempts: 0,
+        maxAttempts: defaultSchedulePolicy.maxAttempts,
+        retryDelayMs: defaultSchedulePolicy.retryDelayMs,
+      },
+      null,
+    );
+    const pseudoSchedule: Schedule = {
+      id: `task:${task.id}`,
+      name: name.trim() || 'Background task',
+      type: 'manual',
+      expression: '',
+      agentInput,
+      enabled: false,
+      nextRunAt: null,
+      lastRunAt: null,
+      policy: defaultSchedulePolicy,
+    };
+    this.onEvent('task.queued', { kind: task.kind }, { taskId: task.id });
+    void this.executeTask(task, pseudoSchedule);
+    return task;
+  }
+
   cancelTask(id: string): void {
     const task = this.store.listTasks().find((entry) => entry.id === id);
     if (!task) throw new Error(`Unknown task: ${id}`);
@@ -286,7 +315,6 @@ export class Scheduler {
   private async runSchedule(schedule: Schedule): Promise<void> {
     const active = this.running.get(schedule.id) ?? 0;
     if (active >= schedule.policy.concurrencyLimit) return;
-    this.running.set(schedule.id, active + 1);
     const now = Date.now();
     const next =
       schedule.type === 'once' || schedule.type === 'startup'
@@ -311,6 +339,13 @@ export class Scheduler {
       { name: schedule.name, agentInput: schedule.agentInput },
       { taskId: schedule.id },
     );
+    await this.executeTask(task, { ...schedule, lastRunAt: now, nextRunAt: next });
+  }
+
+  private async executeTask(task: TaskRow, schedule: Schedule): Promise<void> {
+    const active = this.running.get(schedule.id) ?? 0;
+    if (active >= schedule.policy.concurrencyLimit) return;
+    this.running.set(schedule.id, active + 1);
     let taskPayload = { ...task.payload };
     try {
       this.store.updateTask(task.id, 'running', taskPayload);
@@ -323,7 +358,7 @@ export class Scheduler {
         taskPayload = { ...taskPayload, attempts: attempt };
         this.store.updateTask(task.id, 'running', taskPayload);
         try {
-          await this.onRun({ ...schedule, lastRunAt: now, nextRunAt: next }, task.id);
+          await this.onRun(schedule, task.id);
           const completed = this.store.listTasks().find((entry) => entry.id === task.id);
           if (completed?.status !== 'cancelled') {
             this.store.updateTask(task.id, 'completed', taskPayload);

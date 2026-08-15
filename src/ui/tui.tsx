@@ -117,12 +117,14 @@ async function loadCatalog(baseUrl: string, token: string): Promise<TuiEvent> {
     }>(baseUrl, token, '/api/plugins'),
     request<{
       providers: Array<{ name: string; available: boolean; detail: string; models?: string[] }>;
+      active: { name: string; model: string };
     }>(baseUrl, token, '/api/providers'),
     request<{ names: string[] }>(baseUrl, token, '/api/secrets'),
   ]);
 
   return {
     type: 'catalog.loaded',
+    active: providers.active,
     tasks: tasks.tasks,
     schedules: schedules.schedules,
     memories: memories.memories,
@@ -271,9 +273,14 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
   );
 
   const providerChoices = tuiState.providers.filter((provider) => provider.available);
-  const providerName = selectedProvider ?? providerChoices[0]?.name ?? null;
+  const providerName =
+    selectedProvider ?? tuiState.provider?.name ?? providerChoices[0]?.name ?? null;
   const provider = tuiState.providers.find((entry) => entry.name === providerName);
-  const modelName = selectedModel ?? provider?.models?.[0] ?? null;
+  const modelName =
+    selectedModel ??
+    (providerName === tuiState.provider?.name ? tuiState.provider.model : null) ??
+    provider?.models?.[0] ??
+    null;
 
   useEffect(() => {
     void refresh();
@@ -354,12 +361,26 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
         const next = providerChoices[(index + 1) % providerChoices.length];
         setSelectedProvider(next.name);
         setSelectedModel(next.models?.[0] ?? null);
+        if (next.models?.[0])
+          void request(baseUrl, token, '/api/providers/switch', {
+            method: 'POST',
+            body: JSON.stringify({ provider: next.name, model: next.models[0] }),
+          })
+            .then(() => refresh())
+            .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
         dispatch({ type: 'view.changed', view: 'settings' });
         return;
       }
       if (key.ctrl && character === 'm' && provider?.models?.length) {
         const index = provider.models.indexOf(modelName ?? '');
-        setSelectedModel(provider.models[(index + 1) % provider.models.length]);
+        const nextModel = provider.models[(index + 1) % provider.models.length];
+        setSelectedModel(nextModel);
+        void request(baseUrl, token, '/api/providers/switch', {
+          method: 'POST',
+          body: JSON.stringify({ provider: provider.name, model: nextModel }),
+        })
+          .then(() => refresh())
+          .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
         dispatch({ type: 'view.changed', view: 'settings' });
         return;
       }

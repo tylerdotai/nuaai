@@ -11,6 +11,7 @@ import {
   defaultRuntimeConfig,
   loadRuntimeConfig,
   parseRuntimeConfig,
+  persistProviderSelection,
   workspaceDirectory,
 } from '../src/config/index.js';
 import { createEvent } from '../src/core/events.js';
@@ -123,6 +124,18 @@ describe('runtime configuration and security primitives', () => {
     });
     expect(workspaceDirectory(root)).toBe(join(root, '.nuaai'));
     await expect(loadRuntimeConfig(root)).resolves.toMatchObject({ name: 'NUAAI', version: 1 });
+    const previousPort = process.env.NUAAI_PORT;
+    process.env.NUAAI_PORT = '41234';
+    expect(parseRuntimeConfig({}, root).port).toBe(41234);
+    if (previousPort === undefined) process.env.NUAAI_PORT = undefined;
+    else process.env.NUAAI_PORT = previousPort;
+    await expect(persistProviderSelection(root, 'ollama', 'vision-model')).resolves.toBeUndefined();
+    await expect(loadRuntimeConfig(root)).resolves.toMatchObject({
+      provider: { name: 'ollama', model: 'vision-model' },
+    });
+    await expect(persistProviderSelection(root, '', 'model')).rejects.toThrow(
+      'Provider and model are required',
+    );
   });
 
   it('encrypts, decrypts, rotates, and rejects malformed secrets', () => {
@@ -919,6 +932,61 @@ describe('providers and scheduler', () => {
     }
   });
 
+  it('discovers models and switches only after health and persistence succeed', async () => {
+    const originalFetch = globalThis.fetch;
+    const persisted: Array<{ provider: string; model: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/tags'))
+        return responseJson({ models: [{ name: 'qwen3.5:latest' }, { name: 'qwen3.5:next' }] });
+      return responseJson({}, 404);
+    }) as typeof fetch;
+    try {
+      const registry = new ProviderRegistry({
+        root: process.cwd(),
+        providerName: 'ollama',
+        model: 'qwen3.5:latest',
+        baseUrl: 'http://ollama.local',
+        embeddingModel: 'embed',
+        timeoutMs: 5_000,
+        codexEnabled: false,
+        persistSelection: async (provider, model) => {
+          persisted.push({ provider, model });
+        },
+      });
+      expect(registry.active()).toEqual({ name: 'ollama', model: 'qwen3.5:latest' });
+      expect(await registry.switch('ollama', 'qwen3.5:next')).toEqual({
+        name: 'ollama',
+        model: 'qwen3.5:next',
+      });
+      expect(persisted).toEqual([{ provider: 'ollama', model: 'qwen3.5:next' }]);
+      await expect(registry.switch('ollama', 'missing')).rejects.toThrow('not available');
+      expect(registry.active().model).toBe('qwen3.5:next');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('rejects switching to an unavailable provider without changing the active selection', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => responseJson({}, 503)) as typeof fetch;
+    try {
+      const registry = new ProviderRegistry({
+        root: process.cwd(),
+        providerName: 'ollama',
+        model: 'model',
+        baseUrl: 'http://ollama.local',
+        embeddingModel: 'embed',
+        timeoutMs: 5_000,
+        codexEnabled: false,
+      });
+      await expect(registry.switch('ollama', 'model')).rejects.toThrow('unavailable');
+      expect(registry.active()).toEqual({ name: 'ollama', model: 'model' });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('parses Ollama streaming, modern and legacy embeddings, and health states', async () => {
     const originalFetch = globalThis.fetch;
     const calls: string[] = [];
@@ -1365,6 +1433,61 @@ else process.stdout.write(JSON.stringify({ item: { type: 'error', message: 'non-
     expect(store.listTasks().find((task) => task.scheduleId === failingSchedule.id)).toMatchObject({
       status: 'failed',
       payload: { error: 'background failed' },
+    });
+  });
+
+  it('exposes durable memory and background-task operations as model-facing tools', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = new DeterministicProvider();
+    const providers = providerMap({ ollama: provider });
+    let release!: () => void;
+    const scheduler = new Scheduler(
+      store,
+      () => undefined,
+      async () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const tools = new ToolRegistry(root, undefined, {}, { store, scheduler, providers });
+    const context = { root, permissions: permissive };
+    const stored = (await tools.execute(
+      'memory.store',
+      { content: 'Tyler prefers local-first software', metadata: { token: 'private' } },
+      context,
+    )) as { id: string; stored: boolean; hasEmbedding: boolean };
+    expect(stored).toMatchObject({ stored: true, hasEmbedding: true });
+    expect(
+      await tools.execute('memory.search', { query: 'local-first software' }, context),
+    ).toMatchObject({ mode: 'semantic', results: [expect.objectContaining({ id: stored.id })] });
+    expect(await tools.execute('memory.forget', { id: stored.id }, context)).toEqual({
+      id: stored.id,
+      deleted: true,
+    });
+    const schedule = (await tools.execute(
+      'schedule.create',
+      { name: 'manual schedule', type: 'manual', expression: '', agentInput: 'run it' },
+      context,
+    )) as { id: string };
+    expect(await tools.execute('schedule.list', {}, context)).toMatchObject({
+      schedules: [expect.objectContaining({ id: schedule.id })],
+    });
+    const task = (await tools.execute(
+      'task.create',
+      { name: 'long task', agentInput: 'background work' },
+      context,
+    )) as { id: string; status: string };
+    expect(task.status).toBe('queued');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(await tools.execute('task.cancel', { id: task.id }, context)).toEqual({
+      ok: true,
+      id: task.id,
+    });
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(store.listTasks().find((entry) => entry.id === task.id)).toMatchObject({
+      status: 'cancelled',
     });
   });
 });

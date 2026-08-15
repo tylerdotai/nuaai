@@ -155,8 +155,11 @@ function App(): React.JSX.Element {
   const [status, setStatus] = useState('Connecting');
   const [error, setError] = useState<string | null>(null);
   const [providers, setProviders] = useState<
-    Array<{ name: string; available: boolean; detail: string }>
+    Array<{ name: string; available: boolean; detail: string; models?: string[] }>
   >([]);
+  const [activeProvider, setActiveProvider] = useState<{ name: string; model: string } | null>(
+    null,
+  );
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [scheduleName, setScheduleName] = useState('');
@@ -218,9 +221,15 @@ function App(): React.JSX.Element {
           skillResult,
           pluginResult,
         ] = await Promise.all([
-          request<{ providers: Array<{ name: string; available: boolean; detail: string }> }>(
-            '/api/providers',
-          ),
+          request<{
+            active: { name: string; model: string };
+            providers: Array<{
+              name: string;
+              available: boolean;
+              detail: string;
+              models?: string[];
+            }>;
+          }>('/api/providers'),
           request<{ schedules: Schedule[] }>('/api/schedules'),
           request<{ tasks: Task[] }>('/api/tasks'),
           request<{ memories: MemoryRecord[] }>('/api/memory'),
@@ -229,6 +238,7 @@ function App(): React.JSX.Element {
         ]);
         if (!isCurrent()) return;
         setProviders(providerResult.providers);
+        setActiveProvider(providerResult.active);
         setSchedules(scheduleResult.schedules);
         setTasks(taskResult.tasks);
         setMemories(memoryResult.memories);
@@ -316,6 +326,21 @@ function App(): React.JSX.Element {
   const cancel = async (): Promise<void> => {
     if (!activeRunId) return;
     await request(`/api/runs/${activeRunId}/cancel`, { method: 'POST' });
+  };
+  const switchProvider = async (provider: string, model: string): Promise<void> => {
+    try {
+      const result = await request<{ active: { name: string; model: string } }>(
+        '/api/providers/switch',
+        {
+          method: 'POST',
+          body: JSON.stringify({ provider, model }),
+        },
+      );
+      setActiveProvider(result.active);
+      setNotice(`Using ${result.active.name} · ${result.active.model}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   };
   const executeCommand = async (commandId: AgentCommandId): Promise<void> => {
     setError(null);
@@ -441,8 +466,28 @@ function App(): React.JSX.Element {
             {providers.map((provider) => (
               <div className="provider" key={provider.name}>
                 <span className={provider.available ? 'dot live' : 'dot'} />
-                {provider.name}
+                <span>
+                  {provider.name}
+                  {activeProvider?.name === provider.name && (
+                    <small> · {activeProvider.model}</small>
+                  )}
+                </span>
                 <small>{provider.available ? 'ready' : 'offline'}</small>
+                {provider.available &&
+                  provider.models?.map((model) => (
+                    <button
+                      type="button"
+                      key={`${provider.name}-${model}`}
+                      disabled={
+                        activeProvider?.name === provider.name && activeProvider.model === model
+                      }
+                      onClick={() => void switchProvider(provider.name, model)}
+                    >
+                      {activeProvider?.name === provider.name && activeProvider.model === model
+                        ? 'Active'
+                        : `Use ${model}`}
+                    </button>
+                  ))}
               </div>
             ))}
           </div>

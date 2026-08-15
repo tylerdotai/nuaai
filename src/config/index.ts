@@ -1,5 +1,5 @@
 import { randomInt } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import { z } from 'zod';
@@ -67,6 +67,15 @@ const computerSchema = z.object({
   args: z.array(z.string()).default(['mcp']),
 });
 
+const agentSchema = z.object({
+  enabled: z.boolean().default(false),
+  timeoutMs: z.number().int().positive().max(600_000).default(300_000),
+  maxOutputBytes: z.number().int().positive().max(10_000_000).default(2_000_000),
+  commands: z
+    .record(z.object({ command: z.string().min(1), args: z.array(z.string()).default([]) }))
+    .default({}),
+});
+
 export const runtimeConfigSchema = z.object({
   version: z.literal(1).default(1),
   name: z.string().default('NUAAI'),
@@ -91,6 +100,7 @@ export const runtimeConfigSchema = z.object({
       computer: computerSchema.default({}),
     })
     .default({}),
+  agents: agentSchema.default({}),
   features: featureSchema.default({}),
   limits: z
     .object({
@@ -157,4 +167,17 @@ export async function loadRuntimeConfig(root = process.cwd()): Promise<RuntimeCo
   const path = resolve(workspaceDirectory(root), 'config.json');
   const value = JSON.parse(await readFile(path, 'utf8')) as unknown;
   return parseRuntimeConfig(value, root);
+}
+
+export async function persistProviderSelection(
+  root: string,
+  provider: string,
+  model: string,
+): Promise<void> {
+  if (!provider.trim() || !model.trim()) throw new Error('Provider and model are required');
+  const path = resolve(workspaceDirectory(root), 'config.json');
+  const raw = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  const current = raw.provider && typeof raw.provider === 'object' ? raw.provider : {};
+  raw.provider = { ...(current as Record<string, unknown>), name: provider, model };
+  await writeFile(path, `${JSON.stringify(raw, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
 }

@@ -162,9 +162,20 @@ export function createApp(services: GatewayServices): Hono {
       .filter((event) => !sessionId || event.sessionId === sessionId);
     return context.json({ events });
   });
-  app.get('/api/providers', async (context) =>
-    context.json({ providers: await services.runtime.providerHealth() }),
-  );
+  app.get('/api/providers', async (context) => context.json(await services.providers.catalog()));
+  app.post('/api/providers/switch', async (context) => {
+    const body = (await context.req.json().catch(() => ({}))) as {
+      provider?: string;
+      model?: string;
+    };
+    if (!body.provider || !body.model)
+      return context.json({ error: 'provider and model are required' }, 400);
+    try {
+      return context.json({ active: await services.providers.switch(body.provider, body.model) });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
   app.get('/api/mcp', (context) =>
     context.json(services.mcp?.status() ?? { servers: [], failures: {} }),
   );
@@ -359,7 +370,7 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       resolveListen();
     });
   });
-  const wsServer = new WebSocketServer({ server: httpServer, path: '/ws' });
+  const wsServer = new WebSocketServer({ server: httpServer });
   const clients = new Map<WebSocket, string | undefined>();
   const unsubscribe = services.runtime.subscribe((event) => {
     const payload = JSON.stringify({ type: 'event', event });
@@ -372,6 +383,10 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
   });
   wsServer.on('connection', (socket, request) => {
     const url = new URL(request.url ?? '/ws', `http://${request.headers.host ?? 'localhost'}`);
+    if (!['/ws', '/nuaai/ws'].includes(url.pathname)) {
+      socket.close(1008, 'Unknown WebSocket route');
+      return;
+    }
     const token =
       url.searchParams.get('token') ??
       request.headers.cookie

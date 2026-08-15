@@ -173,19 +173,18 @@ node dist/cli.js onboard
 
 ### Agent tools
 
-When enabled, the runtime exposes:
+When enabled, the daemon-owned runtime exposes:
 
-- `workspace.list`
-- `workspace.read`
-- `workspace.write`
-- `workspace.search`
-- `workspace.inspect`
-- `workspace.command`
-- `web.search`
-- `web.fetch`
-- `browser.open`
+- Workspace: `workspace.list`, `workspace.read`, `workspace.write`, `workspace.search`, `workspace.inspect`, `workspace.command`
+- Web/browser: `web.search`, `web.fetch`, `browser.open`
+- Durable memory: `memory.store`, `memory.search`, `memory.forget`
+- Scheduling/tasks: `schedule.create`, `schedule.list`, `schedule.update`, `schedule.pause`, `schedule.resume`, `schedule.trigger`, `task.create`, `task.list`, `task.cancel`
+- Providers: `provider.list`, `provider.status`, `provider.switch`
+- Media: `media.inspect` for bounded text, image, audio, video, PDF, DOCX, and XLSX inspection
+- MCP/computer-use: `mcp.status`, `mcp.discover`, `mcp.execute`, `computer.status`, `computer.use` when explicitly configured
+- External agents: `agent.list`, `agent.dispatch` when explicitly allowlisted and enabled
 
-Network-backed tools require the runtime network capability. Tool registration follows onboarding feature choices.
+Network-backed tools require the runtime network capability. Tool registration follows onboarding feature choices. Provider/model switching is daemon-owned and persisted; downloading or discovering a model does not activate it.
 
 The command tool is intentionally allowlisted rather than an unrestricted shell. MCP and computer-use servers are disabled by default and require explicit local configuration plus matching permissions.
 

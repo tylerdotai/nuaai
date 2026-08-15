@@ -103,6 +103,7 @@ export type TuiEvent =
   | { type: 'sessions.loaded'; sessions: TuiSession[]; threads: TuiThread[] }
   | {
       type: 'catalog.loaded';
+      active: { name: string; model: string };
       tasks: TuiTask[];
       schedules: TuiSchedule[];
       memories: TuiMemory[];
@@ -180,6 +181,7 @@ export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
     case 'catalog.loaded':
       return {
         ...state,
+        provider: event.active,
         tasks: event.tasks,
         schedules: event.schedules,
         memories: event.memories,

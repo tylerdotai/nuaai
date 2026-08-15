@@ -58,6 +58,7 @@ describe('TUI event state', () => {
   it('hydrates navigable daemon catalog surfaces without exposing secret values', () => {
     const next = reduceTuiEvent(initialTuiState, {
       type: 'catalog.loaded',
+      active: { name: 'ollama', model: 'qwen3.5:latest' },
       tasks: [{ id: 'task-1', status: 'queued', kind: 'scheduled', scheduleId: 'schedule-1' }],
       schedules: [{ id: 'schedule-1', name: 'Morning', enabled: true, nextRunAt: null }],
       memories: [{ id: 'memory-1', content: 'A durable fact', hasEmbedding: true }],
@@ -73,6 +74,7 @@ describe('TUI event state', () => {
     expect(next.skills[0]?.name).toBe('workspace');
     expect(next.plugins[0]?.capabilities).toEqual(['network']);
     expect(next.providers[0]?.available).toBe(true);
+    expect(next.provider).toEqual({ name: 'ollama', model: 'qwen3.5:latest' });
     expect(next.secretNames).toEqual(['OLLAMA_API_KEY']);
     expect(JSON.stringify(next)).not.toContain('secret-value');
 

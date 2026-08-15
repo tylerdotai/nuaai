@@ -2,15 +2,17 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadRuntimeConfig, workspaceDirectory } from './config/index.js';
+import { loadRuntimeConfig, persistProviderSelection, workspaceDirectory } from './config/index.js';
 import { loadSessionIdentity } from './core/identity.js';
 import { AgentRuntime } from './core/runtime.js';
 import { Scheduler } from './core/scheduler.js';
 import { acquireDaemonLock } from './gateway/lock.js';
 import { ensureRuntimeIdentity } from './gateway/runtime.js';
+import { ExternalAgentDispatcher } from './integrations/agents.js';
 import { LocalAudioBridge, handleAudioCommand } from './integrations/audio.js';
 import { MatrixBridge, matrixHelpText, parseMatrixCommand } from './integrations/matrix.js';
 import { McpManager } from './integrations/mcp.js';
+import { MediaProcessor } from './integrations/media.js';
 import {
   Crawl4AiClient,
   FlareSolverrClient,
@@ -81,6 +83,7 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     timeoutMs: effectiveConfig.limits.providerTimeoutMs,
     ollamaEnabled: effectiveConfig.features.ollama,
     codexEnabled: effectiveConfig.features.codex,
+    persistSelection: (provider, model) => persistProviderSelection(resolvedRoot, provider, model),
   });
   const search = effectiveConfig.features.search
     ? new SearchStack({
@@ -92,9 +95,6 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
           : null,
       })
     : undefined;
-  const tools = new ToolRegistry(resolvedRoot, search, {
-    browserEnabled: effectiveConfig.features.browser,
-  });
   const mcp = new McpManager(effectiveConfig.mcp);
   await mcp.start();
   const skills = new SkillRegistry();
@@ -109,15 +109,7 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
   await loadFilesystemSkills(resolvedRoot, skills, store);
   const plugins = new PluginRegistry(resolvedRoot, store);
   await plugins.load();
-  const runtime = new AgentRuntime({
-    root: resolvedRoot,
-    config: effectiveConfig,
-    store,
-    providers,
-    tools,
-    identityContext: sessionIdentity,
-    mcp,
-  });
+  let runtime!: AgentRuntime;
   const matrix =
     effectiveConfig.features.matrix &&
     effectiveConfig.matrix.enabled &&
@@ -147,6 +139,12 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     kokoroVoicesPath: effectiveConfig.audio.kokoroVoicesPath,
     timeoutMs: effectiveConfig.audio.timeoutMs,
   });
+  const media = new MediaProcessor({
+    allowedRoot: resolvedRoot,
+    artifactDirectory: resolve(resolvedRoot, '.nuaai/media'),
+    timeoutMs: effectiveConfig.limits.toolTimeoutMs,
+  });
+  const agents = new ExternalAgentDispatcher(resolvedRoot, effectiveConfig.agents);
   const voiceState = {
     voiceEnabled: effectiveConfig.audio.voiceEnabled,
     ttsEnabled: effectiveConfig.audio.ttsEnabled,
@@ -160,8 +158,6 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
       const run = runtime.startRun({
         threadId: created.thread.id,
         input: schedule.agentInput,
-        provider: effectiveConfig.provider.name,
-        model: effectiveConfig.provider.model,
       });
       scheduledRuns.set(taskId, run.id);
       try {
@@ -175,6 +171,21 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
       if (runId) runtime.cancelRun(runId);
     },
   );
+  const tools = new ToolRegistry(
+    resolvedRoot,
+    search,
+    { browserEnabled: effectiveConfig.features.browser },
+    { store, scheduler, providers, mcp, media, agents },
+  );
+  runtime = new AgentRuntime({
+    root: resolvedRoot,
+    config: effectiveConfig,
+    store,
+    providers,
+    tools,
+    identityContext: sessionIdentity,
+    mcp,
+  });
   const daemonLock = await acquireDaemonLock(resolvedRoot);
   let gateway: GatewayHandle;
   try {
@@ -354,61 +365,89 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
         await flushProgress(progress);
         const images: ProviderImage[] = [];
         const transcriptions: string[] = [];
+        const attachmentContext: string[] = [];
         for (const attachment of message.attachments ?? []) {
-          const isSpeechMedia =
-            attachment.mimeType?.startsWith('audio/') || attachment.mimeType?.startsWith('video/');
-          if (isSpeechMedia) {
-            if (!attachment.localPath) {
-              attachment.error = 'Speech media was not downloaded';
+          if (!attachment.localPath || attachment.error) {
+            attachmentContext.push(
+              `Attachment ${attachment.name}: unavailable (${attachment.error ?? 'not downloaded'})`,
+            );
+            continue;
+          }
+          const mimeType = attachment.mimeType ?? 'application/octet-stream';
+          try {
+            if (mimeType.startsWith('image/')) {
+              const bytes = await readFile(attachment.localPath);
+              if (bytes.byteLength > maxOllamaImageBytes)
+                throw new Error('Image exceeds the Ollama vision size limit');
+              if (images.length >= 8)
+                throw new Error('The run already contains the maximum of 8 images');
+              images.push({
+                name: attachment.name,
+                mimeType,
+                data: bytes.toString('base64'),
+              });
+              attachmentContext.push(
+                `Attachment ${attachment.name}: image available to the vision model.`,
+              );
               continue;
             }
-            if (!voiceState.voiceEnabled) {
-              attachment.error = 'Voice input is disabled; use /voice on';
+            if (mimeType.startsWith('video/')) {
+              const inspection = await media.inspect(attachment.localPath, {
+                extractAudio: voiceState.voiceEnabled,
+                extractFrames: true,
+              });
+              for (const [index, frame] of (inspection.frames ?? []).entries()) {
+                if (images.length >= 8) break;
+                const bytes = await readFile(frame.path);
+                if (bytes.byteLength <= maxOllamaImageBytes)
+                  images.push({
+                    name: `${attachment.name} frame ${index + 1}`,
+                    mimeType: frame.mimeType,
+                    data: bytes.toString('base64'),
+                  });
+              }
+              if (voiceState.voiceEnabled) {
+                const speechPath = inspection.audioPath ?? attachment.localPath;
+                const transcript = await audio.transcribe(speechPath);
+                if (transcript.text)
+                  transcriptions.push(`Transcript from ${attachment.name}: ${transcript.text}`);
+              }
+              attachmentContext.push(
+                `Attachment ${attachment.name}: video inspected with ${(inspection.frames ?? []).length} bounded frame(s) available to the vision model${voiceState.voiceEnabled ? ' and audio transcription below' : '; audio transcription disabled'}.`,
+              );
               continue;
             }
-            try {
+            if (mimeType.startsWith('audio/')) {
+              if (!voiceState.voiceEnabled) {
+                attachmentContext.push(
+                  `Attachment ${attachment.name}: audio received; voice input is disabled.`,
+                );
+                continue;
+              }
               const transcript = await audio.transcribe(attachment.localPath);
               if (transcript.text) {
                 transcriptions.push(`Transcript from ${attachment.name}: ${transcript.text}`);
+                attachmentContext.push(`Attachment ${attachment.name}: audio transcribed below.`);
               } else {
-                attachment.error = 'No speech was detected';
+                attachmentContext.push(`Attachment ${attachment.name}: no speech was detected.`);
               }
-            } catch (error) {
-              attachment.error = error instanceof Error ? error.message : String(error);
-            }
-            continue;
-          }
-          if (
-            !attachment.localPath ||
-            attachment.error ||
-            !attachment.mimeType?.startsWith('image/')
-          )
-            continue;
-          try {
-            const bytes = await readFile(attachment.localPath);
-            if (bytes.byteLength > maxOllamaImageBytes) {
-              attachment.error = 'Image exceeds the Ollama vision size limit';
               continue;
             }
-            images.push({
-              name: attachment.name,
-              mimeType: attachment.mimeType,
-              data: bytes.toString('base64'),
-            });
+            const inspection = await media.inspect(attachment.localPath);
+            if (inspection.text) {
+              attachmentContext.push(`Extracted text from ${attachment.name}:\n${inspection.text}`);
+            } else {
+              attachmentContext.push(
+                `Attachment ${attachment.name}: ${inspection.kind} metadata inspected.`,
+              );
+            }
           } catch (error) {
-            attachment.error = error instanceof Error ? error.message : String(error);
+            const detail = error instanceof Error ? error.message : String(error);
+            attachment.error = detail;
+            attachmentContext.push(`Attachment ${attachment.name}: unavailable (${detail})`);
           }
         }
-        const attachmentContext = message.attachments?.map((attachment) =>
-          attachment.localPath && !attachment.error
-            ? attachment.mimeType?.startsWith('image/')
-              ? `Attachment ${attachment.name}: image available to the vision model.`
-              : attachment.mimeType?.startsWith('audio/') ||
-                  attachment.mimeType?.startsWith('video/')
-                ? `Attachment ${attachment.name}: speech media was transcribed below.`
-                : `Attachment ${attachment.name}: ${attachment.localPath}`
-            : `Attachment ${attachment.name}: unavailable (${attachment.error ?? 'not downloaded'})`,
-        );
+
         let runId: string | undefined;
         try {
           const run = runtime.startRun({
