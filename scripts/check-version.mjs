@@ -30,4 +30,4 @@ if (tags[0] !== expectedTag) {
   throw new Error(`Latest Git tag ${tags[0] ?? '(none)'} does not match ${expectedTag}`);
 }
 
-process.stdout.write(`NUAI version ${version} matches ${expectedTag}\n`);
+process.stdout.write(`NUAAI version ${version} matches ${expectedTag}\n`);

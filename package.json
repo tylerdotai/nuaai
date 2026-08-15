@@ -1,16 +1,20 @@
 {
-  "name": "nuai",
+  "name": "nuaai",
   "version": "0.1.0",
-  "description": "NUAI — not ur avg ai",
+  "description": "NUAAI — not ur avg ai",
   "type": "module",
   "bin": {
-    "nuai": "./dist/cli.js"
+    "nuaai": "./dist/cli.js"
   },
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE"
-  ],
+  "files": ["dist", "scripts", "deploy", "docs", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tylerdotai/nuaai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tylerdotai/nuaai/issues"
+  },
+  "homepage": "https://github.com/tylerdotai/nuaai#readme",
   "scripts": {
     "dev": "tsx src/cli.tsx",
     "dev:server": "tsx src/server.ts",
@@ -33,7 +37,7 @@
     "developer-tools",
     "local-first",
     "model-agnostic",
-    "nuai",
+    "nuaai",
     "not-ur-avg-ai"
   ],
   "engines": {

@@ -606,7 +606,7 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
       );
     return (
       <Box flexDirection="column">
-        <Text color="yellow">NUAI help</Text>
+        <Text color="yellow">NUAAI help</Text>
         <Text>Ctrl-1..8 navigate surfaces · Ctrl-0 command palette</Text>
         <Text>Enter sends a message · Ctrl-X cancels the active run</Text>
         <Text>Esc exits · Ctrl-R refreshes daemon state</Text>
@@ -617,7 +617,7 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
   return (
     <Box flexDirection="column" padding={1}>
       <Text color="cyan" bold>
-        NUAI — not ur avg ai
+        NUAAI — not ur avg ai
       </Text>
       <Text dimColor>
         {status} · {tuiState.view} · Esc exit · Ctrl-0 palette · Ctrl-X cancel

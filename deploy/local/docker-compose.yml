@@ -1,0 +1,39 @@
+services:
+  synapse:
+    image: matrixdotorg/synapse:latest
+    restart: unless-stopped
+    environment:
+      SYNAPSE_CONFIG_DIR: /data
+    ports:
+      - "127.0.0.1:${NUAAI_SYNAPSE_PORT}:8008"
+    volumes:
+      - ./state/synapse:/data
+
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    env_file:
+      - .env.integrations
+    environment:
+      BASE_URL: http://127.0.0.1:${NUAAI_SEARXNG_PORT}/
+      INSTANCE_NAME: NUAAI Local Search
+    ports:
+      - "127.0.0.1:${NUAAI_SEARXNG_PORT}:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+
+  crawl4ai:
+    image: unclecode/crawl4ai:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${NUAAI_CRAWL4AI_PORT}:11235"
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
+    ports:
+      - "127.0.0.1:${NUAAI_FLARESOLVERR_PORT}:8191"

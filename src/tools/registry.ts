@@ -1,5 +1,6 @@
 import { z } from 'zod';
 
+import type { SearchStack } from '../integrations/search.js';
 import { type PermissionContext, assertPermission } from '../security/permissions.js';
 import {
   listWorkspaceFiles,
@@ -25,12 +26,16 @@ export interface ToolDefinition {
 
 const empty = z.object({});
 
+function assertNetwork(context: ToolContext): void {
+  if (!context.permissions.capabilities.network) throw new Error('Network capability required');
+}
+
 export class ToolRegistry {
   private readonly tools = new Map<string, ToolDefinition>();
-  constructor(root: string) {
+  constructor(root: string, searchStack?: SearchStack, options: { browserEnabled?: boolean } = {}) {
     this.register({
       name: 'workspace.list',
-      description: 'List files in the NUAI workspace',
+      description: 'List files in the NUAAI workspace',
       permission: 'read',
       parameters: { type: 'object', properties: {} },
       input: empty,
@@ -38,7 +43,7 @@ export class ToolRegistry {
     });
     this.register({
       name: 'workspace.read',
-      description: 'Read a text file in the NUAI workspace',
+      description: 'Read a text file in the NUAAI workspace',
       permission: 'read',
       parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
       input: z.object({ path: z.string().min(1) }),
@@ -47,7 +52,7 @@ export class ToolRegistry {
     });
     this.register({
       name: 'workspace.write',
-      description: 'Write a text file in the NUAI workspace',
+      description: 'Write a text file in the NUAAI workspace',
       permission: 'write',
       parameters: {
         type: 'object',
@@ -94,6 +99,62 @@ export class ToolRegistry {
         });
       },
     });
+    if (searchStack) {
+      this.register({
+        name: 'web.search',
+        description: 'Search the web through local SearXNG with DuckDuckGo fallback',
+        permission: 'read',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' },
+            limit: { type: 'integer', minimum: 1, maximum: 25 },
+          },
+          required: ['query'],
+        },
+        input: z.object({
+          query: z.string().min(1),
+          limit: z.number().int().min(1).max(25).default(10),
+        }),
+        execute: async (input, context) => {
+          assertNetwork(context);
+          const value = input as { query: string; limit: number };
+          return searchStack.search(value.query, value.limit);
+        },
+      });
+      this.register({
+        name: 'web.fetch',
+        description:
+          'Extract a web page through local Crawl4AI, Playwright, and FlareSolverr fallbacks',
+        permission: 'read',
+        parameters: {
+          type: 'object',
+          properties: { url: { type: 'string', format: 'uri' } },
+          required: ['url'],
+        },
+        input: z.object({ url: z.string().url() }),
+        execute: async (input, context) => {
+          assertNetwork(context);
+          return searchStack.fetch((input as { url: string }).url);
+        },
+      });
+      if (options.browserEnabled ?? true)
+        this.register({
+          name: 'browser.open',
+          description: 'Open a web page with headless Playwright browser automation',
+          permission: 'read',
+          parameters: {
+            type: 'object',
+            properties: { url: { type: 'string', format: 'uri' } },
+            required: ['url'],
+          },
+          input: z.object({ url: z.string().url() }),
+          execute: async (input, context) => {
+            assertNetwork(context);
+            return searchStack.open((input as { url: string }).url);
+          },
+        });
+    }
     void root;
   }
 

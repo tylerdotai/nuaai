@@ -274,7 +274,7 @@ function App(): React.JSX.Element {
       <header className="topbar">
         <div>
           <span className="eyebrow">LOCAL AGENT SYSTEM</span>
-          <h1>NUAI</h1>
+          <h1>NUAAI</h1>
           <p>not ur avg ai</p>
         </div>
         <div className="status">
@@ -400,7 +400,7 @@ function App(): React.JSX.Element {
                         void send();
                       }
                     }}
-                    placeholder="Ask NUAI anything…"
+                    placeholder="Ask NUAAI anything…"
                     disabled={!thread}
                   />
                   <button
@@ -566,5 +566,5 @@ function App(): React.JSX.Element {
 }
 
 const root = document.querySelector<HTMLDivElement>('#root');
-if (!root) throw new Error('NUAI web root is missing');
+if (!root) throw new Error('NUAAI web root is missing');
 createRoot(root).render(<App />);

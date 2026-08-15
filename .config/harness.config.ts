@@ -1,6 +1,6 @@
 export const harnessConfig = {
-  name: 'NUAI',
+  name: 'NUAAI',
   tagline: 'not ur avg ai',
-  workspaceDir: '.nuai',
+  workspaceDir: '.nuaai',
   defaultProvider: 'ollama',
 } as const;

@@ -1,18 +1,18 @@
-# NUAI Master Build Prompt
+# NUAAI Master Build Prompt
 
-> Point the implementation agent to this file when starting or resuming NUAI work.
+> Point the implementation agent to this file when starting or resuming NUAAI work.
 >
 > Example:
 >
 > ```text
-> Read and execute /home/tyler/nuai/MASTER_PROMPT.md completely. Continue from the current repository state. Do not stop at a plan or scaffold.
+> Read and execute `<repository-root>/MASTER_PROMPT.md` completely. Continue from the current repository state. Do not stop at a plan or scaffold.
 > ```
 
 ## Mission
 
-Build NUAI — **not ur avg ai** — into a complete, working, persistent personal AI agent harness.
+Build NUAAI — **not ur avg ai** — into a complete, working, persistent personal AI agent harness.
 
-NUAI is not a one-off task runner, demo, mock, placeholder, generic CLI wrapper, or MVP exercise. NUAI is a local-first personal agent operating environment with:
+NUAAI is not a one-off task runner, demo, mock, placeholder, generic CLI wrapper, or MVP exercise. NUAAI is a local-first personal agent operating environment with:
 
 ```text
 persistent daemon
@@ -36,16 +36,16 @@ persistent daemon
 The implementation target is the existing repository:
 
 ```text
-/home/tyler/nuai
+<repository-root>
 ```
 
 Continue from the current repository state. Preserve useful work. Do not replace the repository wholesale.
 
 ## Non-Negotiable Product Requirements
 
-- Product name: `NUAI`
+- Product name: `NUAAI`
 - Product tagline: `not ur avg ai`
-- Runtime workspace: `.nuai/`
+- Runtime workspace: `.nuaai/`
 - Persistent daemon, not one-off process execution
 - Full TUI, not a terminal demo
 - Full web UI, not a static shell
@@ -74,7 +74,7 @@ Continue from the current repository state. Preserve useful work. Do not replace
 4. Verify external tool capabilities instead of guessing CLI syntax or API behavior.
 5. Build the complete product in dependency order, but continue through every phase in this goal without waiting for another confirmation.
 6. Ask only when a missing decision materially changes architecture, requires credentials, or requires an external state-changing action.
-7. Internal source edits, local builds, local servers, local databases, local browser tests, and local `.nuai` initialization are authorized.
+7. Internal source edits, local builds, local servers, local databases, local browser tests, and local `.nuaai` initialization are authorized.
 8. Do not push, publish, deploy publicly, send messages, enable remote access, modify billing, or change production services without explicit approval.
 9. Do not delete user data or destructive files. Use safe deletion methods when cleanup is authorized.
 10. Do not fabricate command flags. Inspect `ollama --help`, `codex --help`, package documentation, or installed type definitions.
@@ -120,7 +120,7 @@ Use a clear structure close to this shape, adapting only when the current reposi
 ```text
 .config/
   harness.config.ts
-.nuai/                         # runtime-created and Git-ignored
+.nuaai/                         # runtime-created and Git-ignored
 src/
   cli.tsx                      # TUI entrypoint and client commands
   daemon.ts                    # long-lived daemon entrypoint
@@ -200,12 +200,12 @@ CHANGELOG.md
 
 The final tree does not need to match this list exactly, but every required responsibility must have a real implementation and tests.
 
-## `.nuai` Runtime Workspace
+## `.nuaai` Runtime Workspace
 
-The runtime workspace must initialize safely and idempotently below `.nuai/`:
+The runtime workspace must initialize safely and idempotently below `.nuaai/`:
 
 ```text
-.nuai/
+.nuaai/
   config.json
   runtime.json
   memory.db
@@ -220,7 +220,7 @@ The runtime workspace must initialize safely and idempotently below `.nuai/`:
 
 Requirements:
 
-- `.nuai/` is Git-ignored.
+- `.nuaai/` is Git-ignored.
 - Directory initialization is safe to repeat.
 - Configuration has a schema and version.
 - Configuration migrations are explicit and tested.
@@ -228,7 +228,7 @@ Requirements:
 - Runtime paths cannot escape the workspace root.
 - Symlink escape is rejected for protected file operations.
 - Runtime state survives daemon restart.
-- Secrets never appear in `.nuai` as plaintext.
+- Secrets never appear in `.nuaai` as plaintext.
 - Logs are bounded and redacted.
 - The workspace can be inspected through the TUI and web UI.
 
@@ -237,12 +237,12 @@ Requirements:
 Implement a real long-running command:
 
 ```text
-nuai daemon
+nuaai daemon
 ```
 
 The daemon must:
 
-- initialize `.nuai/`
+- initialize `.nuaai/`
 - open the database
 - load configuration, plugins, and skills
 - recover interrupted sessions and scheduled tasks
@@ -260,11 +260,11 @@ The daemon must:
 Provide reliable local commands such as:
 
 ```text
-nuai daemon
-nuai status
-nuai doctor
-nuai version
-nuai init
+nuaai daemon
+nuaai status
+nuaai doctor
+nuaai version
+nuaai init
 ```
 
 Do not enable a system service automatically. Prepare documented systemd/s6 integration only after the local daemon works, and require explicit approval before enabling a persistent host service.
@@ -425,7 +425,7 @@ Implement:
 - unavailable-provider errors
 - model capability reporting
 - embedding generation
-- configuration through `.nuai/config.json` and environment variables
+- configuration through `.nuaai/config.json` and environment variables
 
 Run a real Ollama smoke test when Ollama and a usable model are available. If no model is available, report the exact command and blocker. Never fabricate model output.
 
@@ -592,7 +592,7 @@ Do not expose arbitrary shell execution through a generic model tool.
 Skills live under:
 
 ```text
-.nuai/skills/
+.nuaai/skills/
 ```
 
 Implement:
@@ -629,7 +629,7 @@ Implement a plugin system with:
 
 - plugin manifest
 - plugin name and version
-- NUAI API compatibility range
+- NUAAI API compatibility range
 - plugin capability declarations
 - plugin lifecycle
 - plugin load/unload
@@ -989,10 +989,10 @@ Do not stop between phases to ask whether to continue. Continue automatically un
 
 ## Final Acceptance Criteria
 
-NUAI is not complete until all conditions below are verified:
+NUAAI is not complete until all conditions below are verified:
 
-- `nuai daemon` starts successfully.
-- `.nuai/` initializes safely and idempotently.
+- `nuaai daemon` starts successfully.
+- `.nuaai/` initializes safely and idempotently.
 - A session can be created.
 - A session survives daemon restart.
 - Threads and messages persist.
@@ -1013,7 +1013,7 @@ NUAI is not complete until all conditions below are verified:
 - Secrets are encrypted at rest.
 - Key rotation works.
 - Secrets never appear in logs, events, database plaintext fields, or rendered UI.
-- Skills load from `.nuai/skills/`.
+- Skills load from `.nuaai/skills/`.
 - Plugins load through manifests and capability checks.
 - Plugin lifecycle failures do not corrupt the daemon.
 - Generated skills/plugins are validated before execution.
@@ -1047,6 +1047,6 @@ At completion, report only verified facts:
 11. Dependency audit result.
 12. Remaining blockers, if any.
 13. Current version and Git commit.
-14. Whether NUAI is locally live, externally deployed, or neither.
+14. Whether NUAAI is locally live, externally deployed, or neither.
 
-Do not call NUAI complete based only on compilation. Completion requires the working daemon, real provider paths, persistent sessions, scheduled background agents, encrypted secrets, plugins, skills, full TUI, full web UI, mandatory browser E2E, and verified end-to-end behavior.
+Do not call NUAAI complete based only on compilation. Completion requires the working daemon, real provider paths, persistent sessions, scheduled background agents, encrypted secrets, plugins, skills, full TUI, full web UI, mandatory browser E2E, and verified end-to-end behavior.

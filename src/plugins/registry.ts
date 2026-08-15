@@ -203,8 +203,8 @@ export class PluginRegistry {
         env: {
           PATH: process.env.PATH ?? '',
           NODE_ENV: 'production',
-          NUAI_PLUGIN_NAME: name,
-          NUAI_PLUGIN_CAPABILITIES: record.manifest.capabilities.join(','),
+          NUAAI_PLUGIN_NAME: name,
+          NUAAI_PLUGIN_CAPABILITIES: record.manifest.capabilities.join(','),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,

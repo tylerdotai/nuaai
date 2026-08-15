@@ -10,28 +10,32 @@ export interface ProviderRegistryConfig {
   baseUrl: string;
   embeddingModel: string;
   timeoutMs: number;
+  ollamaEnabled?: boolean;
+  codexEnabled?: boolean;
 }
 
 export class ProviderRegistry {
   private readonly providers = new Map<string, ProviderAdapter>();
 
   constructor(config: ProviderRegistryConfig) {
-    this.providers.set(
-      'ollama',
-      new OllamaProvider(
-        { baseUrl: config.baseUrl, model: config.model, embeddingModel: config.embeddingModel },
-        config.timeoutMs,
-      ),
-    );
-    this.providers.set(
-      'codex',
-      new CodexProvider({
-        model: config.model,
-        workspaceRoot: config.root,
-        timeoutMs: config.timeoutMs,
-      }),
-    );
-    if (process.env.NUAI_TEST_MODE === '1')
+    if (config.ollamaEnabled ?? true)
+      this.providers.set(
+        'ollama',
+        new OllamaProvider(
+          { baseUrl: config.baseUrl, model: config.model, embeddingModel: config.embeddingModel },
+          config.timeoutMs,
+        ),
+      );
+    if (config.codexEnabled ?? true)
+      this.providers.set(
+        'codex',
+        new CodexProvider({
+          model: config.model,
+          workspaceRoot: config.root,
+          timeoutMs: config.timeoutMs,
+        }),
+      );
+    if (process.env.NUAAI_TEST_MODE === '1')
       this.providers.set('deterministic', new DeterministicProvider());
   }
 

@@ -24,7 +24,7 @@ export class DeterministicProvider implements ProviderAdapter {
       yield { type: 'done', text: 'cancel complete' };
       return;
     }
-    const text = 'NUAI deterministic test response';
+    const text = 'NUAAI deterministic test response';
     yield { type: 'delta', text };
     yield { type: 'done', text };
   }

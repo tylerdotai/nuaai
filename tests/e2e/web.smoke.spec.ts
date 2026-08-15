@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 
 test('built web client creates a session and renders a live daemon run', async ({ page }) => {
   await page.goto('/');
-  await expect(page.locator('header h1')).toHaveText('NUAI');
+  await expect(page.locator('header h1')).toHaveText('NUAAI');
   const status = page.locator('.status');
   await expect(status).toContainText('Connected', { timeout: 30_000 });
 
@@ -13,13 +13,13 @@ test('built web client creates a session and renders a live daemon run', async (
   await expect(page.locator('.session.selected')).toBeVisible();
   await expect(page.getByText('ACTIVE THREAD', { exact: true })).toBeVisible();
 
-  const composer = page.getByPlaceholder('Ask NUAI anything…');
+  const composer = page.getByPlaceholder('Ask NUAAI anything…');
   await expect(composer).toBeEnabled();
   await composer.fill('browser smoke');
   await page.getByRole('button', { name: 'Send ↗' }).click();
 
   await expect(page.locator('.message.assistant').last()).toContainText(
-    'NUAI deterministic test response',
+    'NUAAI deterministic test response',
     {
       timeout: 30_000,
     },
@@ -61,5 +61,5 @@ test('built web client creates a session and renders a live daemon run', async (
   await expect(scheduleCard).toBeVisible();
   await scheduleCard.getByRole('button', { name: 'Trigger' }).click();
   await expect(scheduleCard).toContainText('completed', { timeout: 30_000 });
-  await expect(page.locator('body')).not.toContainText('NUAI local token');
+  await expect(page.locator('body')).not.toContainText('NUAAI local token');
 });

@@ -6,9 +6,9 @@ import type { DatabaseStore } from '../memory/db.js';
 import { decryptSecret, encryptSecret, rotateSecret } from './encryption.js';
 
 function loadOrCreateMasterKey(root: string): string {
-  const configured = process.env.NUAI_MASTER_KEY;
+  const configured = process.env.NUAAI_MASTER_KEY;
   if (configured?.trim()) return configured;
-  const directory = resolve(root, '.nuai', 'secrets');
+  const directory = resolve(root, '.nuaai', 'secrets');
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const path = join(directory, 'master.key');
   try {

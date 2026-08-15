@@ -1,6 +1,6 @@
 # Architecture
 
-NUAI is a local-first personal agent harness. The daemon owns runtime state and every client consumes daemon APIs and events.
+NUAAI is a local-first personal agent harness. The daemon owns runtime state and every client consumes daemon APIs and events.
 
 ```text
 Ink TUI / React web client
@@ -18,9 +18,9 @@ Ink TUI / React web client
 
 ## Runtime flow
 
-1. `nuai init` creates `.nuai/` and an idempotent configuration.
-2. `nuai daemon` loads configuration, identity, SQLite state, skills, plugins, providers, and tools.
-3. A local daemon lock at `.nuai/daemon.lock` prevents duplicate ownership. Stale locks are reclaimed only when the recorded PID is no longer alive.
+1. `nuaai init` creates `.nuaai/` and an idempotent configuration.
+2. `nuaai daemon` loads configuration, identity, SQLite state, skills, plugins, providers, and tools.
+3. A local daemon lock at `.nuaai/daemon.lock` prevents duplicate ownership. Stale locks are reclaimed only when the recorded PID is no longer alive.
 4. The daemon starts the authenticated loopback HTTP gateway, WebSocket event stream, and scheduler.
 5. Interactive and scheduled runs use the same `AgentRuntime`, provider contracts, memory retrieval, tools, permissions, cancellation, and durable events.
 6. Shutdown closes the scheduler, WebSocket clients, HTTP server, database, and daemon lock.
@@ -33,7 +33,7 @@ Active queued/running model runs resume on runtime construction. Queued/running 
 
 ## Provider boundaries
 
-Ollama uses the local HTTP API for streaming chat and embeddings. Codex uses `execa` to invoke the installed CLI with validated `codex exec --json --ephemeral --sandbox read-only --cd <workspace> --skip-git-repo-check [--model <model>] <prompt>` arguments, closes stdin, and ignores non-agent error records in the JSONL stream. The daemon never gives Codex a shell command string. The deterministic provider exists only under `NUAI_TEST_MODE=1`.
+Ollama uses the local HTTP API for streaming chat and embeddings. Codex uses `execa` to invoke the installed CLI with validated `codex exec --json --ephemeral --sandbox read-only --cd <workspace> --skip-git-repo-check [--model <model>] <prompt>` arguments, closes stdin, and ignores non-agent error records in the JSONL stream. The daemon never gives Codex a shell command string. The deterministic provider exists only under `NUAAI_TEST_MODE=1`.
 
 ## Client boundary
 

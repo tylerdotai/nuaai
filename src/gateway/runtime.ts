@@ -14,7 +14,7 @@ interface RuntimeIdentity {
 export function ensureRuntimeIdentity(root: string): RuntimeIdentity {
   const path = resolve(workspaceDirectory(root), 'runtime.json');
   if (existsSync(path)) return JSON.parse(readFileSync(path, 'utf8')) as RuntimeIdentity;
-  const secret = process.env.NUAI_AUTH_SECRET?.trim() || randomBytes(32).toString('hex');
+  const secret = process.env.NUAAI_AUTH_SECRET?.trim() || randomBytes(32).toString('hex');
   const token = createToken(
     { sub: 'local-client', exp: Math.floor(Date.now() / 1000) + 2_592_000 },
     secret,

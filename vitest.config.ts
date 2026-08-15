@@ -13,6 +13,7 @@ export default defineConfig({
       exclude: [
         'src/**/*.d.ts',
         'src/cli.tsx',
+        'src/onboarding.ts',
         'src/server.ts',
         'src/daemon.ts',
         'src/ui/**',

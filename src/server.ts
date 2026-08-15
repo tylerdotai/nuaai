@@ -39,8 +39,8 @@ function tokenFromRequest(request: Request): string | null {
     .get('cookie')
     ?.split(';')
     .map((part) => part.trim())
-    .find((part) => part.startsWith('nuai_token='));
-  return cookie?.slice('nuai_token='.length) ?? null;
+    .find((part) => part.startsWith('nuaai_token='));
+  return cookie?.slice('nuaai_token='.length) ?? null;
 }
 function contentType(path: string): string {
   if (path.endsWith('.html')) return 'text/html; charset=utf-8';
@@ -281,7 +281,7 @@ export function createApp(services: GatewayServices): Hono {
         const response = new Response(await readFile(path), {
           headers: {
             'content-type': contentType(path),
-            'set-cookie': `nuai_token=${services.authToken}; HttpOnly; SameSite=Strict; Path=/`,
+            'set-cookie': `nuaai_token=${services.authToken}; HttpOnly; SameSite=Strict; Path=/`,
           },
         });
         return response;
@@ -293,11 +293,11 @@ export function createApp(services: GatewayServices): Hono {
       return new Response(await readFile(resolve(webRoot, 'index.html')), {
         headers: {
           'content-type': 'text/html; charset=utf-8',
-          'set-cookie': `nuai_token=${services.authToken}; HttpOnly; SameSite=Strict; Path=/`,
+          'set-cookie': `nuaai_token=${services.authToken}; HttpOnly; SameSite=Strict; Path=/`,
         },
       });
     } catch {
-      return context.text('NUAI web build is unavailable. Run npm run build:web.', 503);
+      return context.text('NUAAI web build is unavailable. Run npm run build:web.', 503);
     }
   });
   return app;
@@ -359,8 +359,8 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       request.headers.cookie
         ?.split(';')
         .map((part) => part.trim())
-        .find((part) => part.startsWith('nuai_token='))
-        ?.slice('nuai_token='.length);
+        .find((part) => part.startsWith('nuaai_token='))
+        ?.slice('nuaai_token='.length);
     if (!token || !validateToken(token, services.authSecret)) {
       socket.close(1008, 'Unauthorized');
       return;

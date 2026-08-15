@@ -23,12 +23,12 @@ import {
   textDiff,
 } from '../src/workspace/fs.js';
 
-describe('NUAI foundation', () => {
+describe('NUAAI foundation', () => {
   it('exposes product metadata and package version', () => {
-    expect(harnessConfig.name).toBe('NUAI');
+    expect(harnessConfig.name).toBe('NUAAI');
     expect(harnessConfig.tagline).toBe('not ur avg ai');
-    expect(workspaceDirectory('/tmp/project')).toBe('/tmp/project/.nuai');
-    expect(readPackageMetadata().name).toBe('nuai');
+    expect(workspaceDirectory('/tmp/project')).toBe('/tmp/project/.nuaai');
+    expect(readPackageMetadata().name).toBe('nuaai');
     expect(getVersion()).toBe('0.1.0');
   });
 
@@ -80,8 +80,8 @@ describe('NUAI foundation', () => {
     );
   });
 
-  it('stores local memories in the .nuai database', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'nuai-db-'));
+  it('stores local memories in the .nuaai database', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuaai-db-'));
     const db = openMemoryDatabase(root);
     loadVectorExtension(db);
     expect(db.prepare('SELECT vec_version() AS version').get()).toMatchObject({
@@ -157,11 +157,11 @@ describe('NUAI foundation', () => {
   });
 
   it('initializes and safely operates on a workspace', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'nuai-workspace-'));
+    const root = await mkdtemp(join(tmpdir(), 'nuaai-workspace-'));
     const directory = await initWorkspace(root);
-    expect(directory).toBe(join(root, '.nuai'));
+    expect(directory).toBe(join(root, '.nuaai'));
     expect(JSON.parse(await readWorkspaceFile(root, 'config.json'))).toMatchObject({
-      name: 'NUAI',
+      name: 'NUAAI',
     });
     await initWorkspace(root);
     expect(await listWorkspaceFiles(root)).toEqual(['config.json']);

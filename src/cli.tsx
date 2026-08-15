@@ -4,6 +4,7 @@ import { createElement } from 'react';
 import { defaultRuntimeConfig, harnessConfig, loadRuntimeConfig } from './config/index.js';
 import { startDaemon } from './daemon.js';
 import { ensureRuntimeIdentity } from './gateway/runtime.js';
+import { runOnboarding } from './onboarding.js';
 import { Tui } from './ui/tui.js';
 import { getVersion } from './version.js';
 import { initWorkspace } from './workspace/fs.js';
@@ -32,6 +33,27 @@ async function main(): Promise<void> {
     await startDaemon();
     return;
   }
+  if (command === 'onboard') {
+    const onboarding = await runOnboarding(
+      process.cwd(),
+      args.includes('--yes') || args.includes('--non-interactive'),
+    );
+    if (onboarding.launch === 'skip') return;
+    const daemon = await startDaemon();
+    const config = await loadRuntimeConfig();
+    if (onboarding.launch === 'web') {
+      process.stdout.write(`NUAAI web dashboard: http://${config.host}:${daemon.gateway.port}\n`);
+      return;
+    }
+    const identity = ensureRuntimeIdentity(process.cwd());
+    render(
+      createElement(Tui, {
+        baseUrl: `http://${config.host}:${config.port}`,
+        token: identity.token,
+      }),
+    );
+    return;
+  }
   if (command === 'status' || command === 'doctor') {
     const config = await loadRuntimeConfig().catch(() => defaultRuntimeConfig());
     const identity = ensureRuntimeIdentity(process.cwd());
@@ -45,7 +67,7 @@ async function main(): Promise<void> {
   }
   if (command === 'run') {
     const input = args.slice(1).join(' ').trim();
-    if (!input) throw new Error('Usage: nuai run <input>');
+    if (!input) throw new Error('Usage: nuaai run <input>');
     const config = await loadRuntimeConfig();
     const identity = ensureRuntimeIdentity(process.cwd());
     const sessions = await apiRequest<{ sessions: Array<{ id: string }> }>(

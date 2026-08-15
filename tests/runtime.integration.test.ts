@@ -18,6 +18,7 @@ import { AgentRuntime } from '../src/core/runtime.js';
 import { Scheduler, nextCronRun } from '../src/core/scheduler.js';
 import { acquireDaemonLock, daemonLockExists } from '../src/gateway/lock.js';
 import { ensureRuntimeIdentity } from '../src/gateway/runtime.js';
+import { SearchStack } from '../src/integrations/search.js';
 import {
   DatabaseStore,
   addMemory,
@@ -62,7 +63,7 @@ afterEach(() => {
 });
 
 async function makeRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'nuai-integration-'));
+  const root = await mkdtemp(join(tmpdir(), 'nuaai-integration-'));
   roots.push(root);
   await initWorkspace(root);
   return root;
@@ -108,9 +109,9 @@ describe('runtime configuration and security primitives', () => {
   it('normalizes runtime configuration and preserves the workspace identity', async () => {
     const root = await makeRoot();
     const defaults = defaultRuntimeConfig(root);
-    expect(defaults).toMatchObject({ name: 'NUAI', version: 1, workspaceRoot: resolve(root) });
+    expect(defaults).toMatchObject({ name: 'NUAAI', version: 1, workspaceRoot: resolve(root) });
     expect(parseRuntimeConfig({ provider: { name: 'codex' } }, root)).toMatchObject({
-      name: 'NUAI',
+      name: 'NUAAI',
       provider: { name: 'codex', model: '' },
     });
     expect(
@@ -118,8 +119,8 @@ describe('runtime configuration and security primitives', () => {
     ).toMatchObject({
       provider: { name: 'codex', model: 'gpt-live' },
     });
-    expect(workspaceDirectory(root)).toBe(join(root, '.nuai'));
-    await expect(loadRuntimeConfig(root)).resolves.toMatchObject({ name: 'NUAI', version: 1 });
+    expect(workspaceDirectory(root)).toBe(join(root, '.nuaai'));
+    await expect(loadRuntimeConfig(root)).resolves.toMatchObject({ name: 'NUAAI', version: 1 });
   });
 
   it('encrypts, decrypts, rotates, and rejects malformed secrets', () => {
@@ -171,7 +172,7 @@ describe('runtime configuration and security primitives', () => {
 
   it('reclaims malformed and stale daemon locks without deleting another owner', async () => {
     const root = await makeRoot();
-    const lockPath = join(root, '.nuai', 'daemon.lock');
+    const lockPath = join(root, '.nuaai', 'daemon.lock');
     expect(await daemonLockExists(root)).toBe(false);
 
     await writeFile(lockPath, 'not-json\n');
@@ -341,8 +342,8 @@ describe('SQLite persistence and vector memory', () => {
 describe('secrets manager, workspace tools, skills, and plugins', () => {
   it('stores secrets encrypted and rotates the encrypted records', async () => {
     const root = await makeRoot();
-    const previous = process.env.NUAI_MASTER_KEY;
-    process.env.NUAI_MASTER_KEY = 'old-master-key';
+    const previous = process.env.NUAAI_MASTER_KEY;
+    process.env.NUAAI_MASTER_KEY = 'old-master-key';
     try {
       const store = makeStore(root);
       const manager = new SecretsManager(store, root);
@@ -353,7 +354,7 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
       const ciphertext = store.getSecretCiphertext('service-token');
       expect(ciphertext).not.toContain('plaintext-value');
       manager.rotate('old-master-key', 'new-master-key');
-      process.env.NUAI_MASTER_KEY = 'new-master-key';
+      process.env.NUAAI_MASTER_KEY = 'new-master-key';
       expect(new SecretsManager(store, root).get('service-token')).toBe('plaintext-value');
       manager.delete('service-token');
       expect(manager.listNames()).toEqual([]);
@@ -361,21 +362,21 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
       manager.rotate('old-master-key', 'new-master-key');
       expect(() => manager.set('', 'x')).toThrow('Secret name and value are required');
     } finally {
-      if (previous === undefined) Reflect.deleteProperty(process.env, 'NUAI_MASTER_KEY');
-      else process.env.NUAI_MASTER_KEY = previous;
+      if (previous === undefined) Reflect.deleteProperty(process.env, 'NUAAI_MASTER_KEY');
+      else process.env.NUAAI_MASTER_KEY = previous;
     }
   });
 
   it('creates a local master key when no environment key is configured', async () => {
     const root = await makeRoot();
-    const previous = process.env.NUAI_MASTER_KEY;
-    Reflect.deleteProperty(process.env, 'NUAI_MASTER_KEY');
+    const previous = process.env.NUAAI_MASTER_KEY;
+    Reflect.deleteProperty(process.env, 'NUAAI_MASTER_KEY');
     try {
       const manager = new SecretsManager(makeStore(root), root);
       manager.set('generated-key', 'value');
       expect(manager.get('generated-key')).toBe('value');
     } finally {
-      if (previous !== undefined) process.env.NUAI_MASTER_KEY = previous;
+      if (previous !== undefined) process.env.NUAAI_MASTER_KEY = previous;
     }
   });
 
@@ -447,6 +448,55 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
     await expect(assertSafeExistingPath(root, 'missing.txt')).resolves.toBe(
       join(root, 'missing.txt'),
     );
+
+    const searchStack = new SearchStack({
+      searxng: {
+        search: async () => [
+          { title: 'result', url: 'https://example.com', snippet: '', source: 'searxng' },
+        ],
+      },
+      crawl4ai: {
+        crawl: async () => ({ url: 'https://example.com', title: 'page', text: 'body' }),
+      },
+    });
+    const networkTools = new ToolRegistry(root, searchStack, { browserEnabled: false });
+    const networkPermissions: PermissionContext = {
+      ...permissive,
+      capabilities: { ...permissive.capabilities, network: true },
+    };
+    expect(networkTools.schemas().map((tool) => tool.name)).toContain('web.search');
+    expect(networkTools.schemas().map((tool) => tool.name)).not.toContain('browser.open');
+    await expect(
+      networkTools.execute(
+        'web.search',
+        { query: 'nuaai' },
+        { root, permissions: networkPermissions },
+      ),
+    ).resolves.toHaveLength(1);
+    await expect(
+      networkTools.execute(
+        'web.fetch',
+        { url: 'https://example.com' },
+        { root, permissions: networkPermissions },
+      ),
+    ).resolves.toMatchObject({ text: 'body' });
+    await expect(
+      networkTools.execute(
+        'web.search',
+        { query: 'nuaai' },
+        {
+          root,
+          permissions: { approved: new Set(['read']), capabilities: { filesystem: true } },
+        },
+      ),
+    ).rejects.toThrow('Network capability required');
+    await expect(
+      networkTools.execute(
+        'browser.open',
+        { url: 'https://example.com' },
+        { root, permissions: permissive },
+      ),
+    ).rejects.toThrow('Unknown tool');
     await expect(readWorkspaceFile(root, 'skills')).rejects.toThrow('Not a regular file');
     await expect(assertSafeExistingPath(root, '../outside')).rejects.toThrow(
       'Path escapes workspace',
@@ -772,16 +822,16 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
 
 describe('providers and scheduler', () => {
   it('runs the deterministic provider and registers it only in test mode', async () => {
-    const previous = process.env.NUAI_TEST_MODE;
-    process.env.NUAI_TEST_MODE = '1';
+    const previous = process.env.NUAAI_TEST_MODE;
+    process.env.NUAAI_TEST_MODE = '1';
     try {
       const provider = new DeterministicProvider();
       const events: ProviderStreamEvent[] = [];
       for await (const event of provider.stream({ model: 'local-test', messages: [] }))
         events.push(event);
       expect(events).toEqual([
-        { type: 'delta', text: 'NUAI deterministic test response' },
-        { type: 'done', text: 'NUAI deterministic test response' },
+        { type: 'delta', text: 'NUAAI deterministic test response' },
+        { type: 'done', text: 'NUAAI deterministic test response' },
       ]);
       const toolEvents: ProviderStreamEvent[] = [];
       for await (const event of provider.stream({
@@ -816,8 +866,8 @@ describe('providers and scheduler', () => {
       expect(registry.get('deterministic').name).toBe('deterministic');
       expect(await registry.health()).toHaveLength(3);
       expect(() => registry.get('missing')).toThrow('Unknown provider');
-      const testMode = process.env.NUAI_TEST_MODE;
-      Reflect.deleteProperty(process.env, 'NUAI_TEST_MODE');
+      const testMode = process.env.NUAAI_TEST_MODE;
+      Reflect.deleteProperty(process.env, 'NUAAI_TEST_MODE');
       try {
         expect(
           new ProviderRegistry({
@@ -830,11 +880,11 @@ describe('providers and scheduler', () => {
           }).list(),
         ).toEqual(['codex', 'ollama']);
       } finally {
-        if (testMode !== undefined) process.env.NUAI_TEST_MODE = testMode;
+        if (testMode !== undefined) process.env.NUAAI_TEST_MODE = testMode;
       }
     } finally {
-      if (previous === undefined) Reflect.deleteProperty(process.env, 'NUAI_TEST_MODE');
-      else process.env.NUAI_TEST_MODE = previous;
+      if (previous === undefined) Reflect.deleteProperty(process.env, 'NUAAI_TEST_MODE');
+      else process.env.NUAAI_TEST_MODE = previous;
     }
   });
 
@@ -1241,7 +1291,7 @@ describe('agent runtime orchestration', () => {
     const completed = await runtime.waitForRun(run.id);
     expect(completed).toMatchObject({
       status: 'completed',
-      output: 'NUAI deterministic test response',
+      output: 'NUAAI deterministic test response',
     });
     expect(runtime.listMessages(created.thread.id).map((message) => message.role)).toEqual([
       'user',
@@ -1423,7 +1473,7 @@ describe('agent runtime orchestration', () => {
     });
     await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
       status: 'completed',
-      output: 'NUAI deterministic test response',
+      output: 'NUAAI deterministic test response',
     });
     const failed = store.createRun(
       created.thread.id,

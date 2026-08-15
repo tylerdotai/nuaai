@@ -1,18 +1,16 @@
-# NUAI Implementation Ledger
+# NUAAI Implementation Ledger
 
 This ledger records implementation evidence against `MASTER_PROMPT.md`. `verified` means the acceptance evidence ran successfully. `partial` means real work exists but a required acceptance item or feature remains incomplete. `pending` means no sufficient evidence exists yet.
 
 ## Baseline
 
-- Repository: `/home/tyler/nuai`
-- Starting commit: `ec383cb`
-- Starting tag: `v0.1.0`
+- Repository: `<repository-root>`
+- Release baseline: `v0.1.0`
 - Product version: `0.1.0`
 - Branch: `main`
-- Node: 20+ required by project; current command runtime is Node 26.7.0
-- Ollama: `0.20.3`
-- Installed Ollama models: 10, including `qwen3.5:latest` and `nomic-embed-text:latest`
-- Codex: `codex-cli 0.147.0`
+- Node: 20+ required by project
+- Ollama: local HTTP adapter
+- Codex: installed CLI subprocess adapter
 - Codex non-interactive command: `codex exec --json`
 
 ## Architecture decisions
@@ -21,11 +19,11 @@ This ledger records implementation evidence against `MASTER_PROMPT.md`. `verifie
 2. SQLite is the local durable store. SQLite-backed scheduling avoids an unnecessary queue service.
 3. Ollama uses its local HTTP API through a small native `fetch` adapter.
 4. Codex uses a controlled `execa` subprocess adapter and verified `codex exec --json` behavior.
-5. HMAC tokens authenticate local HTTP/WebSocket access. Generated authentication metadata lives in `.nuai/runtime.json`.
-6. AES-256-GCM encrypts provider secrets. The master key comes from `NUAI_MASTER_KEY` or the local restrictive `.nuai/master.key` path.
+5. HMAC tokens authenticate local HTTP/WebSocket access. Generated authentication metadata lives in `.nuaai/runtime.json`.
+6. AES-256-GCM encrypts provider secrets. The master key comes from `NUAAI_MASTER_KEY` or the local restrictive `.nuaai/master.key` path.
 7. Skills and plugins use manifests and validated capabilities. Untrusted code is refused.
 8. Browser E2E uses Playwright against the built web client and a real deterministic local daemon. External provider smoke tests remain separate and truthful.
-9. A local `.nuai/daemon.lock` prevents duplicate daemon ownership and reclaims stale PID records.
+9. A local `.nuaai/daemon.lock` prevents duplicate daemon ownership and reclaims stale PID records.
 
 ## Delivery ledger
 
@@ -36,7 +34,7 @@ This ledger records implementation evidence against `MASTER_PROMPT.md`. `verifie
 | Daemon lifecycle | verified | Loopback daemon smoke, graceful stop, SIG handlers, startup error path, and duplicate-lock test pass. |
 | Sessions/threads/runs | verified | Durable lifecycle, cancellation, resumption, and restart recovery tests pass. |
 | Ollama adapter | verified | Real local chat returned streamed `OLLAMA_SMOKE_OK`; `nomic-embed-text:latest` returned a 768-dimensional vector. |
-| Codex adapter | verified | Controlled `execa` subprocess with JSONL parsing, empty-stdin closure, abort/timeout handling, read-only sandbox, non-Git workspace support, explicit-model omission when unset, fake-executable coverage, and a live hosted Codex `AgentRuntime` smoke that completed and persisted `NUAI_RUNTIME_CODEX_OK`. |
+| Codex adapter | verified | Controlled `execa` subprocess with JSONL parsing, empty-stdin closure, abort/timeout handling, read-only sandbox, non-Git workspace support, explicit-model omission when unset, fake-executable coverage, and a live hosted Codex `AgentRuntime` smoke that completed and persisted `NUAAI_RUNTIME_CODEX_OK`. |
 | Agent loop | verified | Deterministic streaming, memory retrieval, tool loop, limits, failures, timeout/cancellation paths pass. |
 | Encrypted secrets | verified | AES-GCM, tamper rejection, rotation, permissions, redaction, and API wiring pass. |
 | Secure workspace tools | verified | Traversal, symlink, allowlist, timeout, output capture, and permission tests pass. |
@@ -62,7 +60,7 @@ This ledger records implementation evidence against `MASTER_PROMPT.md`. `verifie
 - Playwright: 1 passed against the built web UI and deterministic daemon.
 - `npm audit --audit-level=low`: 0 vulnerabilities.
 - `git diff --check`: passed.
-- Daemon cleanup: no active daemon process and no `.nuai/daemon.lock`.
+- Daemon cleanup: no active daemon process and no `.nuaai/daemon.lock`.
 
 ## Rule
 

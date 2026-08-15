@@ -43,7 +43,7 @@ export class AgentRuntime {
         );
         void this.executeRun(run, provider, {
           approved: new Set(['read']),
-          capabilities: { filesystem: true },
+          capabilities: { filesystem: true, network: true },
         });
       } catch (error) {
         this.options.store.updateRun(run.id, {
@@ -142,7 +142,10 @@ export class AgentRuntime {
     void this.executeRun(
       run,
       provider,
-      request.permissions ?? { approved: new Set(['read']), capabilities: { filesystem: true } },
+      request.permissions ?? {
+        approved: new Set(['read']),
+        capabilities: { filesystem: true, network: true },
+      },
     );
     return run;
   }
@@ -265,7 +268,7 @@ export class AgentRuntime {
         const messages: ProviderMessage[] = [
           {
             role: 'system',
-            content: `You are NUAI, a persistent local-first personal agent. Use available tools only when needed. Be precise and report unavailable capabilities honestly.${memoryContext ? `\nRelevant persisted memory:\n${memoryContext}` : ''}`,
+            content: `You are NUAAI, a persistent local-first personal agent. Use available tools only when needed. Be precise and report unavailable capabilities honestly.${memoryContext ? `\nRelevant persisted memory:\n${memoryContext}` : ''}`,
           },
           ...this.options.store.listMessages(thread.id, 200).map((message) => ({
             role: message.role as ProviderMessage['role'],
