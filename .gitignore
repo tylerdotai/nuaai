@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+.nuai/
+.env
+.env.*
+!.env.example
+*.db-shm
+*.db-wal
+.DS_Store

@@ -1,0 +1,178 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
+
+import { harnessConfig, workspaceDirectory } from '../src/config/index.js';
+import { runAgent } from '../src/core/agent.js';
+import { createProvider, isProviderName } from '../src/core/provider.js';
+import { createToken, validateToken } from '../src/gateway/token.js';
+import { addMemory, listMemories, openMemoryDatabase } from '../src/memory/db.js';
+import { cosineSimilarity, loadVectorExtension, searchVectors } from '../src/memory/vector.js';
+import { SkillRegistry } from '../src/skills/registry.js';
+import { compileSkill, generateSkillSource } from '../src/skills/synthesizer.js';
+import { getVersion, readPackageMetadata } from '../src/version.js';
+import {
+  initWorkspace,
+  listWorkspaceFiles,
+  readWorkspaceFile,
+  runWorkspaceCommand,
+  safePath,
+  textDiff,
+} from '../src/workspace/fs.js';
+
+describe('NUAI foundation', () => {
+  it('exposes product metadata and package version', () => {
+    expect(harnessConfig.name).toBe('NUAI');
+    expect(harnessConfig.tagline).toBe('not ur avg ai');
+    expect(workspaceDirectory('/tmp/project')).toBe('/tmp/project/.nuai');
+    expect(readPackageMetadata().name).toBe('nuai');
+    expect(getVersion()).toBe('0.1.0');
+  });
+
+  it('runs observe, plan, and act in order', async () => {
+    const calls: string[] = [];
+    const result = await runAgent('hello', {
+      async observe(input) {
+        calls.push(`observe:${input}`);
+        return { input };
+      },
+      async plan(observation) {
+        calls.push(`plan:${observation.input}`);
+        return { action: observation.input.toUpperCase() };
+      },
+      async act(action) {
+        calls.push(`act:${action.action}`);
+        return 'done';
+      },
+    });
+
+    expect(result.result).toBe('done');
+    expect(calls).toEqual(['observe:hello', 'plan:hello', 'act:HELLO']);
+  });
+
+  it('validates provider names and models', async () => {
+    expect(isProviderName('ollama')).toBe(true);
+    expect(isProviderName('unknown')).toBe(false);
+    const provider = createProvider('ollama', 'llama3', async (prompt) => `reply:${prompt}`);
+    expect(await provider.generateText('hi')).toBe('reply:hi');
+    expect(() => createProvider('unknown', 'model', async () => '')).toThrow(
+      'Unsupported provider',
+    );
+    expect(() => createProvider('ollama', ' ', async () => '')).toThrow('model is required');
+  });
+
+  it('creates and rejects signed gateway tokens', () => {
+    const token = createToken({ sub: 'tester', exp: 2_000 }, 'secret', 1_000_000);
+    expect(validateToken(token, 'secret', 1_500)).toMatchObject({ sub: 'tester', exp: 2_000 });
+    expect(validateToken(token, 'wrong', 1_500)).toBeNull();
+    expect(validateToken(`${token}x`, 'secret', 1_500)).toBeNull();
+    expect(validateToken('malformed', 'secret', 1_500)).toBeNull();
+    expect(validateToken('', 'secret', 1_500)).toBeNull();
+    expect(validateToken(token, '', 1_500)).toBeNull();
+    expect(
+      validateToken(createToken({ sub: 'tester', exp: 1 }, 'secret'), 'secret', 2_000),
+    ).toBeNull();
+    expect(() => createToken({ sub: 'tester', exp: 2_000 }, '', 1_000)).toThrow(
+      'secret is required',
+    );
+  });
+
+  it('stores local memories in the .nuai database', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuai-db-'));
+    const db = openMemoryDatabase(root);
+    loadVectorExtension(db);
+    expect(db.prepare('SELECT vec_version() AS version').get()).toMatchObject({
+      version: expect.any(String),
+    });
+    expect(() => addMemory(db, '  ')).toThrow('content is required');
+    expect(addMemory(db, 'first', 123)).toBe(1);
+    expect(listMemories(db)).toEqual([{ id: 1, content: 'first', createdAt: 123 }]);
+    db.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('searches vectors by cosine similarity', () => {
+    expect(cosineSimilarity([1, 0], [1, 0])).toBe(1);
+    expect(cosineSimilarity([0, 0], [1, 0])).toBe(0);
+    expect(() => cosineSimilarity([1], [1, 0])).toThrow('dimensions');
+    const matches = searchVectors(
+      [1, 0],
+      [
+        { id: 'low', vector: [0, 1], value: 'low' },
+        { id: 'high', vector: [1, 0], value: 'high' },
+      ],
+      1,
+    );
+    expect(matches).toEqual([{ id: 'high', vector: [1, 0], value: 'high', score: 1 }]);
+    expect(searchVectors([1], [], 0)).toEqual([]);
+  });
+
+  it('registers, validates, and dispatches skills', async () => {
+    const registry = new SkillRegistry();
+    registry.register({
+      name: 'echo',
+      description: 'Echo text',
+      input: z.string(),
+      execute: (input) => `echo:${input}`,
+    });
+    registry.register({
+      name: 'add',
+      description: 'Add numbers',
+      input: z.number(),
+      execute: async (input) => Number(input) + 1,
+    });
+    expect(registry.list().map((skill) => skill.name)).toEqual(['add', 'echo']);
+    expect(await registry.dispatch('echo', 'hi')).toBe('echo:hi');
+    expect(await registry.dispatch('add', 2)).toBe(3);
+    await expect(registry.dispatch('missing', null)).rejects.toThrow('Unknown skill');
+    await expect(registry.dispatch('echo', 2)).rejects.toThrow();
+    expect(() =>
+      registry.register({
+        name: 'echo',
+        description: 'Duplicate',
+        input: z.string(),
+        execute: (input) => input,
+      }),
+    ).toThrow('already registered');
+    expect(() =>
+      registry.register({
+        name: '',
+        description: 'Invalid',
+        input: z.string(),
+        execute: (input) => input,
+      }),
+    ).toThrow('name is required');
+  });
+
+  it('generates and compiles a skill module', async () => {
+    const source = generateSkillSource('echo-skill', 'Echo input', 'return input;');
+    expect(source).toContain('export async function execute');
+    expect(await compileSkill(source)).toContain('async function execute');
+    expect(() => generateSkillSource('Bad Name', 'x', 'return input;')).toThrow('lowercase');
+    expect(() => generateSkillSource('valid', 'x', ' ')).toThrow('body is required');
+    await expect(compileSkill('')).rejects.toThrow('source is required');
+  });
+
+  it('initializes and safely operates on a workspace', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuai-workspace-'));
+    const directory = await initWorkspace(root);
+    expect(directory).toBe(join(root, '.nuai'));
+    expect(JSON.parse(await readWorkspaceFile(root, 'config.json'))).toMatchObject({
+      name: 'NUAI',
+    });
+    await initWorkspace(root);
+    expect(await listWorkspaceFiles(root)).toEqual(['config.json']);
+    expect(() => safePath(directory, '../escape')).toThrow('escapes workspace');
+    const command = await runWorkspaceCommand(
+      process.execPath,
+      ['-e', 'process.stdout.write("ok")'],
+      root,
+    );
+    expect(command).toMatchObject({ exitCode: 0, stdout: 'ok', stderr: '' });
+    expect(textDiff('one\n', 'two\n').map((change) => change.value)).toEqual(['one\n', 'two\n']);
+    await rm(root, { recursive: true, force: true });
+  });
+});
