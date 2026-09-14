@@ -15,6 +15,10 @@ All notable NUAAI changes are recorded here.
 - Authenticated approval list/detail/approve/deny APIs, approval lifecycle events, a functional PWA approval inbox, and TUI pending-action visibility.
 - Versioned tool-specific approval previews with allowlisted path/action/coordinate facts, opaque-field size and SHA-256 fingerprints, and safe source/session/client context.
 
+### Changed
+
+- Local and OpenAI-compatible runs now default to a 262,144-token context budget with an 8,192-token response reserve, matching high-memory local servers instead of compacting at 131,072 tokens.
+
 ### Fixed
 
 - Artifact storage now rejects pre-existing artifact-root and run-directory symbolic links, validates physical containment and inode identity before writes, and retains exclusive owner-only immutable copies.

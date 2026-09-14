@@ -370,7 +370,7 @@ describe('runtime context contract', () => {
     });
     expect(runtime.status().context).toEqual({
       estimator: 'utf8-bytes-per-3-v1',
-      maxTokens: 131_072,
+      maxTokens: 262_144,
       responseReserveTokens: 8_192,
       maxSummaryTokens: 4_096,
     });
