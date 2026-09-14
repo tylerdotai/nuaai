@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Box, Text, useApp, useInput } from 'ink';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { WebSocket } from 'ws';
@@ -168,7 +169,10 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
           baseUrl,
           token,
           '/api/sessions',
-          { method: 'POST', body: JSON.stringify({ title: 'Main session' }) },
+          {
+            method: 'POST',
+            body: JSON.stringify({ title: 'Main session', sourceKey: `tui:${randomUUID()}` }),
+          },
         );
         session = created.session;
         selectedSessionRef.current = session.id;

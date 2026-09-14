@@ -8,8 +8,8 @@ Ink TUI / React web client
           ▼
       Node daemon
           ├── AgentRuntime — sessions, runs, provider loop, tools, memory, recovery
-          ├── ProviderRegistry — Ollama, Codex CLI, deterministic test provider
-          ├── DatabaseStore — SQLite/Drizzle persistence and sqlite-vec retrieval
+          ├── ProviderRegistry — native Ollama, OpenAI-compatible local, Codex Responses, deterministic test
+          ├── DatabaseStore — SQLite/Drizzle persistence with semantic and lexical retrieval
           ├── Scheduler — durable schedules, task records, restart recovery
           ├── SecretsManager — AES-256-GCM encrypted local records
           ├── SkillRegistry / PluginRegistry
@@ -25,15 +25,26 @@ Ink TUI / React web client
 5. Interactive and scheduled runs use the same `AgentRuntime`, provider contracts, memory retrieval, tools, permissions, cancellation, and durable events.
 6. Shutdown closes the scheduler, WebSocket clients, HTTP server, database, and daemon lock.
 
+## Agentic loop
+
+1. **Perception:** an authenticated Web, Matrix, CLI, TUI, or scheduler request enters a durable thread and captures current context.
+2. **Decision:** the selected provider receives the layered system prompt plus one stable tool catalog filtered by the client permission profile.
+3. **Action:** a structured provider tool call is validated against the advertised catalog and executed once through the daemon-owned registry.
+4. **Observation:** the bounded tool result is persisted as a typed artifact and returned to the provider with the assistant tool-call message.
+5. **Continuation:** the loop repeats until a verified final response, explicit failure, cancellation, timeout, or configured turn limit. Exhausting the tool budget disables further tools and requests a final answer from gathered evidence.
+6. **Commit:** authoritative output and lifecycle evidence are written by the active thread writer and projected to connected clients.
+
 ## Persistence
 
 SQLite stores sessions, threads, messages, runs, events, memories, tasks, schedules, secrets, skills, and plugins. Runtime initialization uses idempotent schema creation. Events are versioned, redacted before persistence, and replayable by cursor through HTTP or WebSocket subscription.
 
-Active queued/running model runs resume on runtime construction. Queued/running scheduled tasks are marked as interrupted on scheduler restart; enabled schedules become eligible for the next poll, providing at-least-once recovery without silently losing task history.
+Active queued/running model runs are marked failed on runtime construction and require explicit manual resume, preventing automatic action replay. Exceptional terminal failure text is also persisted as an assistant message so the next turn can identify the actual cause. Queued/running scheduled tasks are marked interrupted on scheduler restart; enabled schedules become eligible for the next poll without silently losing task history.
+
+Automatic memory retrieval first attempts the configured Ollama embedding provider. Missing or empty semantic results fall back to bounded lexical ranking over durable memory records. The read-only `run.history` tool exposes only recent outcomes from the current thread and omits internal correlation data.
 
 ## Provider boundaries
 
-Ollama uses the local HTTP API for streaming chat and embeddings. Codex uses `execa` to invoke the installed CLI with validated `codex exec --json --ephemeral --sandbox read-only --cd <workspace> --skip-git-repo-check [--model <model>] <prompt>` arguments, closes stdin, and ignores non-agent error records in the JSONL stream. The daemon never gives Codex a shell command string. The deterministic provider exists only under `NUAAI_TEST_MODE=1`.
+Ollama uses the local HTTP API for streaming chat and embeddings. Codex turns use the fixed HTTPS ChatGPT Codex Responses endpoint with OAuth state read on demand from the installed Codex CLI. NUAAI never copies OAuth state into project configuration or SQLite. When an access token nears expiry, NUAAI invokes a short-lived, sanitized `codex app-server` account RPC so Codex refreshes its own store; model turns do not use App Server. Responses function calls normalize into the same daemon-owned, permission-filtered tool loop as local providers. Visible model IDs come from Codex's local model cache, and independent provider selections survive restarts. The deterministic provider exists only under `NUAAI_TEST_MODE=1`.
 
 ## Client boundary
 

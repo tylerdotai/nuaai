@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -22,6 +22,7 @@ import {
   runWorkspaceCommand,
   safePath,
   textDiff,
+  writeWorkspaceFile,
 } from '../src/workspace/fs.js';
 
 describe('NUAAI foundation', () => {
@@ -30,7 +31,7 @@ describe('NUAAI foundation', () => {
     expect(harnessConfig.tagline).toBe('not ur avg ai');
     expect(workspaceDirectory('/tmp/project')).toBe('/tmp/project/.nuaai');
     expect(readPackageMetadata().name).toBe('nuaai');
-    expect(getVersion()).toBe('0.1.0');
+    expect(getVersion()).toBe('1.0.0');
   });
 
   it('runs observe, plan, and act in order', async () => {
@@ -161,7 +162,7 @@ describe('NUAAI foundation', () => {
     const root = await mkdtemp(join(tmpdir(), 'nuaai-workspace-'));
     const directory = await initWorkspace(root);
     expect(directory).toBe(join(root, '.nuaai'));
-    await expect(readWorkspaceFile(root, 'config.json')).rejects.toThrow(
+    await expect(readWorkspaceFile(root, '.nuaai/config.json')).rejects.toThrow(
       'Protected workspace file',
     );
     await initWorkspace(root);
@@ -173,23 +174,106 @@ describe('NUAAI foundation', () => {
     expect(isProtectedWorkspaceFile('runtime.json')).toBe(true);
     expect(isProtectedWorkspaceFile('matrix.env')).toBe(true);
     expect(isProtectedWorkspaceFile('secrets/master.key')).toBe(true);
-    await expect(readWorkspaceFile(root, 'matrix.env')).rejects.toThrow('Protected workspace file');
-    expect(() => safePath(directory, '../escape')).toThrow('escapes workspace');
-    const command = await runWorkspaceCommand(
-      process.execPath,
-      ['-e', 'process.stdout.write("ok")'],
-      root,
+    expect(isProtectedWorkspaceFile('plugins/planted/index.mjs')).toBe(true);
+    expect(isProtectedWorkspaceFile('skills/planted/manifest.json')).toBe(true);
+    await expect(readWorkspaceFile(root, '.nuaai/matrix.env')).rejects.toThrow(
+      'Protected workspace file',
     );
-    expect(command).toMatchObject({ exitCode: 0, stdout: 'ok', stderr: '' });
+    await writeFile(join(directory, 'runtime.json'), '{"token":"do-not-read"}');
+    await link(join(directory, 'runtime.json'), join(root, 'hard-linked-runtime.txt'));
+    await expect(readWorkspaceFile(root, 'hard-linked-runtime.txt')).rejects.toThrow('hard-linked');
+    await expect(writeWorkspaceFile(root, 'hard-linked-runtime.txt', 'changed')).rejects.toThrow(
+      'hard-linked',
+    );
+    expect(await readFile(join(directory, 'runtime.json'), 'utf8')).toBe('{"token":"do-not-read"}');
+    await symlink(join(directory, 'runtime.json'), join(directory, 'runtime-alias.txt'));
+    await expect(readWorkspaceFile(root, '.nuaai/runtime-alias.txt')).rejects.toThrow(
+      'Protected workspace file',
+    );
+    await writeWorkspaceFile(root, 'src/generated.ts', 'export const generated = true;\n');
+    expect(await readFile(join(root, 'src/generated.ts'), 'utf8')).toBe(
+      'export const generated = true;\n',
+    );
+    expect(await listWorkspaceFiles(root)).toContain('src/generated.ts');
+    expect(await listWorkspaceFiles(root)).not.toContain('.nuaai/config.json');
+    expect(() => safePath(directory, '../escape')).toThrow('escapes workspace');
+    await expect(
+      runWorkspaceCommand(process.execPath, ['-e', 'process.stdout.write("ok")'], root),
+    ).rejects.toThrow('Absolute command is not allowlisted');
+    await expect(runWorkspaceCommand('./echo', ['hello'], root)).rejects.toThrow(
+      'Command path is not allowlisted',
+    );
     await expect(runWorkspaceCommand('echo', ['hello'], root)).resolves.toMatchObject({
       exitCode: 0,
       stdout: 'hello',
     });
-    for (const commandLine of ['uname -a', 'df -h', 'free -h', 'lscpu', 'cat /etc/os-release']) {
+    for (const commandLine of ['uname -a', 'df -h', 'free -h']) {
       await expect(runWorkspaceCommand(commandLine, [], root)).resolves.toMatchObject({
         exitCode: 0,
       });
     }
+    await writeFile(join(root, 'README.md'), 'inside workspace');
+    await expect(runWorkspaceCommand('cat', ['README.md'], root)).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: 'inside workspace',
+    });
+    await expect(runWorkspaceCommand('cat', ['/etc/os-release'], root)).rejects.toThrow(
+      'outside workspace',
+    );
+    await expect(runWorkspaceCommand('ls', ['/etc'], root)).rejects.toThrow(
+      'Command is not allowlisted',
+    );
+    await writeFile(join(root, '.env'), 'NUAAI_PRIVATE_VALUE=do-not-read');
+    await expect(runWorkspaceCommand('cat', ['.env'], root)).rejects.toThrow(
+      'Protected project file',
+    );
+    await mkdir(join(root, '.git'));
+    await writeFile(join(root, '.git', 'config'), '[remote "origin"]');
+    await expect(runWorkspaceCommand('cat', ['.git/config'], root)).rejects.toThrow(
+      'Protected project file',
+    );
+    const previousSentinel = process.env.NUAAI_WORKSPACE_SENTINEL;
+    process.env.NUAAI_WORKSPACE_SENTINEL = 'must-not-leak';
+    try {
+      const childEnvironment = await runWorkspaceCommand('env', [], root, {
+        allowedCommands: new Set(['env']),
+      });
+      expect(childEnvironment.stdout).not.toContain('NUAAI_WORKSPACE_SENTINEL');
+      await expect(
+        runWorkspaceCommand('ps', ['eww', '-p', String(process.pid)], root),
+      ).rejects.toThrow('Unsupported ps arguments');
+      await expect(
+        runWorkspaceCommand('ps', ['-p', String(process.pid)], root),
+      ).resolves.toMatchObject({
+        exitCode: 0,
+      });
+    } finally {
+      if (previousSentinel === undefined) process.env.NUAAI_WORKSPACE_SENTINEL = undefined;
+      else process.env.NUAAI_WORKSPACE_SENTINEL = previousSentinel;
+    }
+    await symlink(join(directory, 'runtime.json'), join(root, 'runtime-alias.txt'));
+    await expect(runWorkspaceCommand('cat', ['runtime-alias.txt'], root)).rejects.toThrow(
+      'Protected workspace file',
+    );
+    await expect(runWorkspaceCommand('date', ['--file=/etc/os-release'], root)).rejects.toThrow(
+      'Indirect file options are not supported',
+    );
+    await expect(
+      runWorkspaceCommand('date', ['--reference=/etc/os-release'], root),
+    ).rejects.toThrow('Indirect file options are not supported');
+
+    await mkdir(join(root, '-'));
+    await expect(
+      runWorkspaceCommand('cat', ['--', '-/../../../etc/os-release'], root),
+    ).rejects.toThrow('outside workspace');
+    for (const command of ['file', 'hostname', 'ls', 'lscpu', 'lsblk', 'lspci', 'lsusb'])
+      await expect(runWorkspaceCommand(command, [], root)).rejects.toThrow(
+        'Command is not allowlisted',
+      );
+    await expect(runWorkspaceCommand('date', ['--set=2030-01-01'], root)).rejects.toThrow(
+      'Mutating command options are not supported',
+    );
+
     await expect(runWorkspaceCommand("printf 'hello world'", [], root)).resolves.toMatchObject({
       exitCode: 0,
       stdout: 'hello world',
@@ -201,9 +285,31 @@ describe('NUAAI foundation', () => {
       'Protected workspace file',
     );
     await expect(runWorkspaceCommand('python3', ['-c', 'print(1)'], root)).rejects.toThrow(
-      'Inline interpreter execution is not supported',
+      'Command is not allowlisted',
     );
+    const outside = join(root, 'outside.txt');
+    await writeFile(outside, 'unchanged');
+    await symlink(outside, join(root, 'linked-output.txt'));
+    await expect(writeWorkspaceFile(root, 'linked-output.txt', 'changed')).rejects.toThrow(
+      'symbolic link',
+    );
+    expect(await readFile(outside, 'utf8')).toBe('unchanged');
+    const externalDirectory = await mkdtemp(join(tmpdir(), 'nuaai-external-'));
+    await symlink(externalDirectory, join(root, 'linked-directory'));
+    await expect(
+      writeWorkspaceFile(root, 'linked-directory/nested/planted.txt', 'changed'),
+    ).rejects.toThrow('escapes workspace');
+    await expect(
+      readFile(join(externalDirectory, 'nested/planted.txt'), 'utf8'),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(
+      writeWorkspaceFile(root, '.nuaai/plugins/planted/index.mjs', 'code'),
+    ).rejects.toThrow('Protected workspace file');
+    await expect(
+      writeWorkspaceFile(root, '.nuaai/skills/planted/manifest.json', '{}'),
+    ).rejects.toThrow('Protected workspace file');
     expect(textDiff('one\n', 'two\n').map((change) => change.value)).toEqual(['one\n', 'two\n']);
+    await rm(externalDirectory, { recursive: true, force: true });
     await rm(root, { recursive: true, force: true });
   });
 });

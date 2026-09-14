@@ -23,6 +23,9 @@ export interface ToolContext {
   root: string;
   permissions: PermissionContext;
   timeoutMs?: number;
+  signal?: AbortSignal;
+  threadId?: string;
+  runId?: string;
 }
 export interface ToolServices {
   store?: DatabaseStore;
@@ -42,27 +45,19 @@ export interface ToolDefinition {
 }
 
 const empty = z.object({});
+const githubCommands = new Set(['gh']);
 
 function assertNetwork(context: ToolContext): void {
   if (!context.permissions.capabilities.network) throw new Error('Network capability required');
 }
 
-function lexicalMemorySearch(
-  rows: ReturnType<DatabaseStore['searchMemoryRows']>,
-  query: string,
-  limit: number,
-): Array<Record<string, unknown>> {
-  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-  return rows
-    .map((memory) => {
-      const haystack = memory.content.toLowerCase();
-      const score = terms.reduce((total, term) => total + (haystack.includes(term) ? 1 : 0), 0);
-      return { ...memory, embedding: undefined, score };
-    })
-    .filter((memory) => memory.score > 0)
-    .sort((left, right) => right.score - left.score || right.createdAt - left.createdAt)
-    .slice(0, limit)
-    .map(({ embedding: _embedding, ...memory }) => memory);
+function assertSubprocess(context: ToolContext): void {
+  if (!context.permissions.capabilities.subprocess)
+    throw new Error('Subprocess capability required');
+}
+
+function githubError(result: { stdout: string; stderr: string }): string {
+  return (result.stderr || result.stdout).trim().slice(0, 2_000);
 }
 
 export class ToolRegistry {
@@ -70,7 +65,7 @@ export class ToolRegistry {
   constructor(
     root: string,
     searchStack?: SearchStack,
-    options: { browserEnabled?: boolean } = {},
+    options: { browserEnabled?: boolean; searchEnabled?: boolean } = {},
     services: ToolServices = {},
   ) {
     this.register({
@@ -136,7 +131,7 @@ export class ToolRegistry {
     this.register({
       name: 'workspace.command',
       description:
-        'Run one explicitly allowlisted workspace command (cat, date, df, echo, file, free, hostname, head, lscpu, ls, lsblk, lspci, lsusb, printf, ps, pwd, stat, tail, uname, uptime, wc, which, whoami, node, npm, npx, git, ollama, codex, python, or python3). Put arguments in args. Protected runtime files remain inaccessible, inline Python/Node execution is rejected, and shell operators such as &&, ;, |, and redirects are rejected; issue separate tool calls instead of chaining commands.',
+        'Run one explicitly allowlisted read-oriented command (cat, date, df, echo, free, head, printf, ps, pwd, stat, tail, uname, uptime, wc, which, or whoami). Put arguments in args. Protected runtime and credential files remain inaccessible, subprocess environments are minimal, and shell operators such as &&, ;, |, and redirects are rejected; issue separate tool calls instead of chaining commands.',
       permission: 'execute',
       parameters: {
         type: 'object',
@@ -151,10 +146,93 @@ export class ToolRegistry {
         const value = input as { command: string; args: string[] };
         return runWorkspaceCommand(value.command, value.args, context.root, {
           timeoutMs: context.timeoutMs,
+          cancelSignal: context.signal,
         });
       },
     });
-    if (searchStack) {
+    this.register({
+      name: 'github.auth',
+      description:
+        'Check GitHub CLI authentication through the bounded gh command and return only sanitized account/status information',
+      permission: 'execute',
+      parameters: { type: 'object', properties: {} },
+      input: empty,
+      execute: async (_input, context) => {
+        assertNetwork(context);
+        assertSubprocess(context);
+        const result = await runWorkspaceCommand('gh', ['auth', 'status'], context.root, {
+          timeoutMs: context.timeoutMs,
+          allowedCommands: githubCommands,
+        });
+        const account = `${result.stdout}\n${result.stderr}`.match(/account\s+([^\s(]+)/i)?.[1];
+        return {
+          exitCode: result.exitCode,
+          authenticated: result.exitCode === 0,
+          ...(account ? { account } : {}),
+          ...(result.exitCode === 0 ? {} : { error: githubError(result) }),
+        };
+      },
+    });
+    this.register({
+      name: 'github.repo.list',
+      description:
+        'List repositories through gh with an enforced bounded limit; use mode count for an exact small count or rows for structured repository data',
+      permission: 'execute',
+      parameters: {
+        type: 'object',
+        properties: {
+          owner: { type: 'string' },
+          mode: { type: 'string', enum: ['count', 'rows'] },
+          limit: { type: 'integer', minimum: 1, maximum: 1000 },
+        },
+      },
+      input: z.object({
+        owner: z.string().trim().min(1).max(200).optional(),
+        mode: z.enum(['count', 'rows']).default('count'),
+        limit: z.number().int().min(1).max(1_000).default(1_000),
+      }),
+      execute: async (input, context) => {
+        assertNetwork(context);
+        assertSubprocess(context);
+        const value = input as { owner?: string; mode: 'count' | 'rows'; limit: number };
+        const args = ['repo', 'list'];
+        if (value.owner) args.push(value.owner);
+        args.push(
+          '--limit',
+          String(value.limit),
+          '--json',
+          'nameWithOwner,description,isPrivate,isArchived,updatedAt,url',
+        );
+        if (value.mode === 'count') {
+          args.push('--jq', 'length');
+          const result = await runWorkspaceCommand('gh', args, context.root, {
+            timeoutMs: context.timeoutMs,
+            allowedCommands: githubCommands,
+          });
+          const count = Number.parseInt(result.stdout.trim(), 10);
+          return result.exitCode === 0 && Number.isInteger(count)
+            ? { exitCode: result.exitCode, count, limit: value.limit }
+            : { exitCode: result.exitCode, error: githubError(result), limit: value.limit };
+        }
+        const result = await runWorkspaceCommand('gh', args, context.root, {
+          timeoutMs: context.timeoutMs,
+          allowedCommands: githubCommands,
+        });
+        if (result.exitCode !== 0) return { exitCode: result.exitCode, error: githubError(result) };
+        try {
+          const repositories = JSON.parse(result.stdout) as unknown;
+          if (!Array.isArray(repositories))
+            throw new Error('GitHub returned a non-array repository result');
+          return { exitCode: result.exitCode, count: repositories.length, repositories };
+        } catch (error) {
+          return {
+            exitCode: result.exitCode,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+    });
+    if (searchStack && (options.searchEnabled ?? true)) {
       this.register({
         name: 'web.search',
         description: 'Search the web through local SearXNG with DuckDuckGo fallback',
@@ -177,26 +255,10 @@ export class ToolRegistry {
           return searchStack.search(value.query, value.limit);
         },
       });
-      this.register({
-        name: 'web.fetch',
-        description:
-          'Extract a web page through local Crawl4AI, Playwright, and FlareSolverr fallbacks',
-        permission: 'read',
-        parameters: {
-          type: 'object',
-          properties: { url: { type: 'string', format: 'uri' } },
-          required: ['url'],
-        },
-        input: z.object({ url: z.string().url() }),
-        execute: async (input, context) => {
-          assertNetwork(context);
-          return searchStack.fetch((input as { url: string }).url);
-        },
-      });
       if (options.browserEnabled ?? true)
         this.register({
-          name: 'browser.open',
-          description: 'Open a web page with headless Playwright browser automation',
+          name: 'web.fetch',
+          description: 'Extract a web page through guarded Playwright browser automation',
           permission: 'read',
           parameters: {
             type: 'object',
@@ -206,12 +268,56 @@ export class ToolRegistry {
           input: z.object({ url: z.string().url() }),
           execute: async (input, context) => {
             assertNetwork(context);
-            return searchStack.open((input as { url: string }).url);
+            return searchStack.fetch((input as { url: string }).url);
           },
         });
     }
+    if (searchStack && (options.browserEnabled ?? true))
+      this.register({
+        name: 'browser.open',
+        description: 'Open a web page with headless Playwright browser automation',
+        permission: 'read',
+        parameters: {
+          type: 'object',
+          properties: { url: { type: 'string', format: 'uri' } },
+          required: ['url'],
+        },
+        input: z.object({ url: z.string().url() }),
+        execute: async (input, context) => {
+          assertNetwork(context);
+          return searchStack.open((input as { url: string }).url);
+        },
+      });
     if (services.store) {
       const store = services.store;
+      this.register({
+        name: 'run.history',
+        description:
+          'List recent run outcomes for the current conversation thread, including bounded inputs and failure outputs',
+        permission: 'read',
+        parameters: {
+          type: 'object',
+          properties: { limit: { type: 'integer', minimum: 1, maximum: 20 } },
+        },
+        input: z.object({ limit: z.number().int().min(1).max(20).default(5) }),
+        execute: async (input, context) => {
+          if (!context.threadId) throw new Error('Current thread is unavailable');
+          const limit = (input as { limit: number }).limit;
+          return {
+            threadId: context.threadId,
+            runs: store.listRuns(context.threadId, limit).map((run) => ({
+              id: run.id,
+              status: run.status,
+              provider: run.provider,
+              model: run.model,
+              input: run.input.slice(0, 2_000),
+              output: run.output.slice(0, 2_000),
+              createdAt: run.createdAt,
+              updatedAt: run.updatedAt,
+            })),
+          };
+        },
+      });
       this.register({
         name: 'memory.store',
         description:
@@ -278,13 +384,13 @@ export class ToolRegistry {
           } catch (error) {
             return {
               mode: 'lexical',
-              results: lexicalMemorySearch(store.searchMemoryRows(), value.query, value.limit),
+              results: store.searchMemoryLexical(value.query, value.limit),
               warning: `Semantic search unavailable: ${error instanceof Error ? error.message : String(error)}`,
             };
           }
           return {
             mode: 'lexical',
-            results: lexicalMemorySearch(store.searchMemoryRows(), value.query, value.limit),
+            results: store.searchMemoryLexical(value.query, value.limit),
           };
         },
       });
@@ -531,7 +637,12 @@ export class ToolRegistry {
         }),
         execute: async (input, context) => {
           const value = input as { action: string; arguments: Record<string, unknown> };
-          return mcp.executeComputer(value.action, value.arguments, context.permissions);
+          return mcp.executeComputer(
+            value.action,
+            value.arguments,
+            context.permissions,
+            context.signal,
+          );
         },
       });
       this.register({
@@ -550,7 +661,7 @@ export class ToolRegistry {
         }),
         execute: async (input, context) => {
           const value = input as { name: string; arguments: Record<string, unknown> };
-          return mcp.execute(value.name, value.arguments, context.permissions);
+          return mcp.execute(value.name, value.arguments, context.permissions, context.signal);
         },
       });
     }
@@ -604,9 +715,9 @@ export class ToolRegistry {
           required: ['agent', 'prompt'],
         },
         input: z.object({ agent: z.string().trim().min(1), prompt: z.string().trim().min(1) }),
-        execute: async (input) => {
+        execute: async (input, context) => {
           const value = input as { agent: string; prompt: string };
-          return agents.dispatch(value.agent, value.prompt);
+          return agents.dispatch(value.agent, value.prompt, context.signal);
         },
       });
     }
@@ -637,6 +748,9 @@ export class ToolRegistry {
     const tool = this.tools.get(name);
     if (!tool) throw new Error(`Unknown tool: ${name}`);
     assertPermission(context.permissions, tool.permission);
-    return tool.execute(tool.input.parse(input), context);
+    context.signal?.throwIfAborted();
+    const result = await tool.execute(tool.input.parse(input), context);
+    context.signal?.throwIfAborted();
+    return result;
   }
 }

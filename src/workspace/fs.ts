@@ -1,59 +1,63 @@
 import { constants } from 'node:fs';
-import { access, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
-import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { access, chmod, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import { type Change, diffLines } from 'diff';
 import { execa } from 'execa';
 import fg from 'fast-glob';
 
 import { defaultRuntimeConfig, workspaceDirectory } from '../config/index.js';
+import { sanitizedSubprocessEnvironment } from '../security/environment.js';
 
 const SAFE_COMMANDS = new Set([
   'cat',
   'df',
   'echo',
   'free',
-  'hostname',
-  'lscpu',
-  'ls',
-  'lsblk',
-  'lspci',
-  'lsusb',
   'printf',
   'ps',
   'pwd',
   'date',
-  'file',
   'head',
   'stat',
   'tail',
   'uname',
   'wc',
   'which',
-  'node',
-  'npm',
-  'npx',
-  'git',
-  'ollama',
-  'codex',
-  'python',
-  'python3',
   'uptime',
   'whoami',
 ]);
 
 const PROTECTED_WORKSPACE_FILE =
-  /(?:^|\/)(?:config\.json|runtime\.json|daemon\.lock|matrix-since\.txt|secrets(?:\/|$)|(?:[^/]*\.(?:env|key|pem|p12|pfx)|[^/]*(?:pass(?:word)?|token|secret|since)[^/]*|[^/]*\.db(?:-(?:shm|wal))?|[^/]*\.sqlite(?:-(?:shm|wal))?|[^/]*\.lock))$/i;
-const PATH_READING_COMMANDS = new Set(['cat', 'file', 'head', 'stat', 'tail', 'wc']);
-const INLINE_INTERPRETER_FLAGS = new Set(['-c', '--eval', '-e', '--print', '-p']);
+  /(?:^|\/)(?:config\.json|runtime\.json|daemon\.lock|matrix-since\.txt|(?:plugins|skills|secrets)(?:\/.*)?|(?:[^/]*\.(?:env|key|pem|p12|pfx)|[^/]*(?:pass(?:word)?|token|secret|since)[^/]*|[^/]*\.db(?:-(?:shm|wal))?|[^/]*\.sqlite(?:-(?:shm|wal))?|[^/]*\.lock))$/i;
+const PATH_READING_COMMANDS = new Set(['cat', 'date', 'df', 'head', 'stat', 'tail', 'wc']);
+const PROTECTED_PROJECT_BASENAME =
+  /^(?:\.env(?:\.(?!example$|sample$|template$).+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|credentials?(?:\.(?:json|ya?ml|txt|env))?|secrets?(?:\.(?:json|ya?ml|txt|env))?|tokens?(?:\.(?:json|txt|env))?|pass(?:word|wd)?(?:\.(?:json|txt|env))?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?)$/i;
 
 export function isProtectedWorkspaceFile(relativePath: string): boolean {
   return PROTECTED_WORKSPACE_FILE.test(relativePath.replaceAll('\\', '/'));
 }
 
-function assertAgentWorkspaceFile(relativePath: string): void {
-  if (isProtectedWorkspaceFile(relativePath))
-    throw new Error(`Protected workspace file: ${relativePath}`);
+function isProtectedProjectFile(relativePath: string): boolean {
+  const normalized = relativePath.replaceAll('\\', '/').replace(/^\.\//, '');
+  const projectBasename = basename(normalized);
+  return (
+    normalized === '.nuaai' ||
+    normalized.startsWith('.nuaai/') ||
+    normalized === '.git' ||
+    normalized.startsWith('.git/') ||
+    PROTECTED_PROJECT_BASENAME.test(projectBasename) ||
+    /\.(?:key|pem|p12|pfx)$/i.test(projectBasename)
+  );
+}
+
+function assertAgentProjectFile(relativePath: string): void {
+  const normalized = relativePath.replaceAll('\\', '/').replace(/^\.\//, '');
+  if (normalized === '.nuaai' || normalized.startsWith('.nuaai/')) {
+    const runtimeRelative = normalized.slice('.nuaai/'.length) || '.nuaai';
+    throw new Error(`Protected workspace file: ${runtimeRelative}`);
+  }
+  if (isProtectedProjectFile(normalized)) throw new Error(`Protected project file: ${normalized}`);
 }
 
 export function safePath(root: string, target: string): string {
@@ -78,10 +82,45 @@ export async function assertSafeExistingPath(root: string, target: string): Prom
   }
 }
 
+export async function assertSafeProjectFile(root: string, target: string): Promise<string> {
+  const project = await realpath(resolve(root));
+  const path = await assertSafeExistingPath(project, target);
+  const projectRelative = relative(project, path).replaceAll('\\', '/');
+  if (projectRelative) assertAgentProjectFile(projectRelative);
+  try {
+    const stats = await lstat(path);
+    if (stats.isFile() && stats.nlink > 1)
+      throw new Error(`Refusing to access hard-linked file: ${projectRelative || target}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return path;
+}
+
+async function assertSafeWriteParent(root: string, parent: string): Promise<void> {
+  const base = await realpath(root);
+  let current = parent;
+  while (true) {
+    try {
+      const resolved = await realpath(current);
+      if (resolved !== base && !resolved.startsWith(`${base}${sep}`))
+        throw new Error(`Path escapes workspace: ${parent}`);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const next = dirname(current);
+      if (next === current) throw error;
+      current = next;
+    }
+  }
+}
+
 export async function initWorkspace(root = process.cwd()): Promise<string> {
   const directory = workspaceDirectory(root);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
   for (const child of ['sessions', 'skills', 'plugins', 'schedules', 'logs', 'cache', 'secrets'])
-    await mkdir(resolve(directory, child), { recursive: true });
+    await mkdir(resolve(directory, child), { recursive: true, mode: 0o700 });
   const configPath = safePath(directory, 'config.json');
   try {
     await access(configPath, constants.F_OK);
@@ -96,8 +135,8 @@ export async function initWorkspace(root = process.cwd()): Promise<string> {
 }
 
 export async function readWorkspaceFile(root: string, relativePath: string): Promise<string> {
-  assertAgentWorkspaceFile(relativePath);
-  const path = await assertSafeExistingPath(workspaceDirectory(root), relativePath);
+  assertAgentProjectFile(relativePath);
+  const path = await assertSafeProjectFile(root, relativePath);
   const stats = await lstat(path);
   if (!stats.isFile()) throw new Error(`Not a regular file: ${relativePath}`);
   return readFile(path, 'utf8');
@@ -113,8 +152,8 @@ export async function inspectWorkspaceFile(
   mimeType: string;
   textPreview?: string;
 }> {
-  assertAgentWorkspaceFile(relativePath);
-  const path = await assertSafeExistingPath(workspaceDirectory(root), relativePath);
+  assertAgentProjectFile(relativePath);
+  const path = await assertSafeProjectFile(root, relativePath);
   const stats = await lstat(path);
   if (!stats.isFile()) throw new Error(`Not a regular file: ${relativePath}`);
   const extension = extname(relativePath).toLowerCase();
@@ -176,22 +215,43 @@ export async function writeWorkspaceFile(
   relativePath: string,
   content: string,
 ): Promise<void> {
-  assertAgentWorkspaceFile(relativePath);
-  const path = safePath(workspaceDirectory(root), relativePath);
-  await mkdir(dirname(path), { recursive: true });
+  assertAgentProjectFile(relativePath);
+  const workspace = await realpath(resolve(root));
+  const path = safePath(workspace, relativePath);
+  try {
+    const stats = await lstat(path);
+    if (stats.isSymbolicLink())
+      throw new Error(`Refusing to write through symbolic link: ${relativePath}`);
+    if (!stats.isFile()) throw new Error(`Not a regular file: ${relativePath}`);
+    if (stats.nlink > 1) throw new Error(`Refusing to write hard-linked file: ${relativePath}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  await assertSafeWriteParent(workspace, dirname(path));
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await assertSafeExistingPath(workspace, relative(workspace, dirname(path)));
   await writeFile(path, content, { encoding: 'utf8', mode: 0o600 });
+  await chmod(path, 0o600);
 }
 
 export async function listWorkspaceFiles(root: string): Promise<string[]> {
   return (
     await fg('**/*', {
-      cwd: workspaceDirectory(root),
+      cwd: resolve(root),
       dot: true,
       onlyFiles: true,
       followSymbolicLinks: false,
+      ignore: [
+        '.git/**',
+        '.nuaai/**',
+        'node_modules/**',
+        'dist/**',
+        'coverage/**',
+        'test-results/**',
+      ],
     })
   )
-    .filter((file) => !isProtectedWorkspaceFile(file))
+    .filter((file) => !isProtectedProjectFile(file))
     .sort();
 }
 
@@ -215,7 +275,7 @@ export async function runWorkspaceCommand(
   command: string,
   args: string[] = [],
   root = process.cwd(),
-  options: { timeoutMs?: number; allowedCommands?: Set<string> } = {},
+  options: { timeoutMs?: number; allowedCommands?: Set<string>; cancelSignal?: AbortSignal } = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const tokens: string[] = [];
   let token = '';
@@ -251,35 +311,59 @@ export async function runWorkspaceCommand(
   const executable = tokens.shift();
   if (!executable) throw new Error('Command is required');
   const invocationArgs = [...tokens, ...args];
-  if (isAbsolute(executable) && executable !== process.execPath)
-    throw new Error(`Absolute command is not allowlisted: ${executable}`);
+  if (isAbsolute(executable)) throw new Error(`Absolute command is not allowlisted: ${executable}`);
   const name = executable.split(/[\\/]/).pop() ?? executable;
+  if (executable !== name) throw new Error(`Command path is not allowlisted: ${executable}`);
   const allowed = options.allowedCommands ?? SAFE_COMMANDS;
-  if (executable !== process.execPath && !allowed.has(name))
-    throw new Error(`Command is not allowlisted: ${name}`);
-  if (
-    executable !== process.execPath &&
-    (name === 'node' || name === 'python' || name === 'python3') &&
-    invocationArgs.some((argument) => INLINE_INTERPRETER_FLAGS.has(argument))
-  )
-    throw new Error('Inline interpreter execution is not supported; use workspace file tools');
+  if (!allowed.has(name)) throw new Error(`Command is not allowlisted: ${name}`);
+  if (name === 'date' && invocationArgs.some((argument) => /^(?:-s|--set(?:=|$))/.test(argument)))
+    throw new Error('Mutating command options are not supported');
+
   if (PATH_READING_COMMANDS.has(name)) {
-    const workspace = resolve(workspaceDirectory(root));
+    const project = resolve(root);
+    let optionsEnded = false;
     for (const argument of invocationArgs) {
-      if (!argument || argument.startsWith('-')) continue;
-      const candidate = isAbsolute(argument) ? resolve(argument) : resolve(root, argument);
-      if (candidate === workspace || candidate.startsWith(`${workspace}${sep}`)) {
-        const relativePath = relative(workspace, candidate);
-        if (relativePath && isProtectedWorkspaceFile(relativePath))
-          throw new Error(`Protected workspace file: ${relativePath}`);
+      if (argument === '--') {
+        optionsEnded = true;
+        continue;
       }
+      if (
+        !optionsEnded &&
+        (/^--(?:file|files-from|files0-from)(?:=|$)/.test(argument) ||
+          (name === 'date' && /^(?:-r|--reference)/.test(argument)) ||
+          (name === 'date' && /^-f(?:$|.)/.test(argument)))
+      )
+        throw new Error('Indirect file options are not supported');
+      if (!argument || (!optionsEnded && argument.startsWith('-'))) continue;
+      const candidate = isAbsolute(argument) ? resolve(argument) : resolve(root, argument);
+      if (candidate !== project && !candidate.startsWith(`${project}${sep}`))
+        throw new Error(`Path is outside workspace: ${argument}`);
+      await assertSafeProjectFile(project, candidate);
     }
   }
-  const result = await execa(executable, invocationArgs, {
+  let executionArgs = invocationArgs;
+  if (name === 'ps') {
+    const selection =
+      invocationArgs.length === 0
+        ? []
+        : invocationArgs.length === 1 && ['-e', '-A'].includes(invocationArgs[0])
+          ? invocationArgs
+          : invocationArgs.length === 2 &&
+              ['-p', '--pid'].includes(invocationArgs[0]) &&
+              /^\d+(?:,\d+)*$/.test(invocationArgs[1])
+            ? invocationArgs
+            : undefined;
+    if (!selection) throw new Error('Unsupported ps arguments');
+    executionArgs = [...selection, '-o', 'pid=,ppid=,stat=,comm='];
+  }
+  const result = await execa(executable, executionArgs, {
     cwd: resolve(root),
+    env: sanitizedSubprocessEnvironment(),
+    extendEnv: false,
     reject: false,
     timeout: options.timeoutMs ?? 30_000,
     maxBuffer: 1_000_000,
+    cancelSignal: options.cancelSignal,
     shell: false,
     windowsHide: true,
   });

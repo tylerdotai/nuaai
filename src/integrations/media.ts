@@ -4,7 +4,8 @@ import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import { execa } from 'execa';
 
-import { assertSafeExistingPath } from '../workspace/fs.js';
+import { sanitizedSubprocessEnvironment } from '../security/environment.js';
+import { assertSafeProjectFile } from '../workspace/fs.js';
 
 const MAX_TEXT_CHARS = 40_000;
 const MAX_INPUT_BYTES = 100_000_000;
@@ -130,7 +131,7 @@ export class MediaProcessor {
     inputPath: string,
     options: { extractAudio?: boolean; extractFrames?: boolean } = {},
   ): Promise<MediaInspection> {
-    const path = await assertSafeExistingPath(this.root, inputPath);
+    const path = await assertSafeProjectFile(this.root, inputPath);
     const file = await stat(path);
     if (!file.isFile()) throw new Error(`Media input is not a regular file: ${inputPath}`);
     if (file.size > MAX_INPUT_BYTES) throw new Error('Media input exceeds the 100 MB limit');
@@ -204,7 +205,14 @@ export class MediaProcessor {
     const result = await execa(
       this.ffprobePath,
       ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', path],
-      { cwd: this.root, timeout: this.timeoutMs, reject: false, maxBuffer: 1_000_000 },
+      {
+        cwd: this.root,
+        timeout: this.timeoutMs,
+        reject: false,
+        maxBuffer: 1_000_000,
+        env: sanitizedSubprocessEnvironment(),
+        extendEnv: false,
+      },
     );
     if (result.exitCode !== 0)
       throw new Error(result.stderr.trim() || `ffprobe exited ${result.exitCode}`);
@@ -218,6 +226,8 @@ export class MediaProcessor {
       timeout: this.timeoutMs,
       reject: false,
       maxBuffer: 2_000_000,
+      env: sanitizedSubprocessEnvironment(),
+      extendEnv: false,
     });
     if (result.exitCode !== 0)
       throw new Error(result.stderr.trim() || `${command} exited ${result.exitCode}`);
@@ -230,6 +240,8 @@ export class MediaProcessor {
       timeout: this.timeoutMs,
       reject: false,
       maxBuffer: 2_000_000,
+      env: sanitizedSubprocessEnvironment(),
+      extendEnv: false,
     });
     if (result.exitCode !== 0) return '';
     return decodeXml(result.stdout);
@@ -256,7 +268,14 @@ export class MediaProcessor {
         '-y',
         pattern,
       ],
-      { cwd: this.root, timeout: this.timeoutMs, reject: false, maxBuffer: 100_000 },
+      {
+        cwd: this.root,
+        timeout: this.timeoutMs,
+        reject: false,
+        maxBuffer: 100_000,
+        env: sanitizedSubprocessEnvironment(),
+        extendEnv: false,
+      },
     );
     if (result.exitCode !== 0)
       throw new Error(result.stderr.trim() || `ffmpeg exited ${result.exitCode}`);
@@ -293,7 +312,14 @@ export class MediaProcessor {
         '-y',
         outputPath,
       ],
-      { cwd: this.root, timeout: this.timeoutMs, reject: false, maxBuffer: 100_000 },
+      {
+        cwd: this.root,
+        timeout: this.timeoutMs,
+        reject: false,
+        maxBuffer: 100_000,
+        env: sanitizedSubprocessEnvironment(),
+        extendEnv: false,
+      },
     );
     if (result.exitCode !== 0)
       throw new Error(result.stderr.trim() || `ffmpeg exited ${result.exitCode}`);

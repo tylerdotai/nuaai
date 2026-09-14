@@ -121,13 +121,16 @@ function nextRun(type: ScheduleType, expression: string, now: number): number | 
   return nextCronRun(expression, now);
 }
 
+// biome-ignore lint/suspicious/noConfusingVoidType: observation-only callbacks intentionally return void.
+type ScheduleRunResult = void | { status: string; output?: string };
+
 export class Scheduler {
   private timer: NodeJS.Timeout | undefined;
   private readonly running = new Map<string, number>();
   constructor(
     private readonly store: DatabaseStore,
     private readonly onEvent: SchedulerEvent,
-    private readonly onRun: (schedule: Schedule, taskId: string) => Promise<void>,
+    private readonly onRun: (schedule: Schedule, taskId: string) => Promise<ScheduleRunResult>,
     private readonly onCancel?: (taskId: string) => void,
   ) {}
 
@@ -358,7 +361,9 @@ export class Scheduler {
         taskPayload = { ...taskPayload, attempts: attempt };
         this.store.updateTask(task.id, 'running', taskPayload);
         try {
-          await this.onRun(schedule, task.id);
+          const outcome = await this.onRun(schedule, task.id);
+          if (outcome && outcome.status !== 'completed')
+            throw new Error(`Agent run ended with status: ${outcome.status}`);
           const completed = this.store.listTasks().find((entry) => entry.id === task.id);
           if (completed?.status !== 'cancelled') {
             this.store.updateTask(task.id, 'completed', taskPayload);

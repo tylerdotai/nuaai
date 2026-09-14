@@ -7,6 +7,11 @@ export interface TokenPayload {
   [key: string]: unknown;
 }
 
+export type TokenInspection =
+  | { status: 'valid'; payload: TokenPayload }
+  | { status: 'expired'; payload: TokenPayload }
+  | { status: 'invalid' };
+
 function encode(value: string): string {
   return Buffer.from(value, 'utf8').toString('base64url');
 }
@@ -28,19 +33,11 @@ export function createToken(
   return `${body}.${sign(body, secret)}`;
 }
 
-export function validateToken(
-  token: string,
-  secret: string,
-  now = Date.now(),
-): TokenPayload | null {
-  if (!token || !secret) {
-    return null;
-  }
+export function inspectToken(token: string, secret: string, now = Date.now()): TokenInspection {
+  if (!token || !secret) return { status: 'invalid' };
 
   const [body, signature] = token.split('.');
-  if (!body || !signature) {
-    return null;
-  }
+  if (!body || !signature) return { status: 'invalid' };
 
   const expected = sign(body, secret);
   const actualBuffer = Buffer.from(signature);
@@ -48,17 +45,24 @@ export function validateToken(
   if (
     actualBuffer.length !== expectedBuffer.length ||
     !timingSafeEqual(actualBuffer, expectedBuffer)
-  ) {
-    return null;
-  }
+  )
+    return { status: 'invalid' };
 
   try {
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as TokenPayload;
-    if (!payload.sub || !Number.isFinite(payload.exp) || payload.exp <= Math.floor(now / 1000)) {
-      return null;
-    }
-    return payload;
+    if (!payload.sub || !Number.isFinite(payload.exp)) return { status: 'invalid' };
+    if (payload.exp <= Math.floor(now / 1000)) return { status: 'expired', payload };
+    return { status: 'valid', payload };
   } catch {
-    return null;
+    return { status: 'invalid' };
   }
+}
+
+export function validateToken(
+  token: string,
+  secret: string,
+  now = Date.now(),
+): TokenPayload | null {
+  const inspection = inspectToken(token, secret, now);
+  return inspection.status === 'valid' ? inspection.payload : null;
 }

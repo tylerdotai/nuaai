@@ -93,7 +93,7 @@ Use the existing project stack where a real requirement exists:
 - ESM
 - Vercel AI SDK for model-agnostic model streaming where compatible
 - Ollama provider integration
-- OpenAI Codex CLI adapter through a controlled subprocess boundary
+- OpenAI Codex adapter through the installed CLI's OAuth state and a verified Codex-compatible interface
 - `better-sqlite3`
 - `sqlite-vec`
 - `drizzle-orm`

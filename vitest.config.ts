@@ -8,8 +8,9 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary', 'html'],
-      all: true,
       include: ['src/**/*.ts', 'src/**/*.tsx'],
+      // Percentage thresholds cover the configured runtime/core library scope. Process entrypoints,
+      // presentation code, schema declarations, and transport shims use integration/E2E gates.
       exclude: [
         'src/**/*.d.ts',
         'src/cli.tsx',

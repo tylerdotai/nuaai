@@ -1,134 +1,81 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+
+import {
+  isAuthenticationErrorMessage,
+  isRequestAbort,
+  pairingFailureMessage,
+  parseApiResponse,
+  webSocketCloseDisposition,
+} from './auth.js';
+import { AgentComposer } from './components/AgentComposer.js';
+import { MarkdownContent } from './components/MarkdownContent.js';
+import { RunStatusSummary } from './components/RunStatusSummary.js';
+import { type ComposerCommand, draftStorageKey, resolveComposerCommand } from './composer.js';
+import type {
+  ActiveProvider,
+  CommandId,
+  ConnectionState,
+  MemoryRecord,
+  MessageView,
+  PermissionProfile,
+  PluginHealth,
+  PluginRecord,
+  ProviderHealth,
+  Schedule,
+  Session,
+  SkillRecord,
+  Task,
+  Thread,
+  ThreadPresentation,
+  ViewId,
+} from './contracts.js';
+import {
+  connectionLabel,
+  displayModel,
+  newConversationTitle,
+  providerUnavailableNotice,
+  relativeTime,
+  runLabel,
+} from './format.js';
+import { groupSessionsForRail } from './navigation.js';
+import {
+  isNearScrollBottom,
+  preserveScrollAnchor,
+  shouldFollowNewOutput,
+  shouldShowNewResponseButton,
+} from './scroll.js';
+import {
+  type ActiveRunsByThread,
+  type QueuedRunsByThread,
+  type SelectionIdentity,
+  type SelectionLoad,
+  SelectionLoadCoordinator,
+  type ThreadRunState,
+  type WebEventRecord,
+  activeRunForThread,
+  projectRunEvents,
+  reduceActiveRunsByThread,
+  reduceQueuedRunsByThread,
+  selectionIdentityMatches,
+  selectionSnapshotCanCommit,
+} from './state.js';
+import {
+  AutomationsView,
+  CommandPalette,
+  ErrorToast,
+  MemoryView,
+  NavigationTabs,
+  SystemView,
+} from './views.js';
 import './styles.css';
-
-interface Session {
-  id: string;
-  title: string;
-  status: string;
-}
-interface Thread {
-  id: string;
-  title: string;
-}
-interface Message {
-  role: string;
-  content: string;
-  createdAt: number;
-}
-interface EventRecord {
-  id?: number;
-  type: string;
-  payload: Record<string, unknown>;
-  createdAt: number;
-}
-interface Schedule {
-  id: string;
-  name: string;
-  type: string;
-  expression: string;
-  agentInput: string;
-  enabled: boolean;
-  nextRunAt: number | null;
-  policy: {
-    missedRun: string;
-    maxAttempts: number;
-    retryDelayMs: number;
-    concurrencyLimit: number;
-  };
-}
-interface Task {
-  id: string;
-  kind: string;
-  status: string;
-  scheduleId: string | null;
-  payload: Record<string, unknown>;
-  updatedAt: number;
-}
-interface MemoryRecord {
-  id: string;
-  content: string;
-  createdAt: number;
-  hasEmbedding: boolean;
-}
-interface SkillRecord {
-  name: string;
-  description: string;
-  version: string;
-  source: string;
-}
-interface PluginRecord {
-  name: string;
-  version: string;
-  apiVersion: string;
-  capabilities: string[];
-  trusted: boolean;
-}
-interface PluginHealth {
-  name: string;
-  loaded: boolean;
-  enabled: boolean;
-  capabilities: string[];
-}
-
-type AgentCommandId =
-  | 'new-session'
-  | 'status'
-  | 'sessions'
-  | 'refresh'
-  | 'focus-composer'
-  | 'cancel-run';
-
-interface AgentCommand {
-  id: AgentCommandId;
-  label: string;
-  description: string;
-  shortcut?: string;
-}
-
-const AGENT_COMMANDS: AgentCommand[] = [
-  {
-    id: 'new-session',
-    label: 'New session',
-    description: 'Create and switch to a fresh durable session.',
-    shortcut: 'N',
-  },
-  {
-    id: 'status',
-    label: 'Show status',
-    description: 'Check daemon, provider, and active session state.',
-    shortcut: 'S',
-  },
-  {
-    id: 'sessions',
-    label: 'Browse sessions',
-    description: 'Open the session list and keep the current thread visible.',
-    shortcut: 'L',
-  },
-  {
-    id: 'refresh',
-    label: 'Refresh runtime',
-    description: 'Reload sessions, events, providers, memory, and schedules.',
-    shortcut: 'R',
-  },
-  {
-    id: 'focus-composer',
-    label: 'Ask NUAAI',
-    description: 'Jump straight to the agent composer.',
-    shortcut: 'A',
-  },
-  {
-    id: 'cancel-run',
-    label: 'Cancel active run',
-    description: 'Stop the currently running agent task.',
-    shortcut: 'Esc',
-  },
-];
 
 const APP_BASE_PATH =
   window.location.pathname === '/nuaai' || window.location.pathname.startsWith('/nuaai/')
     ? '/nuaai/'
     : '/';
+
+const terminalRunStates = new Set(['completed', 'failed', 'cancelled']);
 
 function appPath(path: string): string {
   return `${APP_BASE_PATH}${path.replace(/^\//, '')}`;
@@ -139,669 +86,1551 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...options,
     headers: { 'content-type': 'application/json', ...options.headers },
   });
-  const body = (await response.json()) as T & { error?: string };
-  if (!response.ok) throw new Error(body.error ?? `Request failed: ${response.status}`);
-  return body;
+  return parseApiResponse<T>(response);
 }
 
 function App(): React.JSX.Element {
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [selected, setSelected] = useState<Session | null>(null);
-  const [thread, setThread] = useState<Thread | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [events, setEvents] = useState<EventRecord[]>([]);
-  const [input, setInput] = useState('');
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
-  const [status, setStatus] = useState('Connecting');
-  const [error, setError] = useState<string | null>(null);
-  const [providers, setProviders] = useState<
-    Array<{ name: string; available: boolean; detail: string; models?: string[] }>
-  >([]);
-  const [activeProvider, setActiveProvider] = useState<{ name: string; model: string } | null>(
-    null,
-  );
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<MessageView[]>([]);
+  const [events, setEvents] = useState<WebEventRecord[]>([]);
+  const [providers, setProviders] = useState<ProviderHealth[]>([]);
+  const [activeProvider, setActiveProvider] = useState<ActiveProvider | null>(null);
+  const [webPermissionProfile, setWebPermissionProfile] = useState<PermissionProfile>('read-only');
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [scheduleName, setScheduleName] = useState('');
-  const [scheduleInput, setScheduleInput] = useState('');
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [plugins, setPlugins] = useState<PluginRecord[]>([]);
   const [pluginHealth, setPluginHealth] = useState<PluginHealth[]>([]);
-  const [view, setView] = useState<'conversation' | 'memory' | 'skills' | 'plugins' | 'schedules'>(
-    'conversation',
-  );
-  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [view, setView] = useState<ViewId>('conversation');
+  const [connection, setConnection] = useState<ConnectionState>('connecting');
+  const [input, setInput] = useState('');
+  const [activeRunsByThread, setActiveRunsByThread] = useState<ActiveRunsByThread>({});
+  const [queuedRunsByThread, setQueuedRunsByThread] = useState<QueuedRunsByThread>({});
+  const [queuedPromptsByRun, setQueuedPromptsByRun] = useState<Record<string, string>>({});
+  const [eventSubscription, setEventSubscription] = useState<{
+    sessionId: string;
+    after: number;
+    generation: number;
+  } | null>(null);
+  const [scheduleName, setScheduleName] = useState('');
+  const [scheduleInput, setScheduleInput] = useState('');
+  const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const composerRef = useRef<HTMLTextAreaElement>(null);
-  const loadRequest = useRef(0);
+  const [showNewResponse, setShowNewResponse] = useState(false);
+  const [historyCursor, setHistoryCursor] = useState<number | null>(null);
+  const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
+  const [loadingEarlierMessages, setLoadingEarlierMessages] = useState(false);
+  const [composerExpanded, setComposerExpanded] = useState(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
+  const [sessionSearch, setSessionSearch] = useState('');
 
-  const load = useCallback(
-    async (preferredSessionId?: string): Promise<void> => {
-      const requestId = ++loadRequest.current;
-      const isCurrent = (): boolean => requestId === loadRequest.current;
+  const selectedSessionRef = useRef<string | null>(null);
+  const selectedThreadRef = useRef<string | null>(null);
+  const lastEventId = useRef(0);
+  const selectionLoads = useRef(new SelectionLoadCoordinator());
+  const backgroundLoads = useRef(new SelectionLoadCoordinator());
+  const snapshotEpoch = useRef(0);
+  const snapshotEpochByLoad = useRef(new WeakMap<SelectionLoad, number>());
+  const pollGeneration = useRef(0);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const sessionRailRef = useRef<HTMLElement>(null);
+  const followFrameRef = useRef<number | null>(null);
+  const historyFrameRef = useRef<number | null>(null);
+  const nearBottomRef = useRef(true);
+  const forceFollowRef = useRef(true);
+  const draftHydrationRef = useRef<{ threadId: string; value: string } | null>(null);
+  const paletteFirstActionRef = useRef<HTMLButtonElement>(null);
+  const activeRunId = activeRunForThread(activeRunsByThread, selectedThreadId);
+  const authenticationError = isAuthenticationErrorMessage(error);
+
+  const reportBackgroundFailure = useCallback((cause: unknown): void => {
+    if (isRequestAbort(cause)) return;
+    setError(cause instanceof Error ? cause.message : String(cause));
+  }, []);
+
+  const registerSnapshotLoad = useCallback((load: SelectionLoad): SelectionLoad => {
+    const epoch = snapshotEpoch.current + 1;
+    snapshotEpoch.current = epoch;
+    snapshotEpochByLoad.current.set(load, epoch);
+    return load;
+  }, []);
+
+  const snapshotCanCommit = useCallback(
+    (
+      coordinator: SelectionLoadCoordinator,
+      load: SelectionLoad,
+      expected: SelectionIdentity,
+      current: SelectionIdentity,
+    ): boolean => {
+      const loadEpoch = snapshotEpochByLoad.current.get(load);
+      return (
+        loadEpoch !== undefined &&
+        selectionSnapshotCanCommit(
+          coordinator,
+          load,
+          expected,
+          current,
+          loadEpoch,
+          snapshotEpoch.current,
+        )
+      );
+    },
+    [],
+  );
+
+  const snapshotLoadIsCurrent = useCallback(
+    (coordinator: SelectionLoadCoordinator, load: SelectionLoad): boolean => {
+      const loadEpoch = snapshotEpochByLoad.current.get(load);
+      return (
+        loadEpoch !== undefined &&
+        loadEpoch === snapshotEpoch.current &&
+        coordinator.isCurrent(load)
+      );
+    },
+    [],
+  );
+
+  const beginForegroundLoad = useCallback(
+    (selection: SelectionIdentity): SelectionLoad => {
+      backgroundLoads.current.cancel();
+      if (historyFrameRef.current !== null) {
+        window.cancelAnimationFrame(historyFrameRef.current);
+        historyFrameRef.current = null;
+      }
+      return registerSnapshotLoad(selectionLoads.current.begin(selection));
+    },
+    [registerSnapshotLoad],
+  );
+
+  const beginBackgroundLoad = useCallback(
+    (selection: SelectionIdentity): SelectionLoad =>
+      registerSnapshotLoad(backgroundLoads.current.begin(selection)),
+    [registerSnapshotLoad],
+  );
+
+  const clearThreadView = useCallback((): void => {
+    setMessages([]);
+    setEvents([]);
+    setHistoryCursor(null);
+    setHasEarlierMessages(false);
+    setLoadingEarlierMessages(false);
+    setEventSubscription(null);
+    setShowNewResponse(false);
+    setNotice(null);
+    lastEventId.current = 0;
+  }, []);
+
+  const followNextOutput = (): void => {
+    forceFollowRef.current = true;
+    nearBottomRef.current = true;
+    setShowNewResponse(false);
+  };
+
+  const scrollToLatest = (): void => {
+    const scroller = messagesRef.current;
+    if (!scroller) return;
+    scroller.scrollTop = scroller.scrollHeight;
+    forceFollowRef.current = false;
+    nearBottomRef.current = true;
+    setShowNewResponse(false);
+  };
+
+  useEffect(() => {
+    selectedSessionRef.current = selectedSessionId;
+  }, [selectedSessionId]);
+  useEffect(() => {
+    selectedThreadRef.current = selectedThreadId;
+  }, [selectedThreadId]);
+  useEffect(
+    () => () => {
+      selectionLoads.current.cancel();
+      backgroundLoads.current.cancel();
+      if (historyFrameRef.current !== null) window.cancelAnimationFrame(historyFrameRef.current);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!sessionDrawerOpen) return;
+    const rail = sessionRailRef.current;
+    const previousFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusFrame = window.requestAnimationFrame(() => {
+      rail?.querySelector<HTMLElement>('button, input, [tabindex="0"]')?.focus();
+    });
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return;
+      setSessionDrawerOpen(false);
+    };
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener('keydown', closeOnEscape);
+      previousFocus?.focus();
+    };
+  }, [sessionDrawerOpen]);
+
+  useEffect(() => {
+    const key = draftStorageKey(selectedThreadId);
+    if (!key || !selectedThreadId) {
+      setInput('');
+      return;
+    }
+    try {
+      const value = window.localStorage.getItem(key) ?? '';
+      draftHydrationRef.current = { threadId: selectedThreadId, value };
+      setInput(value);
+    } catch (cause) {
+      setInput('');
+      setError(
+        `Draft storage is unavailable: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  }, [selectedThreadId]);
+
+  useEffect(() => {
+    const key = draftStorageKey(selectedThreadId);
+    if (!key || !selectedThreadId) return;
+    const hydration = draftHydrationRef.current;
+    if (hydration?.threadId === selectedThreadId) {
+      if (input !== hydration.value) return;
+      draftHydrationRef.current = null;
+    }
+    try {
+      if (input) window.localStorage.setItem(key, input);
+      else window.localStorage.removeItem(key);
+    } catch (cause) {
+      setError(
+        `Draft could not be saved: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  }, [input, selectedThreadId]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 3_000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+  useEffect(() => {
+    if (commandPaletteOpen) paletteFirstActionRef.current?.focus();
+  }, [commandPaletteOpen]);
+
+  const loadSystem = useCallback(async (signal?: AbortSignal): Promise<void> => {
+    const [providerResult, scheduleResult, taskResult, memoryResult, skillResult, pluginResult] =
+      await Promise.all([
+        request<{
+          active: ActiveProvider;
+          providers: ProviderHealth[];
+          webPermissionProfile?: PermissionProfile;
+        }>('/api/providers', { signal }),
+        request<{ schedules: Schedule[] }>('/api/schedules', { signal }),
+        request<{ tasks: Task[] }>('/api/tasks', { signal }),
+        request<{ memories: MemoryRecord[] }>('/api/memory', { signal }),
+        request<{ skills: SkillRecord[] }>('/api/skills', { signal }),
+        request<{ plugins: PluginRecord[]; health: PluginHealth[] }>('/api/plugins', { signal }),
+      ]);
+    setWebPermissionProfile(providerResult.webPermissionProfile ?? 'read-only');
+    setProviders(providerResult.providers);
+    setActiveProvider(providerResult.active);
+    setSchedules(scheduleResult.schedules);
+    setTasks(taskResult.tasks);
+    setMemories(memoryResult.memories);
+    setSkills(skillResult.skills);
+    setPlugins(pluginResult.plugins);
+    setPluginHealth(pluginResult.health);
+  }, []);
+
+  const loadThread = useCallback(
+    async (
+      threadId: string,
+      load: SelectionLoad,
+      coordinator = selectionLoads.current,
+      expectedSelection: SelectionIdentity = {
+        sessionId: selectedSessionRef.current,
+        threadId,
+      },
+    ): Promise<ThreadRunState | null> => {
+      const [presentation, runState] = await Promise.all([
+        request<ThreadPresentation>(`/api/threads/${encodeURIComponent(threadId)}/presentation`, {
+          signal: load.signal,
+        }),
+        request<ThreadRunState>(`/api/threads/${encodeURIComponent(threadId)}/run-state`, {
+          signal: load.signal,
+        }),
+      ]);
+      if (
+        !snapshotCanCommit(coordinator, load, expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        return null;
+      setMessages(presentation.messages);
+      setHistoryCursor(presentation.nextCursor);
+      setHasEarlierMessages(presentation.hasMore);
+      setLoadingEarlierMessages(false);
+      setEvents(runState.events);
+      setActiveRunsByThread((current) => ({
+        ...current,
+        [threadId]: runState.activeRunId,
+      }));
+      setQueuedRunsByThread((current) => ({
+        ...current,
+        [threadId]: runState.queuedRunIds,
+      }));
+      setQueuedPromptsByRun((current) => ({
+        ...current,
+        ...Object.fromEntries(runState.queuedRuns.map((run) => [run.id, run.input])),
+      }));
+      lastEventId.current = runState.lastEventId;
+      return runState;
+    },
+    [snapshotCanCommit],
+  );
+
+  const loadSession = useCallback(
+    async (
+      sessionId: string,
+      load: SelectionLoad,
+      preferredThreadId?: string | null,
+    ): Promise<boolean> => {
+      const detail = await request<{ threads: Thread[] }>(
+        `/api/sessions/${encodeURIComponent(sessionId)}`,
+        { signal: load.signal },
+      );
+      if (
+        !snapshotLoadIsCurrent(selectionLoads.current, load) ||
+        selectedSessionRef.current !== sessionId
+      )
+        return false;
+      setThreads(detail.threads);
+      const currentThreadId =
+        preferredThreadId === undefined ? selectedThreadRef.current : preferredThreadId;
+      const nextThread =
+        detail.threads.find((thread) => thread.id === currentThreadId) ?? detail.threads[0] ?? null;
+      if (!nextThread || nextThread.id !== selectedThreadRef.current) clearThreadView();
+      setSelectedThreadId(nextThread?.id ?? null);
+      selectedThreadRef.current = nextThread?.id ?? null;
+      if (!nextThread) return true;
+
+      const runState = await loadThread(nextThread.id, load);
+      if (
+        !runState ||
+        !snapshotCanCommit(
+          selectionLoads.current,
+          load,
+          { sessionId, threadId: nextThread.id },
+          {
+            sessionId: selectedSessionRef.current,
+            threadId: selectedThreadRef.current,
+          },
+        )
+      )
+        return false;
+      setEventSubscription({
+        sessionId,
+        after: runState.lastEventId,
+        generation: load.generation,
+      });
+      return true;
+    },
+    [clearThreadView, loadThread, snapshotCanCommit, snapshotLoadIsCurrent],
+  );
+
+  const refresh = useCallback(
+    async (preferredSessionId?: string | null): Promise<boolean> => {
+      const load = beginForegroundLoad({
+        sessionId: preferredSessionId ?? selectedSessionRef.current,
+        threadId: selectedThreadRef.current,
+      });
       try {
-        const result = await request<{ sessions: Session[] }>('/api/sessions');
-        if (!isCurrent()) return;
-        setSessions(result.sessions);
-        const preferred = preferredSessionId
-          ? result.sessions.find((session) => session.id === preferredSessionId)
-          : null;
-        const active =
-          preferred ??
-          (selected && result.sessions.find((session) => session.id === selected.id)
-            ? selected
-            : (result.sessions[0] ?? null));
-        if (active) {
-          setSelected(active);
-          const detail = await request<{ threads: Thread[] }>(`/api/sessions/${active.id}`);
-          if (!isCurrent()) return;
-          const nextThread = detail.threads[0] ?? null;
-          setThread(nextThread);
-          if (nextThread) {
-            const messageResult = await request<{ messages: Message[] }>(
-              `/api/threads/${nextThread.id}/messages`,
-            );
-            if (!isCurrent()) return;
-            setMessages(messageResult.messages);
-          }
-          const eventResult = await request<{ events: EventRecord[] }>(
-            `/api/events?after=0&sessionId=${encodeURIComponent(active.id)}`,
-          );
-          if (!isCurrent()) return;
-          setEvents(eventResult.events.slice(-100));
-        } else {
-          setEvents([]);
+        const sessionResult = await request<{ sessions: Session[] }>('/api/sessions', {
+          signal: load.signal,
+        });
+        if (!snapshotLoadIsCurrent(selectionLoads.current, load)) return false;
+        setSessions(sessionResult.sessions);
+        const requestedId = preferredSessionId ?? selectedSessionRef.current;
+        const nextSession =
+          sessionResult.sessions.find((session) => session.id === requestedId) ??
+          sessionResult.sessions[0] ??
+          null;
+        if (!nextSession || nextSession.id !== selectedSessionRef.current) {
+          setThreads([]);
+          setSelectedThreadId(null);
+          selectedThreadRef.current = null;
+          clearThreadView();
         }
-        const [
-          providerResult,
-          scheduleResult,
-          taskResult,
-          memoryResult,
-          skillResult,
-          pluginResult,
-        ] = await Promise.all([
-          request<{
-            active: { name: string; model: string };
-            providers: Array<{
-              name: string;
-              available: boolean;
-              detail: string;
-              models?: string[];
-            }>;
-          }>('/api/providers'),
-          request<{ schedules: Schedule[] }>('/api/schedules'),
-          request<{ tasks: Task[] }>('/api/tasks'),
-          request<{ memories: MemoryRecord[] }>('/api/memory'),
-          request<{ skills: SkillRecord[] }>('/api/skills'),
-          request<{ plugins: PluginRecord[]; health: PluginHealth[] }>('/api/plugins'),
+        setSelectedSessionId(nextSession?.id ?? null);
+        selectedSessionRef.current = nextSession?.id ?? null;
+        const [sessionLoaded] = await Promise.all([
+          nextSession ? loadSession(nextSession.id, load) : Promise.resolve(true),
+          loadSystem(load.signal),
         ]);
-        if (!isCurrent()) return;
-        setProviders(providerResult.providers);
-        setActiveProvider(providerResult.active);
-        setSchedules(scheduleResult.schedules);
-        setTasks(taskResult.tasks);
-        setMemories(memoryResult.memories);
-        setSkills(skillResult.skills);
-        setPlugins(pluginResult.plugins);
-        setPluginHealth(pluginResult.health);
-        setStatus('Connected');
+        if (!nextSession) {
+          setThreads([]);
+          setSelectedThreadId(null);
+          selectedThreadRef.current = null;
+          clearThreadView();
+        }
+        if (!snapshotLoadIsCurrent(selectionLoads.current, load) || !sessionLoaded) return false;
+        setConnection('connected');
+        setError(null);
+        return true;
       } catch (cause) {
-        if (!isCurrent()) return;
-        setStatus('Daemon unavailable');
+        if (!snapshotLoadIsCurrent(selectionLoads.current, load)) return false;
+        setConnection('offline');
         setError(cause instanceof Error ? cause.message : String(cause));
+        return false;
       }
     },
-    [selected],
+    [beginForegroundLoad, clearThreadView, loadSession, loadSystem, snapshotLoadIsCurrent],
   );
+
   useEffect(() => {
-    void load();
-    const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-    const socket = new WebSocket(`${protocol}://${location.host}${appPath('/ws')}`);
-    socket.onopen = () => {
-      setEvents([]);
-      socket.send(JSON.stringify({ type: 'subscribe', sessionId: selected?.id, after: 0 }));
-      setStatus('Connected');
+    const pairingToken = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('token');
+    if (!pairingToken) {
+      void refresh();
+      return;
+    }
+    window.history.replaceState(
+      null,
+      document.title,
+      `${window.location.pathname}${window.location.search}`,
+    );
+    void request('/auth/pair', {
+      method: 'POST',
+      body: JSON.stringify({ token: pairingToken }),
+    })
+      .then(() => refresh())
+      .catch((cause: unknown) => {
+        setConnection('offline');
+        setError(pairingFailureMessage(cause));
+      });
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!eventSubscription) return;
+    const subscribedSessionId = eventSubscription.sessionId;
+    let stopped = false;
+    let socket: WebSocket | undefined;
+    let reconnectTimer: number | undefined;
+    let eventFrame: number | undefined;
+    const pendingEvents: WebEventRecord[] = [];
+    let retry = 0;
+    lastEventId.current = eventSubscription.after;
+
+    const flushEvents = (): void => {
+      eventFrame = undefined;
+      const batch = pendingEvents.splice(0);
+      if (!batch.length) return;
+      setActiveRunsByThread((current) => batch.reduce(reduceActiveRunsByThread, current));
+      setQueuedRunsByThread((current) => batch.reduce(reduceQueuedRunsByThread, current));
+      setQueuedPromptsByRun((current) => {
+        const next = { ...current };
+        for (const event of batch) {
+          if (
+            event.runId &&
+            event.type === 'run.created' &&
+            typeof event.payload.input === 'string'
+          )
+            next[event.runId] = event.payload.input;
+          if (
+            event.runId &&
+            (event.type === 'run.started' || terminalRunStates.has(event.type.replace('run.', '')))
+          )
+            delete next[event.runId];
+        }
+        return next;
+      });
+      setEvents((current) => {
+        const next = [...current];
+        const seen = new Set(current.flatMap((event) => (event.id ? [event.id] : [])));
+        for (const event of batch) {
+          if (event.threadId && event.threadId !== selectedThreadRef.current) continue;
+          if (event.id && seen.has(event.id)) continue;
+          if (event.id) seen.add(event.id);
+          next.push(event);
+        }
+        return next.slice(-500);
+      });
     };
-    socket.onmessage = (message) => {
-      const value = JSON.parse(String(message.data)) as { type: string; event?: EventRecord };
-      if (value.type === 'event' && value.event) {
-        setEvents((current) => [...current.slice(-99), value.event as EventRecord]);
-        if (['run.completed', 'run.failed', 'run.cancelled'].includes(value.event.type))
-          void load();
+
+    const scheduleEvent = (event: WebEventRecord): void => {
+      pendingEvents.push(event);
+      eventFrame ??= window.requestAnimationFrame(flushEvents);
+    };
+
+    const subscribe = (after: number): void => {
+      socket?.send(
+        JSON.stringify({
+          type: 'subscribe',
+          sessionId: subscribedSessionId,
+          after,
+          limit: 250,
+        }),
+      );
+    };
+
+    const connect = (): void => {
+      if (stopped) return;
+      const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+      socket = new WebSocket(`${protocol}://${location.host}${appPath('/ws')}`);
+      socket.onopen = () => {
+        retry = 0;
+        setConnection('connected');
+        subscribe(lastEventId.current);
+      };
+      socket.onmessage = (message) => {
+        try {
+          const value = JSON.parse(String(message.data)) as {
+            type: string;
+            event?: WebEventRecord;
+            nextCursor?: number;
+            hasMore?: boolean;
+          };
+          if (value.type === 'replay.complete') {
+            const nextCursor = Math.max(lastEventId.current, value.nextCursor ?? 0);
+            lastEventId.current = nextCursor;
+            if (value.hasMore) subscribe(nextCursor);
+            return;
+          }
+          if (value.type !== 'event' || !value.event) return;
+          const nextEvent = value.event;
+          if (nextEvent.sessionId && nextEvent.sessionId !== subscribedSessionId) return;
+          lastEventId.current = Math.max(lastEventId.current, nextEvent.id ?? 0);
+          scheduleEvent(nextEvent);
+          if (
+            terminalRunStates.has(nextEvent.type.replace('run.', '')) &&
+            nextEvent.threadId === selectedThreadRef.current
+          ) {
+            const sessionId = selectedSessionRef.current;
+            const threadId = selectedThreadRef.current;
+            if (sessionId && threadId) {
+              const expectedSelection = { sessionId, threadId };
+              const load = beginBackgroundLoad(expectedSelection);
+              void loadThread(threadId, load, backgroundLoads.current, expectedSelection).catch(
+                reportBackgroundFailure,
+              );
+            }
+            if (sessionId) void loadSystem().catch(reportBackgroundFailure);
+          }
+        } catch {
+          setError('NUAAI received an invalid live event. Refresh the runtime state.');
+        }
+      };
+      socket.onerror = () => socket?.close();
+      socket.onclose = (event) => {
+        if (stopped) return;
+        const disposition = webSocketCloseDisposition(event.code, event.reason);
+        if (!disposition.reconnect) {
+          stopped = true;
+          setConnection('offline');
+          setError(disposition.message ?? 'Pair this device to continue.');
+          return;
+        }
+        retry += 1;
+        setConnection(retry >= 6 ? 'offline' : 'reconnecting');
+        reconnectTimer = window.setTimeout(connect, Math.min(1_000 * 2 ** (retry - 1), 10_000));
+      };
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (eventFrame) window.cancelAnimationFrame(eventFrame);
+      socket?.close();
+    };
+  }, [beginBackgroundLoad, eventSubscription, loadSystem, loadThread, reportBackgroundFailure]);
+
+  useEffect(() => {
+    if (!activeRunId || !selectedThreadId) return;
+    const runId = activeRunId;
+    const threadId = selectedThreadId;
+    const sessionId = selectedSessionRef.current;
+    if (!sessionId) return;
+    const generation = pollGeneration.current + 1;
+    pollGeneration.current = generation;
+    const controller = new AbortController();
+    const ownsPoll = (): boolean =>
+      pollGeneration.current === generation &&
+      selectedSessionRef.current === sessionId &&
+      selectedThreadRef.current === threadId;
+    const timer = window.setInterval(() => {
+      void request<{ status: string }>(`/api/runs/${encodeURIComponent(runId)}`, {
+        signal: controller.signal,
+      })
+        .then((run) => {
+          if (!ownsPoll() || !terminalRunStates.has(run.status)) return;
+          setActiveRunsByThread((current) =>
+            current[threadId] === runId ? { ...current, [threadId]: null } : current,
+          );
+          const expectedSelection = { sessionId, threadId };
+          const load = beginBackgroundLoad(expectedSelection);
+          void loadThread(threadId, load, backgroundLoads.current, expectedSelection).catch(
+            reportBackgroundFailure,
+          );
+          void loadSystem().catch(reportBackgroundFailure);
+        })
+        .catch((cause: unknown) => {
+          if (!ownsPoll() || isRequestAbort(cause)) return;
+          setError(cause instanceof Error ? cause.message : String(cause));
+        });
+    }, 2_000);
+    return () => {
+      pollGeneration.current += 1;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [
+    activeRunId,
+    beginBackgroundLoad,
+    loadSystem,
+    loadThread,
+    reportBackgroundFailure,
+    selectedThreadId,
+  ]);
+
+  const scrollRevision = `${messages.at(-1)?.id ?? ''}:${events.at(-1)?.id ?? ''}`;
+  useEffect(() => {
+    if (!scrollRevision) return;
+    if (
+      !shouldFollowNewOutput({
+        nearBottom: nearBottomRef.current,
+        forceFollow: forceFollowRef.current,
+      })
+    ) {
+      setShowNewResponse(true);
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      followFrameRef.current = null;
+      if (
+        !shouldFollowNewOutput({
+          nearBottom: nearBottomRef.current,
+          forceFollow: forceFollowRef.current,
+        })
+      ) {
+        setShowNewResponse(true);
+        return;
       }
+      const scroller = messagesRef.current;
+      if (!scroller) return;
+      scroller.scrollTop = scroller.scrollHeight;
+      nearBottomRef.current = true;
+      forceFollowRef.current = false;
+      setShowNewResponse(false);
+    });
+    followFrameRef.current = frame;
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (followFrameRef.current === frame) followFrameRef.current = null;
     };
-    socket.onerror = () => setStatus('WebSocket unavailable');
-    return () => socket.close();
-  }, [load, selected?.id]);
+  }, [scrollRevision]);
+
   useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent): void => {
+    const onKeyDown = (event: KeyboardEvent): void => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
         setCommandPaletteOpen(true);
+      } else if (event.key === 'Escape') {
+        setCommandPaletteOpen(false);
+        setSessionDrawerOpen(false);
       }
-      if (event.key === 'Escape') setCommandPaletteOpen(false);
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
-  const liveOutput = useMemo(
-    () =>
-      events
-        .filter((event) => event.type === 'model.delta')
-        .map((event) => String(event.payload.text ?? ''))
-        .join(''),
-    [events],
+
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
+  const selectedThread = threads.find((thread) => thread.id === selectedThreadId) ?? null;
+  const sessionGroups = useMemo(
+    () => groupSessionsForRail(sessions, sessionSearch),
+    [sessionSearch, sessions],
   );
-  const createSession = async (): Promise<Session> => {
-    const created = await request<{ session: Session }>('/api/sessions', {
-      method: 'POST',
-      body: JSON.stringify({ title: `Session ${sessions.length + 1}` }),
-    });
-    setSelected(created.session);
-    await load(created.session.id);
-    return created.session;
-  };
-  const send = async (): Promise<void> => {
-    if (!input.trim() || !thread) return;
-    const value = input.trim();
-    setInput('');
+  const queuedItems = useMemo(
+    () =>
+      (selectedThreadId ? (queuedRunsByThread[selectedThreadId] ?? []) : [])
+        .map((runId) => ({ id: runId, prompt: queuedPromptsByRun[runId] }))
+        .filter((item): item is { id: string; prompt: string } => Boolean(item.prompt)),
+    [queuedPromptsByRun, queuedRunsByThread, selectedThreadId],
+  );
+  const threadEvents = useMemo(
+    () =>
+      events.filter(
+        (event) => !event.threadId || !selectedThreadId || event.threadId === selectedThreadId,
+      ),
+    [events, selectedThreadId],
+  );
+  const runProjection = useMemo(
+    () => projectRunEvents(threadEvents, activeRunId),
+    [activeRunId, threadEvents],
+  );
+  const transcript = useMemo(
+    () =>
+      messages.filter(
+        (message) =>
+          ['user', 'assistant'].includes(message.role) &&
+          message.markdown.trim() &&
+          !(message.role === 'assistant' && message.runId === activeRunId),
+      ),
+    [activeRunId, messages],
+  );
+  const liveMessage = useMemo<MessageView | null>(() => {
+    if (!runProjection || terminalRunStates.has(runProjection.status)) return null;
+    const startedAt =
+      threadEvents.find(
+        (event) => event.runId === runProjection.runId && event.type === 'run.started',
+      )?.createdAt ?? Date.now();
+    return {
+      id: `run:${runProjection.runId}:assistant`,
+      runId: runProjection.runId,
+      role: 'assistant',
+      markdown: runProjection.liveOutput,
+      createdAt: startedAt,
+      ...(activeProvider ? { provider: activeProvider } : {}),
+      status: 'streaming',
+      activities: [
+        {
+          runId: runProjection.runId,
+          status: 'streaming',
+          startedAt,
+          items: runProjection.tools.map((tool) => ({
+            id: tool.id,
+            name: tool.name,
+            status: tool.status,
+            startedAt: tool.createdAt,
+          })),
+        },
+      ],
+      citations: [],
+      attachments: [],
+      artifacts: [],
+    };
+  }, [activeProvider, runProjection, threadEvents]);
+
+  const createSession = async (): Promise<void> => {
+    followNextOutput();
     setError(null);
-    const started = await request<{ id: string }>('/api/runs', {
-      method: 'POST',
-      body: JSON.stringify({ threadId: thread.id, input: value }),
-    });
-    setActiveRunId(started.id);
+    const expectedSelection = {
+      sessionId: selectedSessionRef.current,
+      threadId: selectedThreadRef.current,
+    };
     try {
-      for (let attempt = 0; attempt < 60; attempt += 1) {
-        const run = await request<{ status: string }>(`/api/runs/${started.id}`);
-        if (['completed', 'failed', 'cancelled'].includes(run.status)) break;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    } finally {
-      setActiveRunId(null);
+      const created = await request<{ session: Session }>('/api/sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: newConversationTitle(),
+          sourceKey: `web:${crypto.randomUUID()}`,
+        }),
+      });
+      if (
+        !selectionIdentityMatches(expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        return;
+      setView('conversation');
+      setSessionDrawerOpen(false);
+      const loaded = await refresh(created.session.id);
+      const createdThreadId = selectedThreadRef.current;
+      if (!loaded || selectedSessionRef.current !== created.session.id || !createdThreadId) return;
+      setNotice('New conversation ready');
+      window.setTimeout(() => {
+        if (
+          selectedSessionRef.current === created.session.id &&
+          selectedThreadRef.current === createdThreadId
+        )
+          composerRef.current?.focus();
+      }, 0);
+    } catch (cause) {
+      if (
+        !selectionIdentityMatches(expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        return;
+      setError(cause instanceof Error ? cause.message : String(cause));
     }
-    await load(selected?.id);
   };
-  const cancel = async (): Promise<void> => {
-    if (!activeRunId) return;
-    await request(`/api/runs/${activeRunId}/cancel`, { method: 'POST' });
-  };
-  const switchProvider = async (provider: string, model: string): Promise<void> => {
+
+  const createThread = async (): Promise<void> => {
+    if (!selectedSessionId) return;
+    followNextOutput();
+    const sessionId = selectedSessionId;
+    const expectedSelection = {
+      sessionId,
+      threadId: selectedThreadRef.current,
+    };
+    let createdThreadId: string | null = null;
+    let createdThreadLoad: SelectionLoad | null = null;
+    setError(null);
     try {
-      const result = await request<{ active: { name: string; model: string } }>(
-        '/api/providers/switch',
+      const created = await request<{ thread: Thread }>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/threads`,
         {
           method: 'POST',
-          body: JSON.stringify({ provider, model }),
+          body: JSON.stringify({ title: `Thread ${threads.length + 1}` }),
         },
       );
-      setActiveProvider(result.active);
-      setNotice(`Using ${result.active.name} · ${result.active.model}`);
+      createdThreadId = created.thread.id;
+      if (
+        !selectionIdentityMatches(expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        return;
+      const load = beginForegroundLoad({ sessionId, threadId: created.thread.id });
+      createdThreadLoad = load;
+      const loaded = await loadSession(sessionId, load, created.thread.id);
+      if (
+        !loaded ||
+        selectedSessionRef.current !== sessionId ||
+        selectedThreadRef.current !== created.thread.id
+      )
+        return;
+      setNotice('New thread ready');
     } catch (cause) {
+      const currentSelection = {
+        sessionId: selectedSessionRef.current,
+        threadId: selectedThreadRef.current,
+      };
+      const ownsFailure = createdThreadId
+        ? currentSelection.sessionId === sessionId &&
+          currentSelection.threadId === createdThreadId &&
+          createdThreadLoad !== null &&
+          snapshotLoadIsCurrent(selectionLoads.current, createdThreadLoad)
+        : selectionIdentityMatches(expectedSelection, currentSelection);
+      if (!ownsFailure || isRequestAbort(cause)) return;
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   };
-  const executeCommand = async (commandId: AgentCommandId): Promise<void> => {
-    setError(null);
+
+  const chooseSession = async (sessionId: string): Promise<void> => {
+    followNextOutput();
+    const load = beginForegroundLoad({ sessionId, threadId: null });
+    clearThreadView();
+    setThreads([]);
+    setSelectedThreadId(null);
+    selectedThreadRef.current = null;
+    setSelectedSessionId(sessionId);
+    selectedSessionRef.current = sessionId;
+    setSessionDrawerOpen(false);
+    setView('conversation');
     try {
-      if (commandId === 'new-session') {
-        const session = await createSession();
-        setNotice(`Started ${session.title}`);
-      } else if (commandId === 'status') {
-        const result = await request<{
-          name?: string;
-          version?: string;
-          activeRuns?: number;
-          providers?: Array<{ name: string; available: boolean }>;
-        }>('/api/status');
-        const onlineProviders =
-          result.providers?.filter((provider) => provider.available).length ?? 0;
-        setNotice(
-          `${result.name ?? 'NUAAI'} ${result.version ?? ''} online · ${onlineProviders} provider(s) ready`,
+      const loaded = await loadSession(sessionId, load, null);
+      if (!loaded || !snapshotLoadIsCurrent(selectionLoads.current, load)) return;
+      setError(null);
+    } catch (cause) {
+      if (!snapshotLoadIsCurrent(selectionLoads.current, load) || isRequestAbort(cause)) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const chooseThread = async (threadId: string): Promise<void> => {
+    const sessionId = selectedSessionRef.current;
+    if (!sessionId) return;
+    followNextOutput();
+    const load = beginForegroundLoad({ sessionId, threadId });
+    clearThreadView();
+    setSelectedThreadId(threadId);
+    selectedThreadRef.current = threadId;
+    try {
+      const runState = await loadThread(threadId, load);
+      if (!runState || !snapshotLoadIsCurrent(selectionLoads.current, load)) return;
+      setEventSubscription({
+        sessionId,
+        after: runState.lastEventId,
+        generation: load.generation,
+      });
+      setError(null);
+    } catch (cause) {
+      if (!snapshotLoadIsCurrent(selectionLoads.current, load) || isRequestAbort(cause)) return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const executeComposerCommand = async (command: ComposerCommand): Promise<void> => {
+    setInput('');
+    if (command === 'new-session') await createSession();
+    else if (command === 'refresh') {
+      if (await refresh(selectedSessionRef.current)) setNotice('Runtime refreshed');
+    } else if (command === 'memory') setView('memory');
+    else if (command === 'automations') setView('automations');
+    else setView('system');
+  };
+
+  const send = async (mode: 'next' | 'interrupt' = 'next'): Promise<void> => {
+    const value = input.trim();
+    const command = resolveComposerCommand(value);
+    if (command) {
+      await executeComposerCommand(command);
+      return;
+    }
+    if (!value || !selectedThreadId || connection !== 'connected') return;
+    const threadId = selectedThreadId;
+    const sessionId = selectedSessionRef.current;
+    const expectedSelection = { sessionId, threadId };
+    const currentRunId = activeRunId;
+    followNextOutput();
+    setInput('');
+    setError(null);
+    let runAccepted = false;
+    try {
+      if (mode === 'interrupt' && currentRunId)
+        await request(
+          `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(currentRunId)}/cancel`,
+          { method: 'POST' },
         );
-      } else if (commandId === 'sessions') {
-        setView('conversation');
-        setNotice(`${sessions.length} session${sessions.length === 1 ? '' : 's'} available`);
-      } else if (commandId === 'refresh') {
-        await load(selected?.id);
-        setNotice('Runtime refreshed');
-      } else if (commandId === 'focus-composer') {
-        setView('conversation');
-        window.setTimeout(() => composerRef.current?.focus(), 0);
-        setNotice('Composer ready');
-      } else if (commandId === 'cancel-run') {
-        if (!activeRunId) {
-          setNotice('No active run');
-        } else {
-          await cancel();
-          setNotice('Cancellation requested');
-        }
+      const run = await request<{ id: string }>('/api/runs', {
+        method: 'POST',
+        body: JSON.stringify({ threadId, input: value }),
+      });
+      runAccepted = true;
+      const stillSelected = selectionIdentityMatches(expectedSelection, {
+        sessionId: selectedSessionRef.current,
+        threadId: selectedThreadRef.current,
+      });
+      if (currentRunId) {
+        setQueuedRunsByThread((current) => ({
+          ...current,
+          [threadId]: [...new Set([...(current[threadId] ?? []), run.id])],
+        }));
+        setQueuedPromptsByRun((current) => ({ ...current, [run.id]: value }));
+        if (stillSelected)
+          setNotice(
+            mode === 'interrupt' ? 'Interrupt requested · follow-up queued' : 'Follow-up queued',
+          );
+      } else setActiveRunsByThread((current) => ({ ...current, [threadId]: run.id }));
+      if (sessionId && stillSelected) {
+        const load = beginForegroundLoad(expectedSelection);
+        await loadThread(threadId, load);
       }
     } catch (cause) {
+      if (
+        !selectionIdentityMatches(expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        }) ||
+        isRequestAbort(cause)
+      )
+        return;
+      const message = cause instanceof Error ? cause.message : String(cause);
+      if (!runAccepted) setInput(value);
+      setError(runAccepted ? `Run accepted, but conversation refresh failed: ${message}` : message);
+    }
+  };
+
+  const cancel = async (): Promise<void> => {
+    if (!activeRunId || !selectedThreadId) return;
+    const runId = activeRunId;
+    const threadId = selectedThreadId;
+    const expectedSelection = { sessionId: selectedSessionRef.current, threadId };
+    try {
+      await request(
+        `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/cancel`,
+        { method: 'POST' },
+      );
+      if (
+        selectionIdentityMatches(expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        setNotice('Cancellation requested');
+    } catch (cause) {
+      if (
+        !selectionIdentityMatches(expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        return;
       setError(cause instanceof Error ? cause.message : String(cause));
     }
-    setCommandPaletteOpen(false);
   };
+
+  const retryRun = async (runId: string): Promise<void> => {
+    const threadId = selectedThreadRef.current;
+    const sessionId = selectedSessionRef.current;
+    if (!threadId || !sessionId || activeRunForThread(activeRunsByThread, threadId)) return;
+    const expectedSelection = { sessionId, threadId };
+    let retryLoad: SelectionLoad | null = null;
+    try {
+      const resumed = await request<{ id: string }>(
+        `/api/runs/${encodeURIComponent(runId)}/resume`,
+        {
+          method: 'POST',
+        },
+      );
+      setActiveRunsByThread((current) => ({ ...current, [threadId]: resumed.id }));
+      if (
+        !selectionIdentityMatches(expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        return;
+      const load = beginForegroundLoad(expectedSelection);
+      retryLoad = load;
+      const runState = await loadThread(threadId, load);
+      if (
+        !runState ||
+        !snapshotCanCommit(selectionLoads.current, load, expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        return;
+      setNotice('Retry started');
+    } catch (cause) {
+      if (
+        !selectionIdentityMatches(expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        }) ||
+        (retryLoad !== null && !snapshotLoadIsCurrent(selectionLoads.current, retryLoad)) ||
+        isRequestAbort(cause)
+      )
+        return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const loadEarlierMessages = async (): Promise<void> => {
+    const threadId = selectedThreadRef.current;
+    const sessionId = selectedSessionRef.current;
+    const before = historyCursor;
+    if (!threadId || !sessionId || before === null || loadingEarlierMessages) return;
+    const expectedSelection = { sessionId, threadId };
+    const load = beginForegroundLoad(expectedSelection);
+    setLoadingEarlierMessages(true);
+    try {
+      const page = await request<ThreadPresentation>(
+        `/api/threads/${encodeURIComponent(threadId)}/presentation?before=${before}&limit=100`,
+        { signal: load.signal },
+      );
+      if (
+        !snapshotCanCommit(selectionLoads.current, load, expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        return;
+      const scroller = messagesRef.current;
+      const previousScrollHeight = scroller?.scrollHeight ?? 0;
+      const previousScrollTop = scroller?.scrollTop ?? 0;
+      setMessages((current) => {
+        const known = new Set(current.map((message) => message.id));
+        return [...page.messages.filter((message) => !known.has(message.id)), ...current];
+      });
+      setHistoryCursor(page.nextCursor);
+      setHasEarlierMessages(page.hasMore);
+      const frame = window.requestAnimationFrame(() => {
+        if (historyFrameRef.current === frame) historyFrameRef.current = null;
+        if (
+          !snapshotCanCommit(selectionLoads.current, load, expectedSelection, {
+            sessionId: selectedSessionRef.current,
+            threadId: selectedThreadRef.current,
+          })
+        )
+          return;
+        const currentScroller = messagesRef.current;
+        if (!currentScroller) return;
+        currentScroller.scrollTop = preserveScrollAnchor({
+          previousScrollHeight,
+          previousScrollTop,
+          nextScrollHeight: currentScroller.scrollHeight,
+        });
+      });
+      historyFrameRef.current = frame;
+    } catch (cause) {
+      if (
+        snapshotCanCommit(selectionLoads.current, load, expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (
+        snapshotCanCommit(selectionLoads.current, load, expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        setLoadingEarlierMessages(false);
+    }
+  };
+
   const createSchedule = async (): Promise<void> => {
     if (!scheduleName.trim() || !scheduleInput.trim()) return;
-    await request('/api/schedules', {
-      method: 'POST',
-      body: JSON.stringify({
-        name: scheduleName.trim(),
-        type: 'manual',
-        expression: '',
-        agentInput: scheduleInput.trim(),
-      }),
-    });
-    setScheduleName('');
-    setScheduleInput('');
-    await load(selected?.id);
+    try {
+      await request('/api/schedules', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: scheduleName.trim(),
+          type: 'manual',
+          expression: '',
+          agentInput: scheduleInput.trim(),
+        }),
+      });
+      setScheduleName('');
+      setScheduleInput('');
+      await loadSystem();
+      setNotice('Automation created');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   };
+
   const scheduleAction = async (
     id: string,
     action: 'pause' | 'resume' | 'trigger',
   ): Promise<void> => {
-    await request(`/api/schedules/${id}/${action}`, { method: 'POST' });
-    await load(selected?.id);
+    try {
+      await request(`/api/schedules/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
+      await loadSystem();
+      setNotice(action === 'trigger' ? 'Automation started' : `Automation ${action}d`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   };
+
+  const switchProvider = async (provider: string, model: string): Promise<void> => {
+    setError(null);
+    try {
+      const result = await request<{ active: ActiveProvider }>('/api/providers/switch', {
+        method: 'POST',
+        body: JSON.stringify({ provider, model }),
+      });
+      setActiveProvider(result.active);
+      setNotice(`Using ${displayModel(result.active)}`);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      const providerNotice = providerUnavailableNotice(message, provider, activeProvider);
+      if (!providerNotice) {
+        setError(message);
+        return;
+      }
+      try {
+        await loadSystem();
+        setNotice(providerNotice);
+      } catch (refreshCause) {
+        setError(refreshCause instanceof Error ? refreshCause.message : String(refreshCause));
+      }
+    }
+  };
+
   const unloadPlugin = async (name: string): Promise<void> => {
-    await request(`/api/plugins/${encodeURIComponent(name)}/unload`, { method: 'POST' });
-    await load(selected?.id);
+    try {
+      await request(`/api/plugins/${encodeURIComponent(name)}/unload`, { method: 'POST' });
+      await loadSystem();
+      setNotice(`${name} unloaded`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
   };
-  const toolEvents = events.filter((event) =>
-    ['tool.started', 'tool.completed', 'tool.failed'].includes(event.type),
-  );
+
+  const executeCommand = async (id: CommandId): Promise<void> => {
+    setCommandPaletteOpen(false);
+    if (id === 'new-session') await createSession();
+    else if (id === 'new-thread') await createThread();
+    else if (id === 'refresh') {
+      if (await refresh(selectedSessionRef.current)) setNotice('Runtime refreshed');
+    } else if (id === 'focus-composer') {
+      setView('conversation');
+      window.setTimeout(() => composerRef.current?.focus(), 0);
+    } else if (id === 'cancel-run') await cancel();
+  };
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <div>
-          <span className="eyebrow">LOCAL AGENT SYSTEM</span>
-          <h1>NUAAI</h1>
-          <p>not ur avg ai</p>
+    <div className="app-shell" data-connection={connection}>
+      <header className="app-header">
+        <button
+          type="button"
+          className="icon-button menu-button"
+          aria-label="Open conversations"
+          aria-expanded={sessionDrawerOpen}
+          onClick={() => setSessionDrawerOpen((open) => !open)}
+        >
+          <span aria-hidden="true">☰</span>
+        </button>
+        <div className="brand">
+          <span className="brand-mark" aria-hidden="true">
+            N
+          </span>
+          <div>
+            <strong>NUAAI</strong>
+            <small>Local agent</small>
+          </div>
         </div>
-        <div className="status">
-          <span className={status === 'Connected' ? 'dot live' : 'dot'} />
-          <span aria-live="polite">{notice ?? status}</span>
+        <div className="header-actions">
+          <div className={`connection connection-${connection}`} aria-live="polite">
+            <span aria-hidden="true" />
+            {notice ?? connectionLabel(connection)}
+          </div>
           <button
             type="button"
-            className="command-trigger"
+            className="header-button command-button"
             onClick={() => setCommandPaletteOpen(true)}
             aria-haspopup="dialog"
           >
             Commands <kbd>⌘K</kbd>
           </button>
-          <button type="button" onClick={() => void load()}>
-            Refresh
+          <button
+            type="button"
+            className="icon-button refresh-button"
+            aria-label="Refresh runtime"
+            onClick={() => void refresh(selectedSessionRef.current)}
+          >
+            <span aria-hidden="true">↻</span>
           </button>
         </div>
       </header>
-      <div className="layout">
-        <aside className="sidebar">
-          <button type="button" className="new-session" onClick={() => void createSession()}>
-            + New session
-          </button>
-          <h2>Sessions</h2>
-          {sessions.length ? (
-            sessions.map((session) => (
-              <button
-                type="button"
-                className={`session ${selected?.id === session.id ? 'selected' : ''}`}
-                key={session.id}
-                onClick={() => {
-                  setSelected(session);
-                  void load();
-                }}
-              >
-                <strong>{session.title}</strong>
-                <small>{session.status}</small>
-              </button>
-            ))
-          ) : (
-            <div className="empty">No sessions yet.</div>
-          )}
-          <div className="sidebar-footer">
-            <span>Provider health</span>
-            {providers.map((provider) => (
-              <div className="provider" key={provider.name}>
-                <span className={provider.available ? 'dot live' : 'dot'} />
-                <span>
-                  {provider.name}
-                  {activeProvider?.name === provider.name && (
-                    <small> · {activeProvider.model}</small>
-                  )}
-                </span>
-                <small>{provider.available ? 'ready' : 'offline'}</small>
-                {provider.available &&
-                  provider.models?.map((model) => (
+
+      <div className="app-frame">
+        <aside
+          ref={sessionRailRef}
+          className={`session-rail ${sessionDrawerOpen ? 'open' : ''}`}
+          aria-label="Conversations"
+          aria-modal={sessionDrawerOpen ? true : undefined}
+          role={sessionDrawerOpen ? 'dialog' : undefined}
+        >
+          <div className="rail-heading">
+            <button
+              type="button"
+              className="new-conversation-button"
+              onClick={() => void createSession()}
+            >
+              New conversation
+            </button>
+            <label className="session-search">
+              <span className="sr-only">Search conversations</span>
+              <input
+                type="search"
+                value={sessionSearch}
+                placeholder="Search conversations"
+                onChange={(event) => setSessionSearch(event.target.value)}
+              />
+            </label>
+          </div>
+          <div className="session-list">
+            {sessionGroups.length ? (
+              sessionGroups.map((group) => (
+                <section className="session-group" key={group.label}>
+                  <h2>{group.label}</h2>
+                  {group.sessions.map((session) => (
                     <button
                       type="button"
-                      key={`${provider.name}-${model}`}
-                      disabled={
-                        activeProvider?.name === provider.name && activeProvider.model === model
-                      }
-                      onClick={() => void switchProvider(provider.name, model)}
+                      className={`session-row ${selectedSessionId === session.id ? 'selected' : ''}`}
+                      aria-current={selectedSessionId === session.id ? 'page' : undefined}
+                      key={session.id}
+                      onClick={() => void chooseSession(session.id)}
                     >
-                      {activeProvider?.name === provider.name && activeProvider.model === model
-                        ? 'Active'
-                        : `Use ${model}`}
+                      <span className="session-glyph" aria-hidden="true" />
+                      <span>
+                        <strong>{session.title}</strong>
+                        <small>{selectedSessionId === session.id ? 'Current' : 'Saved'}</small>
+                      </span>
                     </button>
                   ))}
+                </section>
+              ))
+            ) : (
+              <div className="rail-empty">
+                <strong>{sessions.length ? 'No matches' : 'No conversations'}</strong>
+                <p>
+                  {sessions.length
+                    ? 'Try a different conversation search.'
+                    : 'Start one to create a durable session.'}
+                </p>
               </div>
-            ))}
+            )}
+          </div>
+          <NavigationTabs
+            view={view}
+            memoryCount={memories.length}
+            automationCount={schedules.length}
+            onChange={(nextView) => {
+              setView(nextView);
+              setSessionDrawerOpen(false);
+            }}
+          />
+          <div className="rail-footer">
+            <span className={`connection-dot connection-${connection}`} aria-hidden="true" />
+            <span>Daemon</span>
+            <strong>{connectionLabel(connection)}</strong>
           </div>
         </aside>
-        <main className="main">
-          <nav className="tabs">
-            {(['conversation', 'memory', 'skills', 'plugins', 'schedules'] as const).map((tab) => (
-              <button
-                type="button"
-                className={view === tab ? 'active' : ''}
-                key={tab}
-                onClick={() => setView(tab)}
-              >
-                {tab}
-                <small>
-                  {tab === 'memory'
-                    ? memories.length
-                    : tab === 'skills'
-                      ? skills.length
-                      : tab === 'plugins'
-                        ? plugins.length
-                        : tab === 'schedules'
-                          ? schedules.length
-                          : ''}
-                </small>
-              </button>
-            ))}
-          </nav>
-          {view === 'conversation' ? (
-            <>
-              <section className="panel conversation">
-                <div className="panel-heading">
-                  <div>
-                    <span className="eyebrow">ACTIVE THREAD</span>
-                    <h2>{thread?.title ?? 'No thread selected'}</h2>
+        {sessionDrawerOpen && (
+          <button
+            type="button"
+            className="drawer-scrim"
+            aria-label="Close conversations"
+            onClick={() => setSessionDrawerOpen(false)}
+          />
+        )}
+
+        <main className="workspace">
+          {view === 'conversation' && (
+            <section
+              id="view-conversation"
+              className="conversation-view"
+              role="tabpanel"
+              aria-label="Conversation"
+            >
+              <div className="conversation-pane">
+                <div className="conversation-header">
+                  <div className="conversation-title">
+                    <span className="section-label">
+                      {selectedSession?.title ?? 'Conversation'}
+                    </span>
+                    <div className="thread-control">
+                      {threads.length > 1 ? (
+                        <select
+                          aria-label="Thread"
+                          value={selectedThreadId ?? ''}
+                          onChange={(event) => void chooseThread(event.target.value)}
+                        >
+                          {threads.map((item) => (
+                            <option value={item.id} key={item.id}>
+                              {item.title}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <h1>{selectedThread?.title ?? 'Ready when you are'}</h1>
+                      )}
+                      {selectedSession && (
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => void createThread()}
+                        >
+                          New thread
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <span className="chip">persistent</span>
                 </div>
-                <div className="messages">
-                  {messages.length ? (
-                    messages.map((message, index) => (
-                      <article
-                        className={`message ${message.role}`}
-                        key={`${message.createdAt}-${index}`}
+
+                <div
+                  ref={messagesRef}
+                  className="messages"
+                  aria-live="polite"
+                  onScroll={(event) => {
+                    const nearBottom = isNearScrollBottom(event.currentTarget);
+                    nearBottomRef.current = nearBottom;
+                    if (!nearBottom) {
+                      if (followFrameRef.current !== null) {
+                        window.cancelAnimationFrame(followFrameRef.current);
+                        followFrameRef.current = null;
+                      }
+                      forceFollowRef.current = false;
+                      if (
+                        shouldShowNewResponseButton({
+                          nearBottom,
+                          hasLiveResponse: Boolean(liveMessage),
+                        })
+                      )
+                        setShowNewResponse(true);
+                    } else setShowNewResponse(false);
+                  }}
+                >
+                  {selectedThread && hasEarlierMessages && (
+                    <div className="history-loader">
+                      <button
+                        type="button"
+                        disabled={loadingEarlierMessages}
+                        onClick={() => void loadEarlierMessages()}
                       >
-                        <span className="role">{message.role}</span>
-                        <p>{message.content}</p>
-                      </article>
-                    ))
-                  ) : (
-                    <div className="empty large">
-                      Create a session and send a message to start the agent.
+                        {loadingEarlierMessages ? 'Loading…' : 'Load earlier messages'}
+                      </button>
                     </div>
                   )}
-                  {liveOutput && (
-                    <article className="message assistant live-message">
-                      <span className="role">assistant · live</span>
-                      <p>
-                        {liveOutput}
-                        <span className="cursor" />
-                      </p>
-                    </article>
+                  {!selectedThread ? (
+                    <div className="conversation-empty">
+                      <span className="empty-mark" aria-hidden="true">
+                        N
+                      </span>
+                      <h2>Start with a real question</h2>
+                      <p>NUAAI keeps the session, run state, and action trail on this machine.</p>
+                      <button
+                        type="button"
+                        className="primary-button"
+                        onClick={() => void createSession()}
+                      >
+                        Start a conversation
+                      </button>
+                    </div>
+                  ) : transcript.length === 0 && !runProjection?.liveOutput ? (
+                    <div className="conversation-empty">
+                      <span className="empty-mark" aria-hidden="true">
+                        N
+                      </span>
+                      <h2>What should NUAAI work on?</h2>
+                      <p>Ask about the workspace, runtime status, or available capabilities.</p>
+                      <div className="starter-actions">
+                        {[
+                          'Summarize this workspace',
+                          'Check the current system status',
+                          'Explain the capabilities available in this session',
+                        ].map((prompt) => (
+                          <button type="button" key={prompt} onClick={() => setInput(prompt)}>
+                            {prompt}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="message-stack">
+                      {transcript.map((message) => (
+                        <article className={`message message-${message.role}`} key={message.id}>
+                          <div className="message-meta">
+                            <span>{message.role === 'user' ? 'You' : 'NUAAI'}</span>
+                            <time>{relativeTime(message.createdAt)}</time>
+                          </div>
+                          <MarkdownContent markdown={message.markdown} />
+                          {message.role === 'assistant' && (
+                            <RunStatusSummary
+                              message={message}
+                              {...(message.runId
+                                ? { onRetry: () => void retryRun(message.runId as string) }
+                                : {})}
+                            />
+                          )}
+                        </article>
+                      ))}
+                      {liveMessage && (
+                        <article className="message message-assistant message-live">
+                          <div className="message-meta">
+                            <span>NUAAI</span>
+                            <span>{runLabel(runProjection?.status)}</span>
+                          </div>
+                          <div className="message-live-body">
+                            {liveMessage.markdown ? (
+                              <MarkdownContent markdown={liveMessage.markdown} />
+                            ) : (
+                              <p className="response-placeholder">Preparing response…</p>
+                            )}
+                            <span className="live-cursor" aria-hidden="true" />
+                          </div>
+                          <RunStatusSummary message={liveMessage} active />
+                        </article>
+                      )}
+                    </div>
                   )}
                 </div>
-                {toolEvents.length > 0 && (
-                  <div className="tool-activity" aria-label="Tool activity">
-                    <span className="eyebrow">TOOL ACTIVITY</span>
-                    {toolEvents.slice(-8).map((event, index) => (
-                      <div key={`${event.createdAt}-${index}`}>
-                        {event.type} · {String(event.payload.name ?? 'tool')}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <div className="composer">
-                  <textarea
-                    ref={composerRef}
-                    value={input}
-                    onChange={(event) => setInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' && !event.shiftKey) {
-                        event.preventDefault();
-                        void send();
-                      }
-                    }}
-                    placeholder="Ask NUAAI anything…"
-                    disabled={!thread}
-                  />
+                {showNewResponse && (
                   <button
                     type="button"
-                    onClick={() => void send()}
-                    disabled={!thread || !input.trim()}
+                    className="new-response-button"
+                    aria-label="Jump to newest response"
+                    onClick={scrollToLatest}
                   >
-                    Send ↗
+                    New response ↓
                   </button>
-                  {activeRunId && (
-                    <button type="button" onClick={() => void cancel()}>
-                      Cancel run
-                    </button>
-                  )}
-                </div>
-              </section>
-              <section className="stats">
-                <div>
-                  <span>Sessions</span>
-                  <strong>{sessions.length}</strong>
-                </div>
-                <div>
-                  <span>Events</span>
-                  <strong>{events.length}</strong>
-                </div>
-                <div>
-                  <span>Memory records</span>
-                  <strong>{memories.length}</strong>
-                </div>
-                <div>
-                  <span>Background schedules</span>
-                  <strong>{schedules.length}</strong>
-                </div>
-              </section>
-            </>
-          ) : (
-            <section className="panel secondary">
-              <span className="eyebrow">SYSTEM SURFACE</span>
-              <h2>{view[0].toUpperCase() + view.slice(1)}</h2>
-              {view === 'memory' && (
-                <div className="record-list" aria-label="Memory records">
-                  {memories.length === 0 && <div className="empty">No memory records yet.</div>}
-                  {memories.map((memory) => (
-                    <article className="record" key={memory.id}>
-                      <strong>{memory.content}</strong>
-                      <small>
-                        {memory.hasEmbedding ? 'semantic index ready' : 'embedding unavailable'}
-                      </small>
-                    </article>
-                  ))}
-                </div>
-              )}
-              {view === 'skills' && (
-                <div className="record-list" aria-label="Skills">
-                  {skills.length === 0 && <div className="empty">No skills registered.</div>}
-                  {skills.map((skill) => (
-                    <article className="record" key={skill.name}>
-                      <strong>{skill.name}</strong>
-                      <small>
-                        {skill.version} · {skill.source}
-                      </small>
-                      <p>{skill.description}</p>
-                    </article>
-                  ))}
-                </div>
-              )}
-              {view === 'plugins' && (
-                <div className="record-list" aria-label="Plugins">
-                  {plugins.length === 0 && <div className="empty">No trusted plugins loaded.</div>}
-                  {plugins.map((plugin) => {
-                    const health = pluginHealth.find((entry) => entry.name === plugin.name);
-                    return (
-                      <article className="record" key={plugin.name}>
-                        <strong>{plugin.name}</strong>
-                        <small>
-                          {plugin.version} · API {plugin.apiVersion} ·{' '}
-                          {health?.enabled ? 'enabled' : 'disabled'}
-                        </small>
-                        <p>Capabilities: {plugin.capabilities.join(', ') || 'none'}</p>
-                        <button type="button" onClick={() => void unloadPlugin(plugin.name)}>
-                          Unload
-                        </button>
-                      </article>
-                    );
-                  })}
-                </div>
-              )}
-              {view === 'schedules' && (
-                <div className="schedule-manager">
-                  <p>
-                    {schedules.filter((schedule) => schedule.enabled).length} schedules enabled.
-                  </p>
-                  <div className="schedule-form">
-                    <input
-                      aria-label="Schedule name"
-                      value={scheduleName}
-                      onChange={(event) => setScheduleName(event.target.value)}
-                      placeholder="Schedule name"
-                    />
-                    <input
-                      aria-label="Schedule agent input"
-                      value={scheduleInput}
-                      onChange={(event) => setScheduleInput(event.target.value)}
-                      placeholder="Agent instruction"
-                    />
-                    <button type="button" onClick={() => void createSchedule()}>
-                      Create manual schedule
-                    </button>
-                  </div>
-                  <div className="schedule-list">
-                    {schedules.length === 0 && <div className="empty">No schedules yet.</div>}
-                    {schedules.map((schedule) => {
-                      const scheduleTasks = tasks.filter((task) => task.scheduleId === schedule.id);
-                      return (
-                        <article className="schedule-card" key={schedule.id}>
-                          <div>
-                            <strong>{schedule.name}</strong>
-                            <small>
-                              {schedule.type} · {schedule.enabled ? 'enabled' : 'paused'} · attempts{' '}
-                              {schedule.policy.maxAttempts}
-                            </small>
-                            <p>{schedule.agentInput}</p>
-                          </div>
-                          <div className="schedule-actions">
-                            <button
-                              type="button"
-                              onClick={() => void scheduleAction(schedule.id, 'trigger')}
-                            >
-                              Trigger
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                void scheduleAction(
-                                  schedule.id,
-                                  schedule.enabled ? 'pause' : 'resume',
-                                )
-                              }
-                            >
-                              {schedule.enabled ? 'Pause' : 'Resume'}
-                            </button>
-                          </div>
-                          <small>
-                            Recent tasks:{' '}
-                            {scheduleTasks
-                              .slice(0, 3)
-                              .map((task) => task.status)
-                              .join(', ') || 'none'}
-                          </small>
-                        </article>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
+                )}
+
+                <AgentComposer
+                  input={input}
+                  selectedThread={Boolean(selectedThread)}
+                  connection={connection}
+                  activeRunId={activeRunId}
+                  activeProvider={activeProvider}
+                  providers={providers}
+                  permissionProfile={webPermissionProfile}
+                  queuedItems={queuedItems}
+                  expanded={composerExpanded}
+                  textareaRef={composerRef}
+                  onInput={setInput}
+                  onExpanded={setComposerExpanded}
+                  onSubmit={(mode) => void send(mode)}
+                  onStop={() => void cancel()}
+                  onSwitchProvider={(provider, model) => void switchProvider(provider, model)}
+                  onCommand={(command) => void executeComposerCommand(command)}
+                />
+              </div>
             </section>
           )}
-          {error && <div className="error">{error}</div>}
+
+          {view === 'memory' && <MemoryView memories={memories} />}
+
+          {view === 'automations' && (
+            <AutomationsView
+              schedules={schedules}
+              tasks={tasks}
+              scheduleName={scheduleName}
+              scheduleInput={scheduleInput}
+              onScheduleName={setScheduleName}
+              onScheduleInput={setScheduleInput}
+              onCreate={() => void createSchedule()}
+              onAction={(id, action) => void scheduleAction(id, action)}
+            />
+          )}
+
+          {view === 'system' && (
+            <SystemView
+              connection={connection}
+              activeProvider={activeProvider}
+              providers={providers}
+              skills={skills}
+              plugins={plugins}
+              pluginHealth={pluginHealth}
+              onSwitchProvider={(provider, model) => void switchProvider(provider, model)}
+              onUnloadPlugin={(name) => void unloadPlugin(name)}
+            />
+          )}
         </main>
       </div>
-      <nav className="mobile-actions" aria-label="Agent actions">
-        <button type="button" onClick={() => setCommandPaletteOpen(true)}>
-          <span>⌘</span>
-          Commands
-        </button>
-        <button type="button" onClick={() => void executeCommand('new-session')}>
-          <span>＋</span>
-          New
-        </button>
-        <button type="button" onClick={() => void executeCommand('focus-composer')}>
-          <span>↗</span>
-          Ask
-        </button>
-      </nav>
+
+      <NavigationTabs
+        mobile
+        view={view}
+        memoryCount={memories.length}
+        automationCount={schedules.length}
+        onChange={(nextView) => {
+          setView(nextView);
+          setSessionDrawerOpen(false);
+        }}
+      />
+
+      {error && (
+        <ErrorToast
+          title={authenticationError ? 'Pair this device' : undefined}
+          error={error}
+          onRetry={authenticationError ? undefined : () => void refresh(selectedSessionRef.current)}
+          onDismiss={() => setError(null)}
+        />
+      )}
+
       {commandPaletteOpen && (
-        <div
-          className="palette-backdrop"
-          role="presentation"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setCommandPaletteOpen(false);
-          }}
-        >
-          <dialog
-            open
-            className="command-palette"
-            aria-labelledby="command-title"
-            onCancel={() => setCommandPaletteOpen(false)}
-          >
-            <div className="palette-heading">
-              <div>
-                <span className="eyebrow">NUAAI CONTROL SURFACE</span>
-                <h2 id="command-title">Agent commands</h2>
-              </div>
-              <button
-                type="button"
-                className="palette-close"
-                onClick={() => setCommandPaletteOpen(false)}
-              >
-                Close
-              </button>
-            </div>
-            <div className="command-list">
-              {AGENT_COMMANDS.map((command) => (
-                <button
-                  type="button"
-                  className="agent-command"
-                  key={command.id}
-                  disabled={command.id === 'cancel-run' && !activeRunId}
-                  onClick={() => void executeCommand(command.id)}
-                >
-                  <span>
-                    <strong>{command.label}</strong>
-                    <small>{command.description}</small>
-                  </span>
-                  {command.shortcut && <kbd>{command.shortcut}</kbd>}
-                </button>
-              ))}
-            </div>
-            <p className="palette-hint">
-              Every action calls the authenticated NUAAI daemon. No client-side fake state.
-            </p>
-          </dialog>
-        </div>
+        <CommandPalette
+          activeRunId={activeRunId}
+          selectedSessionId={selectedSessionId}
+          firstActionRef={paletteFirstActionRef}
+          onExecute={(id) => void executeCommand(id)}
+          onClose={() => setCommandPaletteOpen(false)}
+        />
       )}
     </div>
   );
 }
 
-const root = document.querySelector<HTMLDivElement>('#root');
-if (!root) throw new Error('NUAAI web root is missing');
-createRoot(root).render(<App />);
+createRoot(document.getElementById('root') as HTMLElement).render(<App />);
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    void navigator.serviceWorker.register(appPath('/sw.js'));
+  });
+}

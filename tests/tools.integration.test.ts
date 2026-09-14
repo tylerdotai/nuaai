@@ -1,11 +1,11 @@
-import { mkdtemp } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 import type { PermissionContext } from '../src/security/permissions.js';
-import { ToolRegistry } from '../src/tools/registry.js';
+import { type ToolContext, ToolRegistry } from '../src/tools/registry.js';
 import { initWorkspace, writeWorkspaceFile } from '../src/workspace/fs.js';
 
 const allPermissions: PermissionContext = {
@@ -63,7 +63,24 @@ function services() {
     },
     searchMemory: () => [{ id: 'memory-1', content: 'semantic result' }],
     searchMemoryRows: () => memoryRows,
+    searchMemoryLexical: () => memoryRows.map(({ embedding: _embedding, ...memory }) => memory),
     deleteMemory: (id: string) => id === 'memory-1',
+    listRuns: (threadId: string, limit: number) =>
+      [
+        {
+          id: 'run-1',
+          threadId,
+          status: 'failed',
+          provider: 'codex',
+          model: 'gpt-test',
+          input: 'review the code',
+          output: 'Run tool-call limit exceeded',
+          cancelRequested: false,
+          createdAt: 2,
+          updatedAt: 3,
+          correlationId: 'private-correlation',
+        },
+      ].slice(0, limit),
   };
   const search = {
     search: async (query: string, limit: number) => ({ query, limit, results: ['result'] }),
@@ -74,6 +91,52 @@ function services() {
 }
 
 describe('model-facing tool registry contracts', () => {
+  it('exposes browser automation independently of search when configured that way', async () => {
+    const root = await makeRoot();
+    const stack = {
+      open: async (url: string) => ({ url, title: 'opened', text: 'browser output' }),
+    };
+    const registry = new ToolRegistry(root, stack as never, {
+      browserEnabled: true,
+      searchEnabled: false,
+    });
+
+    expect(registry.schemas().some((tool) => tool.name === 'browser.open')).toBe(true);
+    expect(registry.schemas().some((tool) => tool.name === 'web.search')).toBe(false);
+    expect(registry.schemas().some((tool) => tool.name === 'web.fetch')).toBe(false);
+    await expect(
+      registry.execute(
+        'browser.open',
+        { url: 'https://example.com' },
+        {
+          root,
+          permissions: {
+            approved: new Set(['read']),
+            capabilities: { network: true },
+          },
+        },
+      ),
+    ).resolves.toMatchObject({ title: 'opened', text: 'browser output' });
+  });
+
+  it('does not advertise page fetching when search is enabled without browser automation', () => {
+    const root = '/tmp/nuaai-search-only-test';
+    const stack = {
+      search: async () => [],
+      fetch: async () => ({ url: 'https://example.com', title: 'page', text: 'body' }),
+      open: async () => ({ url: 'https://example.com', title: 'page', text: 'body' }),
+    };
+    const registry = new ToolRegistry(root, stack as never, {
+      browserEnabled: false,
+      searchEnabled: true,
+    });
+    const names = registry.schemas().map((tool) => tool.name);
+
+    expect(names).toContain('web.search');
+    expect(names).not.toContain('web.fetch');
+    expect(names).not.toContain('browser.open');
+  });
+
   it('executes workspace, web, memory, schedule, provider, MCP, media, and agent tools', async () => {
     const root = await makeRoot();
     await writeWorkspaceFile(root, 'note.txt', 'vision and schedule');
@@ -84,7 +147,13 @@ describe('model-facing tool registry contracts', () => {
       { browserEnabled: true },
       dependencies as never,
     );
-    const context = { root, permissions: allPermissions, timeoutMs: 5_000 };
+    const context = {
+      root,
+      permissions: allPermissions,
+      timeoutMs: 5_000,
+      threadId: 'thread-1',
+      runId: 'run-current',
+    };
 
     expect(
       ((await registry.execute('workspace.list', {}, context)) as unknown[]).length,
@@ -115,6 +184,17 @@ describe('model-facing tool registry contracts', () => {
     ).toMatchObject({
       stdout: 'ok',
     });
+    expect(registry.schemas(allPermissions).map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(['github.auth', 'github.repo.list']),
+    );
+    const webFetchSchema = registry
+      .schemas(allPermissions)
+      .find((tool) => tool.name === 'web.fetch');
+    expect(webFetchSchema?.description).toContain('guarded Playwright');
+    expect(webFetchSchema?.description).not.toMatch(/Crawl4AI|FlareSolverr/);
+    await expect(
+      registry.execute('github.repo.list', { mode: 'count', limit: 1_001 }, context),
+    ).rejects.toThrow();
     expect(
       await registry.execute('web.search', { query: 'local', limit: 2 }, context),
     ).toMatchObject({
@@ -139,6 +219,21 @@ describe('model-facing tool registry contracts', () => {
     expect(await registry.execute('memory.forget', { id: 'memory-1' }, context)).toEqual({
       id: 'memory-1',
       deleted: true,
+    });
+    expect(await registry.execute('run.history', { limit: 5 }, context)).toEqual({
+      threadId: 'thread-1',
+      runs: [
+        {
+          id: 'run-1',
+          status: 'failed',
+          provider: 'codex',
+          model: 'gpt-test',
+          input: 'review the code',
+          output: 'Run tool-call limit exceeded',
+          createdAt: 2,
+          updatedAt: 3,
+        },
+      ],
     });
 
     expect(
@@ -237,6 +332,9 @@ describe('model-facing tool registry contracts', () => {
       registry.execute('workspace.read', { path: '' }, { root, permissions: readOnly }),
     ).rejects.toThrow();
     await expect(
+      registry.execute('run.history', {}, { root, permissions: readOnly }),
+    ).rejects.toThrow('Current thread is unavailable');
+    await expect(
       registry.execute(
         'workspace.write',
         { path: 'x', content: 'x' },
@@ -274,6 +372,91 @@ describe('model-facing tool registry contracts', () => {
     expect(await registry.execute('memory.search', { query: 'Ollama' }, context)).toMatchObject({
       mode: 'lexical',
       warning: expect.stringContaining('Ollama unavailable'),
+    });
+  });
+
+  it('enforces GitHub capabilities and parses bounded auth and repository results', async () => {
+    const root = await makeRoot();
+    const bin = join(root, 'bin');
+    await mkdir(bin, { recursive: true });
+    const gh = join(bin, 'gh');
+    const modeFile = join(root, 'fake-gh-mode');
+    await writeFile(
+      gh,
+      `#!/usr/bin/env node
+const { readFileSync } = require('node:fs');
+let mode = 'ok';
+try { mode = readFileSync(${JSON.stringify(modeFile)}, 'utf8').trim() || 'ok'; }
+catch (error) { if (error?.code !== 'ENOENT') throw error; }
+if (mode === 'fail') { process.stderr.write('gh unavailable'); process.exit(1); }
+if (process.argv.includes('auth')) process.stdout.write('account tylerdotai (github.com)\\n');
+else if (process.argv.includes('--jq')) process.stdout.write('3\\n');
+else if (mode === 'object') process.stdout.write('{"unexpected":true}');
+else process.stdout.write('[{"nameWithOwner":"tylerdotai/example"}]');
+`,
+    );
+    await chmod(gh, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${bin}:${previousPath ?? ''}`;
+    const dependencies = services();
+    const registry = new ToolRegistry(root, undefined, {}, dependencies as never);
+    const context = { root, permissions: allPermissions, timeoutMs: 5_000 };
+    const noNetwork: ToolContext = {
+      root,
+      permissions: { approved: new Set(['execute']), capabilities: { subprocess: true } },
+    };
+    const noSubprocess: ToolContext = {
+      root,
+      permissions: { approved: new Set(['execute']), capabilities: { network: true } },
+    };
+    try {
+      await expect(registry.execute('github.auth', {}, noNetwork)).rejects.toThrow(
+        'Network capability required',
+      );
+      await expect(registry.execute('github.auth', {}, noSubprocess)).rejects.toThrow(
+        'Subprocess capability required',
+      );
+      expect(await registry.execute('github.auth', {}, context)).toMatchObject({
+        exitCode: 0,
+        authenticated: true,
+        account: 'tylerdotai',
+      });
+      expect(
+        await registry.execute(
+          'github.repo.list',
+          { owner: 'tylerdotai', mode: 'count', limit: 3 },
+          context,
+        ),
+      ).toEqual({ exitCode: 0, count: 3, limit: 3 });
+      expect(
+        await registry.execute('github.repo.list', { mode: 'rows', limit: 1 }, context),
+      ).toMatchObject({ exitCode: 0, count: 1 });
+
+      await writeFile(modeFile, 'object');
+      await expect(
+        registry.execute('github.repo.list', { mode: 'rows', limit: 1 }, context),
+      ).resolves.toMatchObject({ error: 'GitHub returned a non-array repository result' });
+      await writeFile(modeFile, 'fail');
+      await expect(registry.execute('github.auth', {}, context)).resolves.toMatchObject({
+        authenticated: false,
+        error: 'gh unavailable',
+      });
+      await expect(
+        registry.execute('github.repo.list', { mode: 'count', limit: 1 }, context),
+      ).resolves.toMatchObject({ error: 'gh unavailable' });
+    } finally {
+      if (previousPath === undefined) process.env.PATH = undefined;
+      else process.env.PATH = previousPath;
+    }
+
+    const noEmbeddingProvider = new ToolRegistry(root, undefined, {}, {
+      ...dependencies,
+      providers: undefined,
+    } as never);
+    expect(
+      await noEmbeddingProvider.execute('memory.search', { query: 'vision' }, context),
+    ).toMatchObject({
+      mode: 'lexical',
     });
   });
 });

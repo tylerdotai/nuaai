@@ -1,8 +1,14 @@
 import { execa } from 'execa';
 
+import {
+  sanitizedSubprocessEnvironment,
+  selectInheritedEnvironment,
+} from '../security/environment.js';
+
 export interface ExternalAgentCommand {
   command: string;
   args: string[];
+  inheritEnv?: string[];
 }
 
 export interface ExternalAgentConfig {
@@ -27,6 +33,7 @@ export class ExternalAgentDispatcher {
   async dispatch(
     agent: string,
     prompt: string,
+    signal?: AbortSignal,
   ): Promise<{
     agent: string;
     command: string;
@@ -48,7 +55,12 @@ export class ExternalAgentDispatcher {
       timeout: this.config.timeoutMs,
       reject: false,
       maxBuffer: this.config.maxOutputBytes,
-      env: { ...process.env, NUAAI_EXTERNAL_AGENT: agent },
+      cancelSignal: signal,
+      env: sanitizedSubprocessEnvironment({
+        ...selectInheritedEnvironment(adapter.inheritEnv ?? []),
+        NUAAI_EXTERNAL_AGENT: agent,
+      }),
+      extendEnv: false,
     });
     const stdout = result.stdout.slice(0, this.config.maxOutputBytes);
     const stderr = result.stderr.slice(0, 20_000);

@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
@@ -23,6 +23,46 @@ async function makeFixtureRoot(): Promise<string> {
 }
 
 describe('bounded local media processing', () => {
+  it('refuses protected runtime files and symlinks that escape the project root', async () => {
+    const root = await makeFixtureRoot();
+    const outside = await mkdtemp(resolve(tmpdir(), 'nuaai-media-outside-'));
+    temporaryRoots.push(outside);
+    await writeFile(resolve(root, '.nuaai/runtime.json'), '{"token":"do-not-read"}');
+    await writeFile(resolve(outside, 'outside.txt'), 'outside');
+    await symlink(resolve(outside, 'outside.txt'), resolve(root, 'outside-alias.txt'));
+    const media = new MediaProcessor({
+      allowedRoot: root,
+      artifactDirectory: resolve(root, '.nuaai/media'),
+    });
+
+    await expect(media.inspect('.nuaai/runtime.json')).rejects.toThrow('Protected workspace file');
+    await expect(media.inspect('outside-alias.txt')).rejects.toThrow('escapes workspace');
+  });
+
+  it('does not expose the ambient environment to media subprocesses', async () => {
+    const root = await makeFixtureRoot();
+    const input = resolve(root, 'sample.wav');
+    const probe = resolve(root, 'probe.sh');
+    await writeFile(input, 'audio');
+    await writeFile(
+      probe,
+      '#!/bin/sh\nif [ -n "$NUAAI_MEDIA_SENTINEL" ]; then printf \'{"leaked":true}\'; else printf \'{"clean":true}\'; fi\n',
+    );
+    await chmod(probe, 0o700);
+    const previous = process.env.NUAAI_MEDIA_SENTINEL;
+    process.env.NUAAI_MEDIA_SENTINEL = 'must-not-leak';
+    try {
+      const media = new MediaProcessor({
+        allowedRoot: root,
+        artifactDirectory: resolve(root, '.nuaai/media'),
+        ffprobePath: probe,
+      });
+      await expect(media.inspect(input)).resolves.toMatchObject({ metadata: { clean: true } });
+    } finally {
+      process.env.NUAAI_MEDIA_SENTINEL = previous;
+    }
+  });
+
   it('extracts ordinary text, DOCX XML, and XLSX worksheet content', async () => {
     const root = await makeFixtureRoot();
     await writeFile(resolve(root, 'notes.txt'), 'local-first text');

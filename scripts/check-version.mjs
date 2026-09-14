@@ -2,6 +2,8 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+import { validateVersionTagPolicy } from './version-policy.mjs';
+
 const root = resolve(import.meta.dirname, '..');
 const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
 const version = packageJson.version;
@@ -18,16 +20,22 @@ if (existsSync(lockPath)) {
   }
 }
 
-const tags = execFileSync('git', ['tag', '--list', 'v*', '--sort=-version:refname'], {
+const exactTags = execFileSync('git', ['tag', '--points-at', 'HEAD', '--list', 'v*'], {
   cwd: root,
   encoding: 'utf8',
 })
   .trim()
   .split('\n')
   .filter(Boolean);
-const expectedTag = `v${version}`;
-if (tags[0] !== expectedTag) {
-  throw new Error(`Latest Git tag ${tags[0] ?? '(none)'} does not match ${expectedTag}`);
-}
+const expectedTag = validateVersionTagPolicy({
+  version,
+  exactTags,
+  githubRef: process.env.GITHUB_REF,
+});
+const taggedRelease = exactTags.length > 0 || process.env.GITHUB_REF?.startsWith('refs/tags/');
 
-process.stdout.write(`NUAAI version ${version} matches ${expectedTag}\n`);
+process.stdout.write(
+  taggedRelease
+    ? `NUAAI version ${version} matches ${expectedTag}\n`
+    : `NUAAI version ${version} is internally consistent; release tag is not present at HEAD\n`,
+);

@@ -36,6 +36,37 @@ describe('bounded external-agent dispatch', () => {
     ]);
   });
 
+  it('does not leak ambient credentials unless an adapter explicitly inherits a named variable', async () => {
+    const blockedName = 'NUAAI_BLOCKED_SENTINEL';
+    const approvedName = 'NUAAI_APPROVED_SENTINEL';
+    process.env[blockedName] = 'blocked';
+    process.env[approvedName] = 'approved';
+    try {
+      const dispatcher = new ExternalAgentDispatcher('/tmp', {
+        enabled: true,
+        timeoutMs: 5_000,
+        maxOutputBytes: 2_000,
+        commands: {
+          inspect: {
+            command: process.execPath,
+            args: [
+              '-e',
+              `process.stdout.write(JSON.stringify({ blocked: process.env.${blockedName}, approved: process.env.${approvedName} }))`,
+            ],
+            inheritEnv: [approvedName],
+          },
+        },
+      });
+
+      await expect(dispatcher.dispatch('inspect', 'check')).resolves.toMatchObject({
+        stdout: JSON.stringify({ approved: 'approved' }),
+      });
+    } finally {
+      delete process.env[blockedName];
+      delete process.env[approvedName];
+    }
+  });
+
   it('rejects disabled, unknown, empty, failing, and timed-out adapters truthfully', async () => {
     const disabled = new ExternalAgentDispatcher('/tmp', {
       enabled: false,

@@ -6,25 +6,31 @@ import { loadRuntimeConfig, persistProviderSelection, workspaceDirectory } from 
 import { loadSessionIdentity } from './core/identity.js';
 import { AgentRuntime } from './core/runtime.js';
 import { Scheduler } from './core/scheduler.js';
-import { acquireDaemonLock } from './gateway/lock.js';
+import { type DaemonLock, acquireDaemonLock } from './gateway/lock.js';
 import { ensureRuntimeIdentity } from './gateway/runtime.js';
 import { ExternalAgentDispatcher } from './integrations/agents.js';
 import { LocalAudioBridge, handleAudioCommand } from './integrations/audio.js';
-import { MatrixBridge, matrixHelpText, parseMatrixCommand } from './integrations/matrix.js';
+import { MatrixReactionCoordinator } from './integrations/matrix-reactions.js';
+import {
+  MatrixBridge,
+  matrixConversationThreadSourceKey,
+  matrixHelpText,
+  matrixProgressText,
+  matrixReplyOptions,
+  matrixTerminalProgress,
+  parseMatrixCommand,
+} from './integrations/matrix.js';
 import { McpManager } from './integrations/mcp.js';
 import { MediaProcessor } from './integrations/media.js';
-import {
-  Crawl4AiClient,
-  FlareSolverrClient,
-  SearchStack,
-  SearxngSearchClient,
-} from './integrations/search.js';
+import { SearchStack, SearxngSearchClient } from './integrations/search.js';
 import { DatabaseStore, openAppDatabase } from './memory/db.js';
 import { PluginRegistry } from './plugins/registry.js';
 import { ProviderRegistry } from './providers/registry.js';
 import type { ProviderImage } from './providers/types.js';
+import { permissionContextForProfile } from './security/permissions.js';
 import { SecretsManager } from './security/secrets.js';
 import { type GatewayHandle, startServer } from './server.js';
+import { SkillLearner } from './skills/learner.js';
 import { loadFilesystemSkills } from './skills/loader.js';
 import { SkillRegistry } from './skills/registry.js';
 import { ToolRegistry } from './tools/registry.js';
@@ -42,9 +48,23 @@ export interface DaemonHandle {
 }
 
 const maxOllamaImageBytes = 10_000_000;
+const packageRoot = resolve(fileURLToPath(new URL('.', import.meta.url)), '..');
 
 export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
   const resolvedRoot = resolve(root);
+  const daemonLock = await acquireDaemonLock(resolvedRoot);
+  try {
+    return await startOwnedDaemon(resolvedRoot, daemonLock);
+  } catch (error) {
+    await daemonLock.release();
+    throw error;
+  }
+}
+
+async function startOwnedDaemon(
+  resolvedRoot: string,
+  daemonLock: DaemonLock,
+): Promise<DaemonHandle> {
   await initWorkspace(resolvedRoot);
   const matrixSincePath = resolve(workspaceDirectory(resolvedRoot), 'matrix-since.txt');
   let matrixSince: string | undefined;
@@ -54,13 +74,11 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
   let matrixSinceWrite = Promise.resolve();
-  const persistMatrixSince = (since: string): void => {
+  const persistMatrixSince = async (since: string): Promise<void> => {
     matrixSinceWrite = matrixSinceWrite
       .catch(() => undefined)
       .then(() => writeFile(matrixSincePath, since, { encoding: 'utf8', mode: 0o600 }));
-    void matrixSinceWrite.catch((error: unknown) => {
-      process.stderr.write(`Matrix sync state unavailable: ${String(error)}\n`);
-    });
+    await matrixSinceWrite;
   };
   const config = await loadRuntimeConfig(resolvedRoot);
   const effectiveConfig =
@@ -78,23 +96,24 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     root: resolvedRoot,
     providerName: effectiveConfig.provider.name,
     model: effectiveConfig.provider.model,
+    selectedModels: effectiveConfig.provider.selectedModels,
     baseUrl: effectiveConfig.provider.baseUrl,
     embeddingModel: effectiveConfig.embedding.model,
+    embeddingBaseUrl: effectiveConfig.embedding.baseUrl,
+    contextWindow: effectiveConfig.provider.contextWindow,
+    codex: effectiveConfig.provider.codex,
     timeoutMs: effectiveConfig.limits.providerTimeoutMs,
     ollamaEnabled: effectiveConfig.features.ollama,
     codexEnabled: effectiveConfig.features.codex,
     persistSelection: (provider, model) => persistProviderSelection(resolvedRoot, provider, model),
   });
-  const search = effectiveConfig.features.search
-    ? new SearchStack({
-        searxng: new SearxngSearchClient(effectiveConfig.search.searxngUrl),
-        crawl4ai: new Crawl4AiClient(effectiveConfig.search.crawl4aiUrl),
-        browser: effectiveConfig.features.browser ? undefined : null,
-        flaresolverr: effectiveConfig.features.browser
-          ? new FlareSolverrClient(effectiveConfig.search.flaresolverrUrl)
-          : null,
-      })
-    : undefined;
+  const search =
+    effectiveConfig.features.search || effectiveConfig.features.browser
+      ? new SearchStack({
+          searxng: new SearxngSearchClient(effectiveConfig.search.searxngUrl),
+          browser: effectiveConfig.features.browser ? undefined : null,
+        })
+      : undefined;
   const mcp = new McpManager(effectiveConfig.mcp);
   await mcp.start();
   const skills = new SkillRegistry();
@@ -106,7 +125,8 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     input: (await import('zod')).z.object({}),
     execute: async () => ({ root: resolvedRoot }),
   });
-  await loadFilesystemSkills(resolvedRoot, skills, store);
+  await loadFilesystemSkills(resolvedRoot, skills, store, resolve(packageRoot, 'skills'));
+  const skillLearner = new SkillLearner(resolvedRoot, skills);
   const plugins = new PluginRegistry(resolvedRoot, store);
   await plugins.load();
   let runtime!: AgentRuntime;
@@ -124,6 +144,16 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
           onSince: persistMatrixSince,
           downloadDirectory: resolve(workspaceDirectory(resolvedRoot), 'attachments', 'incoming'),
           workspaceRoot: resolvedRoot,
+          allowedUsers: effectiveConfig.matrix.allowedUsers,
+          allowedRooms: effectiveConfig.matrix.allowedRooms,
+          freeResponseRooms: effectiveConfig.matrix.freeResponseRooms,
+          ignoreUserPatterns: effectiveConfig.matrix.ignoreUserPatterns,
+          requireMention: effectiveConfig.matrix.requireMention,
+          processNotices: effectiveConfig.matrix.processNotices,
+          allowRoomMentions: effectiveConfig.matrix.allowRoomMentions,
+          autoThread: effectiveConfig.matrix.autoThread,
+          reactions: effectiveConfig.matrix.reactions,
+          maxMessageLength: effectiveConfig.matrix.maxMessageLength,
         })
       : undefined;
   const audio = new LocalAudioBridge({
@@ -154,14 +184,18 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     store,
     (type, payload, context) => runtime.publishEvent(type, payload, context),
     async (schedule, taskId) => {
-      const created = runtime.createSession(`Background: ${schedule.name}`);
+      const created = runtime.getOrCreateSession(
+        `schedule:${schedule.id}`,
+        `Background: ${schedule.name}`,
+      );
       const run = runtime.startRun({
         threadId: created.thread.id,
         input: schedule.agentInput,
+        permissions: permissionContextForProfile(effectiveConfig.permissions.scheduler),
       });
       scheduledRuns.set(taskId, run.id);
       try {
-        await runtime.waitForRun(run.id);
+        return await runtime.waitForRun(run.id);
       } finally {
         scheduledRuns.delete(taskId);
       }
@@ -174,7 +208,10 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
   const tools = new ToolRegistry(
     resolvedRoot,
     search,
-    { browserEnabled: effectiveConfig.features.browser },
+    {
+      browserEnabled: effectiveConfig.features.browser,
+      searchEnabled: effectiveConfig.features.search,
+    },
     { store, scheduler, providers, mcp, media, agents },
   );
   runtime = new AgentRuntime({
@@ -185,8 +222,9 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     tools,
     identityContext: sessionIdentity,
     mcp,
+    skills,
+    skillLearner,
   });
-  const daemonLock = await acquireDaemonLock(resolvedRoot);
   let gateway: GatewayHandle;
   try {
     scheduler.start();
@@ -195,7 +233,9 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
       host: effectiveConfig.host,
       port: effectiveConfig.port,
       authSecret: identity.secret,
-      authToken: identity.token,
+      browserCookiePath: effectiveConfig.web.publicBasePath,
+      runPermissionProfile: effectiveConfig.permissions.web,
+      runPermissions: permissionContextForProfile(effectiveConfig.permissions.web),
       runtime,
       store,
       providers,
@@ -208,6 +248,7 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
   } catch (error) {
     mcp.stop();
     scheduler.stop();
+    await runtime.shutdown();
     await daemonLock.release();
     store.close();
     throw error;
@@ -220,9 +261,13 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
   if (matrix) {
     type MatrixProgress = {
       roomId: string;
+      sourceEventId: string;
+      threadRootEventId?: string;
       eventId?: string;
+      reactionCoordinator?: MatrixReactionCoordinator;
       pending?: string;
       timer?: ReturnType<typeof setTimeout>;
+      typingTimer?: ReturnType<typeof setInterval>;
       unavailable?: boolean;
     };
     const progressByThread = new Map<string, MatrixProgress>();
@@ -239,6 +284,31 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
         reportMatrixSignalFailure(kind, error);
       }
     };
+    const setStatusReaction = async (progress: MatrixProgress, key: string): Promise<void> => {
+      if (!effectiveConfig.matrix.reactions) return;
+      progress.reactionCoordinator ??= new MatrixReactionCoordinator(
+        async (statusKey) =>
+          (await matrix.sendReaction(progress.roomId, progress.sourceEventId, statusKey)).eventId,
+        (eventId) =>
+          bestEffortMatrix('status reaction cleanup', () =>
+            matrix.redact(progress.roomId, eventId),
+          ),
+      );
+      await progress.reactionCoordinator.set(key);
+    };
+    const startTyping = (progress: MatrixProgress): void => {
+      void bestEffortMatrix('typing notification', () => matrix.setTyping(progress.roomId, true));
+      progress.typingTimer = setInterval(() => {
+        void bestEffortMatrix('typing notification refresh', () =>
+          matrix.setTyping(progress.roomId, true),
+        );
+      }, 10_000);
+    };
+    const stopTyping = async (progress: MatrixProgress): Promise<void> => {
+      if (progress.typingTimer) clearInterval(progress.typingTimer);
+      progress.typingTimer = undefined;
+      await bestEffortMatrix('typing notification', () => matrix.setTyping(progress.roomId, false));
+    };
     const flushProgress = async (progress: MatrixProgress): Promise<void> => {
       if (progress.timer) {
         clearTimeout(progress.timer);
@@ -248,7 +318,14 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
       const body = progress.pending;
       try {
         if (progress.eventId) await matrix.editText(progress.roomId, progress.eventId, body);
-        else progress.eventId = (await matrix.sendText(progress.roomId, body)).eventId;
+        else
+          progress.eventId = (
+            await matrix.sendText(
+              progress.roomId,
+              body,
+              progress.threadRootEventId ? { threadRootEventId: progress.threadRootEventId } : {},
+            )
+          ).eventId;
         if (progress.pending === body) progress.pending = undefined;
       } catch (error) {
         progress.unavailable = true;
@@ -265,15 +342,41 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
       }, 2_000);
     };
     const unsubscribe = runtime.subscribe((event) => {
-      if (!['tool.started', 'tool.completed', 'tool.failed'].includes(event.type)) return;
+      if (
+        ![
+          'run.started',
+          'run.completed',
+          'run.failed',
+          'run.cancelled',
+          'tool.started',
+          'tool.completed',
+          'tool.failed',
+        ].includes(event.type)
+      )
+        return;
       const progress =
         (event.runId ? progressByRun.get(event.runId) : undefined) ??
         (event.threadId ? progressByThread.get(event.threadId) : undefined);
       if (!progress) return;
-      const name = typeof event.payload.name === 'string' ? event.payload.name : 'tool';
-      if (event.type === 'tool.started') scheduleProgress(progress, `🔧 Running ${name}…`);
-      else if (event.type === 'tool.completed') scheduleProgress(progress, `✅ ${name} complete`);
-      else scheduleProgress(progress, `⚠️ ${name} failed`);
+      const name =
+        typeof event.payload.name === 'string'
+          ? event.payload.name
+          : typeof event.payload.error === 'string'
+            ? event.payload.error
+            : 'tool';
+      const progressText = matrixProgressText(event.type, name);
+      if (progressText) scheduleProgress(progress, progressText);
+      if (event.type === 'run.started') {
+        void bestEffortMatrix('status reaction', () => setStatusReaction(progress, '🧠'));
+      } else if (event.type === 'run.completed') {
+        void bestEffortMatrix('status reaction', () => setStatusReaction(progress, '✅'));
+      } else if (
+        event.type === 'run.cancelled' ||
+        event.type === 'run.failed' ||
+        event.type === 'tool.failed'
+      ) {
+        void bestEffortMatrix('status reaction', () => setStatusReaction(progress, '⚠️'));
+      }
     });
     void matrix.start(async (message) => {
       try {
@@ -285,13 +388,14 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
         const sourceKey = `matrix:${message.roomId}:${message.sender}`;
         const command = parseMatrixCommand(message.body);
         if (command) {
+          const replyOptions = matrixReplyOptions(message);
           const audioCommandResponse = handleAudioCommand(command.name, command.args, voiceState);
           if (audioCommandResponse) {
-            await matrix.sendText(message.roomId, audioCommandResponse);
+            await matrix.sendText(message.roomId, audioCommandResponse, replyOptions);
             return;
           }
           if (command.name === 'help' || command.name === 'start') {
-            await matrix.sendText(message.roomId, matrixHelpText());
+            await matrix.sendText(message.roomId, matrixHelpText(), replyOptions);
             return;
           }
           if (command.name === 'status') {
@@ -303,33 +407,34 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
               session
                 ? `Active session: **${session.title}**\nID: \`${session.id}\``
                 : 'No active session for this room and sender. Send a normal message to create one.',
+              replyOptions,
             );
             return;
           }
           if (command.name === 'sessions') {
-            const sessions = runtime
-              .listSessions()
-              .filter((session) => session.sourceKey?.startsWith(`matrix:${message.roomId}:`));
+            const sessions = runtime.listSessionsForSource(sourceKey);
             await matrix.sendText(
               message.roomId,
               sessions.length
                 ? sessions.map((session) => `- ${session.id} — ${session.title}`).join('\n')
                 : 'No Matrix sessions found for this room.',
+              replyOptions,
             );
             return;
           }
           if (command.name === 'new') {
             const title = command.args.join(' ').trim() || 'New Matrix session';
-            const created = runtime.startNewSession(sourceKey, title);
+            const created = runtime.startNewSession(sourceKey, title, `matrix:${message.eventId}`);
             await matrix.sendText(
               message.roomId,
               `Started session **${created.session.title}** (${created.session.id}).`,
+              replyOptions,
             );
             return;
           }
           if (command.name === 'switch') {
             if (command.args.length !== 1) {
-              await matrix.sendText(message.roomId, 'Usage: `/switch <session-id>`');
+              await matrix.sendText(message.roomId, 'Usage: `/switch <session-id>`', replyOptions);
               return;
             }
             try {
@@ -337,11 +442,13 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
               await matrix.sendText(
                 message.roomId,
                 `Switched to **${switched.session.title}** (${switched.session.id}).`,
+                replyOptions,
               );
             } catch (error) {
               await matrix.sendText(
                 message.roomId,
                 `Session switch failed: ${error instanceof Error ? error.message : String(error)}`,
+                replyOptions,
               );
             }
             return;
@@ -349,20 +456,34 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
           await matrix.sendText(
             message.roomId,
             `Unknown command: "/${command.name}"\n\n${matrixHelpText()}`,
+            replyOptions,
           );
           return;
         }
         const created = runtime.getOrCreateSession(sourceKey, `Matrix ${message.roomId}`);
-        process.stdout.write(
-          `[Matrix] received room=${message.roomId} sender=${message.sender} event=${message.eventId}\n`,
+        const responseThreadRootEventId = effectiveConfig.matrix.autoThread
+          ? (message.threadRootEventId ?? message.eventId)
+          : message.threadRootEventId;
+        const threadSourceKey = matrixConversationThreadSourceKey(
+          sourceKey,
+          message,
+          effectiveConfig.matrix.autoThread ?? false,
         );
-        await bestEffortMatrix('typing notification', () => matrix.setTyping(message.roomId, true));
+        const thread = runtime.getOrCreateThread(
+          created.session.id,
+          threadSourceKey,
+          responseThreadRootEventId ? `Matrix thread ${responseThreadRootEventId}` : 'Main thread',
+        );
+        process.stdout.write(
+          `[Matrix] received room=${message.roomId} sender=${message.sender} event=${message.eventId} thread=${thread.id}\n`,
+        );
         const progress: MatrixProgress = {
           roomId: message.roomId,
-          pending: '🧠 NUAAI is working on this…',
+          sourceEventId: message.eventId,
+          ...(responseThreadRootEventId ? { threadRootEventId: responseThreadRootEventId } : {}),
         };
-        progressByThread.set(created.thread.id, progress);
-        await flushProgress(progress);
+        progressByThread.set(thread.id, progress);
+        startTyping(progress);
         const images: ProviderImage[] = [];
         const transcriptions: string[] = [];
         const attachmentContext: string[] = [];
@@ -451,12 +572,10 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
         let runId: string | undefined;
         try {
           const run = runtime.startRun({
-            threadId: created.thread.id,
+            threadId: thread.id,
             input: [message.body, ...(attachmentContext ?? []), ...transcriptions].join('\n'),
-            permissions: {
-              approved: new Set(['read', 'write', 'execute']),
-              capabilities: { filesystem: true, subprocess: true, network: true },
-            },
+            idempotencyKey: `matrix:${message.eventId}`,
+            permissions: permissionContextForProfile(effectiveConfig.permissions.matrix),
             ...(images.length ? { images } : {}),
           });
           runId = run.id;
@@ -468,40 +587,51 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
           const output =
             completed.status === 'completed'
               ? completed.output.trim() || 'NUAAI completed the run without text output.'
-              : `NUAAI run ${completed.status}. The run did not complete successfully.`;
-          scheduleProgress(
-            progress,
-            completed.status === 'completed' ? '✅ NUAAI finished' : `⚠️ NUAAI ${completed.status}`,
+              : completed.output.trim() ||
+                `NUAAI run ${completed.status}. The run did not complete successfully.`;
+          await bestEffortMatrix('status reaction', () =>
+            setStatusReaction(
+              progress,
+              completed.status === 'completed'
+                ? '✅'
+                : completed.status === 'cancelled'
+                  ? '🛑'
+                  : '⚠️',
+            ),
           );
+          const terminalProgress = matrixTerminalProgress(completed.status);
+          if (terminalProgress) scheduleProgress(progress, terminalProgress);
           await flushProgress(progress);
-          await matrix.sendOutput(message.roomId, output.slice(0, 60_000));
+          await matrix.sendOutput(message.roomId, output, {
+            ...(progress.threadRootEventId
+              ? { threadRootEventId: progress.threadRootEventId }
+              : {}),
+            transactionId: `run-${run.id}-output`,
+          });
           if (voiceState.ttsEnabled && completed.status === 'completed') {
             try {
               const speech = await audio.synthesize(output.slice(0, 20_000));
-              await matrix.sendAudio(message.roomId, speech.path);
+              await matrix.sendAudio(
+                message.roomId,
+                speech.path,
+                progress.threadRootEventId ? { threadRootEventId: progress.threadRootEventId } : {},
+              );
             } catch (error) {
               reportMatrixSignalFailure('voice response', error);
             }
           }
         } finally {
           if (progress.timer) clearTimeout(progress.timer);
-          progressByThread.delete(created.thread.id);
+          await stopTyping(progress);
+          progressByThread.delete(thread.id);
           if (runId) progressByRun.delete(runId);
-          await bestEffortMatrix('typing notification', () =>
-            matrix.setTyping(message.roomId, false),
-          );
         }
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         process.stderr.write(
           `[Matrix] message delivery failed room=${message.roomId} event=${message.eventId}: ${detail}\n`,
         );
-        await bestEffortMatrix('error response', async () => {
-          await matrix.sendText(
-            message.roomId,
-            'NUAAI could not complete or deliver this response.',
-          );
-        });
+        throw error;
       }
     });
     unsubscribeMatrixRuntime = unsubscribe;
@@ -511,10 +641,13 @@ export async function startDaemon(root = process.cwd()): Promise<DaemonHandle> {
     if (stopped) return;
     stopped = true;
     matrix?.stop();
+    await matrixSinceWrite;
     unsubscribeMatrixRuntime?.();
-    mcp.stop();
     scheduler.stop();
+    await runtime.shutdown();
+    mcp.stop();
     await gateway.close();
+    await providers.close();
     store.close();
     await daemonLock.release();
   };

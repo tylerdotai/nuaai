@@ -3,6 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 
+import { sanitizedSubprocessEnvironment } from '../security/environment.js';
+import { assertSafeProjectFile } from '../workspace/fs.js';
+
 const maxHelperOutputBytes = 2_000_000;
 const maxHelperErrorBytes = 20_000;
 
@@ -126,9 +129,7 @@ export class LocalAudioBridge {
   }
 
   private async assertInput(inputPath: string): Promise<string> {
-    const target = resolve(inputPath);
-    if (!withinRoot(this.allowedRoot, target))
-      throw new Error('Transcription input escapes the allowed root');
+    const target = await assertSafeProjectFile(this.allowedRoot, inputPath);
     const input = await stat(target).catch(() => undefined);
     if (!input?.isFile())
       throw new Error(`Transcription input is not a regular file: ${inputPath}`);
@@ -139,7 +140,7 @@ export class LocalAudioBridge {
     return new Promise((resolvePromise, reject) => {
       const child = spawn(this.config.pythonCommand, [this.config.scriptPath, ...args], {
         cwd: this.allowedRoot,
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+        env: sanitizedSubprocessEnvironment({ PYTHONUNBUFFERED: '1' }),
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
       });

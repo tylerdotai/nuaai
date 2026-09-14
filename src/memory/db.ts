@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import Database from 'better-sqlite3';
@@ -40,6 +40,7 @@ export interface ThreadRow {
   id: string;
   sessionId: string;
   title: string;
+  sourceKey: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -51,6 +52,28 @@ export interface MessageRow {
   content: string;
   provider: string | null;
   model: string | null;
+  createdAt: number;
+}
+
+export interface MessagePage {
+  messages: MessageRow[];
+  nextCursor: number;
+  hasMore: boolean;
+}
+
+export interface ThreadSummaryRow {
+  threadId: string;
+  summary: string;
+  throughMessageId: string;
+  messageCount: number;
+  version: number;
+  updatedAt: number;
+}
+
+export interface MessageArtifactRow {
+  messageId: string;
+  kind: string;
+  payload: Record<string, unknown>;
   createdAt: number;
 }
 
@@ -66,6 +89,12 @@ export interface RunRow {
   createdAt: number;
   updatedAt: number;
   correlationId: string;
+}
+
+export interface EventPage {
+  events: Array<EventRecord & { id: number }>;
+  nextCursor: number;
+  hasMore: boolean;
 }
 
 export interface TaskRow {
@@ -113,6 +142,7 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
       title TEXT NOT NULL,
+      source_key TEXT UNIQUE,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -124,6 +154,21 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       provider TEXT,
       model TEXT,
       created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS message_artifacts (
+      message_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (message_id, kind)
+    );
+    CREATE TABLE IF NOT EXISTS thread_summaries (
+      thread_id TEXT PRIMARY KEY,
+      summary TEXT NOT NULL,
+      through_message_id TEXT NOT NULL,
+      message_count INTEGER NOT NULL,
+      version INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS runs (
       id TEXT PRIMARY KEY,
@@ -137,6 +182,13 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       correlation_id TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS run_writers (
+      thread_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL UNIQUE,
+      owner_id TEXT NOT NULL,
+      claimed_at INTEGER NOT NULL,
+      lease_until INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,8 +262,11 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS events_created_at_idx ON events(created_at, id);
+    CREATE INDEX IF NOT EXISTS events_session_id_idx ON events(session_id, id);
+    CREATE INDEX IF NOT EXISTS events_thread_id_idx ON events(thread_id, id);
     CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages(thread_id, created_at);
     CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs(thread_id, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS runs_correlation_id_idx ON runs(correlation_id);
     CREATE TABLE IF NOT EXISTS memory_vector_refs (
       memory_id TEXT PRIMARY KEY,
       vector_rowid INTEGER NOT NULL
@@ -243,10 +298,41 @@ function createSchema(db: MemoryDatabase, vector = false): void {
   }
 }
 
+function archiveDuplicateSourceBindings(db: MemoryDatabase, table: 'sessions' | 'threads'): void {
+  const rows = db
+    .prepare(
+      `SELECT rowid AS rowId, id, source_key AS sourceKey
+       FROM ${table}
+       WHERE source_key IS NOT NULL
+       ORDER BY source_key, updated_at DESC, rowid DESC`,
+    )
+    .all() as Array<{ rowId: number; id: string; sourceKey: string }>;
+  const seen = new Set<string>();
+  const exists = db.prepare(`SELECT 1 FROM ${table} WHERE source_key = ? AND id <> ?`);
+  const update = db.prepare(`UPDATE ${table} SET source_key = ? WHERE id = ?`);
+  const migrate = db.transaction(() => {
+    for (const row of rows) {
+      if (!seen.has(row.sourceKey)) {
+        seen.add(row.sourceKey);
+        continue;
+      }
+      let archived = `${row.sourceKey}:history:${row.id}:legacy:${row.rowId}`;
+      let suffix = 1;
+      while (exists.get(archived, row.id)) archived = `${archived}:${suffix++}`;
+      update.run(archived, row.id);
+      seen.add(archived);
+    }
+  });
+  migrate();
+}
+
 function openRaw(root: string, loadVector = false): MemoryDatabase {
   const directory = workspaceDirectory(root);
-  mkdirSync(directory, { recursive: true });
-  const db = new Database(join(directory, 'memory.db'));
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(directory, 0o700);
+  const path = join(directory, 'memory.db');
+  const db = new Database(path);
+  chmodSync(path, 0o600);
   db.pragma('journal_mode = WAL');
   if (loadVector) loadSqliteVec(db);
   createSchema(db, loadVector);
@@ -255,8 +341,16 @@ function openRaw(root: string, loadVector = false): MemoryDatabase {
     db.exec('ALTER TABLE sessions ADD COLUMN source_key TEXT');
   if (!sessionColumns.some((column) => column.name === 'context'))
     db.exec("ALTER TABLE sessions ADD COLUMN context TEXT NOT NULL DEFAULT ''");
+  const threadColumns = db.prepare('PRAGMA table_info(threads)').all() as Array<{ name: string }>;
+  if (!threadColumns.some((column) => column.name === 'source_key'))
+    db.exec('ALTER TABLE threads ADD COLUMN source_key TEXT');
+  archiveDuplicateSourceBindings(db, 'sessions');
+  archiveDuplicateSourceBindings(db, 'threads');
   db.exec(
     'CREATE UNIQUE INDEX IF NOT EXISTS sessions_source_key_idx ON sessions(source_key) WHERE source_key IS NOT NULL',
+  );
+  db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS threads_source_key_idx ON threads(source_key) WHERE source_key IS NOT NULL',
   );
   return db;
 }
@@ -288,6 +382,10 @@ export function listMemories(db: MemoryDatabase): MemoryRow[] {
 export class DatabaseStore {
   constructor(readonly database: AppDatabase) {}
 
+  transaction<T>(action: () => T): T {
+    return this.database.raw.transaction(action)();
+  }
+
   close(): void {
     this.database.raw.close();
   }
@@ -317,7 +415,53 @@ export class DatabaseStore {
     const rows = this.database.raw
       .prepare('SELECT * FROM events WHERE id > ? ORDER BY id ASC LIMIT ?')
       .all(afterId, limit) as Array<Record<string, unknown>>;
-    return rows.map((row) => ({
+    return rows.map((row) => this.eventFromRow(row));
+  }
+
+  listEventsForSession(sessionId: string, afterId = 0, limit = 200): EventPage {
+    return this.listScopedEvents('session_id', sessionId, afterId, limit);
+  }
+
+  listEventsForThread(threadId: string, afterId = 0, limit = 200): EventPage {
+    return this.listScopedEvents('thread_id', threadId, afterId, limit);
+  }
+
+  listRecentEventsForRun(runId: string, limit = 200): Array<EventRecord & { id: number }> {
+    const boundedLimit = Number.isFinite(limit)
+      ? Math.min(1_000, Math.max(1, Math.trunc(limit)))
+      : 200;
+    const rows = this.database.raw
+      .prepare(
+        'SELECT * FROM (SELECT * FROM events WHERE run_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC',
+      )
+      .all(runId, boundedLimit) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.eventFromRow(row));
+  }
+
+  private listScopedEvents(
+    column: 'session_id' | 'thread_id',
+    value: string,
+    afterId: number,
+    limit: number,
+  ): EventPage {
+    const boundedLimit = Number.isFinite(limit)
+      ? Math.min(1_000, Math.max(1, Math.trunc(limit)))
+      : 200;
+    const boundedAfter = Number.isFinite(afterId) ? Math.max(0, Math.trunc(afterId)) : 0;
+    const rows = this.database.raw
+      .prepare(`SELECT * FROM events WHERE ${column} = ? AND id > ? ORDER BY id ASC LIMIT ?`)
+      .all(value, boundedAfter, boundedLimit + 1) as Array<Record<string, unknown>>;
+    const hasMore = rows.length > boundedLimit;
+    const events = rows.slice(0, boundedLimit).map((row) => this.eventFromRow(row));
+    return {
+      events,
+      nextCursor: events.at(-1)?.id ?? boundedAfter,
+      hasMore,
+    };
+  }
+
+  private eventFromRow(row: Record<string, unknown>): EventRecord & { id: number } {
+    return {
       id: Number(row.id),
       eventId: String(row.event_id),
       schemaVersion: Number(row.schema_version) as 1,
@@ -330,7 +474,7 @@ export class DatabaseStore {
       correlationId: String(row.correlation_id),
       createdAt: Number(row.created_at),
       payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
-    }));
+    };
   }
 
   createSession(
@@ -338,9 +482,10 @@ export class DatabaseStore {
     now = Date.now(),
     context = '',
     sourceKey: string | null = null,
+    id: string = randomUUID(),
   ): { session: SessionRow; thread: ThreadRow } {
     const session: SessionRow = {
-      id: randomUUID(),
+      id,
       title,
       status: 'active',
       sourceKey,
@@ -352,6 +497,7 @@ export class DatabaseStore {
       id: randomUUID(),
       sessionId: session.id,
       title: 'Main thread',
+      sourceKey: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -363,20 +509,19 @@ export class DatabaseStore {
         .run(session.id, session.title, session.status, sourceKey, context, now, now);
       this.database.raw
         .prepare(
-          'INSERT INTO threads (id, session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+          'INSERT INTO threads (id, session_id, title, source_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
         )
-        .run(thread.id, thread.sessionId, thread.title, now, now);
+        .run(thread.id, thread.sessionId, thread.title, thread.sourceKey, now, now);
     });
     transaction();
     return { session, thread };
   }
 
-  listSessions(): SessionRow[] {
-    return this.database.raw
-      .prepare(
-        'SELECT id, title, status, source_key AS sourceKey, context, created_at AS createdAt, updated_at AS updatedAt FROM sessions ORDER BY updated_at DESC',
-      )
-      .all() as SessionRow[];
+  listSessions(includeOrphans = true): SessionRow[] {
+    const query = includeOrphans
+      ? 'SELECT id, title, status, source_key AS sourceKey, context, created_at AS createdAt, updated_at AS updatedAt FROM sessions ORDER BY updated_at DESC, rowid DESC'
+      : 'SELECT id, title, status, source_key AS sourceKey, context, created_at AS createdAt, updated_at AS updatedAt FROM sessions WHERE source_key IS NOT NULL ORDER BY updated_at DESC, rowid DESC';
+    return this.database.raw.prepare(query).all() as SessionRow[];
   }
 
   getSessionBySource(sourceKey: string): SessionRow | undefined {
@@ -387,20 +532,26 @@ export class DatabaseStore {
       .get(sourceKey) as SessionRow | undefined;
   }
 
-  createThread(sessionId: string, title = 'New thread', now = Date.now()): ThreadRow {
+  createThread(
+    sessionId: string,
+    title = 'New thread',
+    now = Date.now(),
+    sourceKey: string | null = null,
+  ): ThreadRow {
     if (!this.getSession(sessionId)) throw new Error(`Unknown session: ${sessionId}`);
     const thread: ThreadRow = {
       id: randomUUID(),
       sessionId,
       title,
+      sourceKey,
       createdAt: now,
       updatedAt: now,
     };
     this.database.raw
       .prepare(
-        'INSERT INTO threads (id, session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+        'INSERT INTO threads (id, session_id, title, source_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
       )
-      .run(thread.id, thread.sessionId, thread.title, now, now);
+      .run(thread.id, thread.sessionId, thread.title, thread.sourceKey, now, now);
     return thread;
   }
 
@@ -424,10 +575,24 @@ export class DatabaseStore {
       .run(sourceKey, now, id);
   }
 
+  setThreadSourceKey(id: string, sourceKey: string | null, now = Date.now()): void {
+    this.database.raw
+      .prepare('UPDATE threads SET source_key = ?, updated_at = ? WHERE id = ?')
+      .run(sourceKey, now, id);
+  }
+
+  getThreadBySource(sourceKey: string): ThreadRow | undefined {
+    return this.database.raw
+      .prepare(
+        'SELECT id, session_id AS sessionId, title, source_key AS sourceKey, created_at AS createdAt, updated_at AS updatedAt FROM threads WHERE source_key = ?',
+      )
+      .get(sourceKey) as ThreadRow | undefined;
+  }
+
   getThread(id: string): ThreadRow | undefined {
     return this.database.raw
       .prepare(
-        'SELECT id, session_id AS sessionId, title, created_at AS createdAt, updated_at AS updatedAt FROM threads WHERE id = ?',
+        'SELECT id, session_id AS sessionId, title, source_key AS sourceKey, created_at AS createdAt, updated_at AS updatedAt FROM threads WHERE id = ?',
       )
       .get(id) as ThreadRow | undefined;
   }
@@ -435,7 +600,7 @@ export class DatabaseStore {
   listThreads(sessionId: string): ThreadRow[] {
     return this.database.raw
       .prepare(
-        'SELECT id, session_id AS sessionId, title, created_at AS createdAt, updated_at AS updatedAt FROM threads WHERE session_id = ? ORDER BY updated_at DESC',
+        'SELECT id, session_id AS sessionId, title, source_key AS sourceKey, created_at AS createdAt, updated_at AS updatedAt FROM threads WHERE session_id = ? ORDER BY updated_at DESC',
       )
       .all(sessionId) as ThreadRow[];
   }
@@ -466,12 +631,164 @@ export class DatabaseStore {
     return message;
   }
 
-  listMessages(threadId: string, limit = 100): MessageRow[] {
-    return this.database.raw
+  storeMessageArtifact(
+    messageId: string,
+    kind: string,
+    payload: Record<string, unknown>,
+    now = Date.now(),
+  ): void {
+    this.database.raw
       .prepare(
-        'SELECT id, thread_id AS threadId, role, content, provider, model, created_at AS createdAt FROM messages WHERE thread_id = ? ORDER BY created_at ASC LIMIT ?',
+        'INSERT OR REPLACE INTO message_artifacts (message_id, kind, payload, created_at) VALUES (?, ?, ?, ?)',
+      )
+      .run(messageId, kind, JSON.stringify(redactValue(payload)), now);
+  }
+
+  listMessageArtifacts(messageId: string): MessageArtifactRow[] {
+    const rows = this.database.raw
+      .prepare(
+        'SELECT message_id AS messageId, kind, payload, created_at AS createdAt FROM message_artifacts WHERE message_id = ? ORDER BY created_at ASC',
+      )
+      .all(messageId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      messageId: String(row.messageId),
+      kind: String(row.kind),
+      payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
+      createdAt: Number(row.createdAt),
+    }));
+  }
+
+  listThreadArtifacts(threadId: string): MessageArtifactRow[] {
+    const rows = this.database.raw
+      .prepare(
+        'SELECT a.message_id AS messageId, a.kind, a.payload, a.created_at AS createdAt FROM message_artifacts a JOIN messages m ON m.id = a.message_id WHERE m.thread_id = ? ORDER BY a.created_at ASC',
+      )
+      .all(threadId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      messageId: String(row.messageId),
+      kind: String(row.kind),
+      payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
+      createdAt: Number(row.createdAt),
+    }));
+  }
+
+  listMessages(threadId: string, limit = 100): MessageRow[] {
+    const messages = this.database.raw
+      .prepare(
+        'SELECT id, thread_id AS threadId, role, content, provider, model, created_at AS createdAt FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT ?',
       )
       .all(threadId, limit) as MessageRow[];
+    return messages.reverse();
+  }
+
+  listMessagePage(threadId: string, beforeRowId?: number, limit = 100): MessagePage {
+    const boundedLimit = Number.isFinite(limit)
+      ? Math.min(500, Math.max(1, Math.trunc(limit)))
+      : 100;
+    const before =
+      beforeRowId !== undefined && Number.isFinite(beforeRowId)
+        ? Math.max(1, Math.trunc(beforeRowId))
+        : Number.MAX_SAFE_INTEGER;
+    const rows = this.database.raw
+      .prepare(
+        'SELECT rowid AS rowId, id, thread_id AS threadId, role, content, provider, model, created_at AS createdAt FROM messages WHERE thread_id = ? AND rowid < ? ORDER BY rowid DESC LIMIT ?',
+      )
+      .all(threadId, before, boundedLimit + 1) as Array<MessageRow & { rowId: number }>;
+    const hasMore = rows.length > boundedLimit;
+    const selected = rows.slice(0, boundedLimit);
+    const nextCursor = selected.at(-1)?.rowId ?? before;
+    const messages = selected.reverse().map(({ rowId: _rowId, ...message }) => message);
+    return { messages, nextCursor, hasMore };
+  }
+
+  getThreadSummary(threadId: string): ThreadSummaryRow | undefined {
+    const row = this.database.raw
+      .prepare(
+        'SELECT thread_id AS threadId, summary, through_message_id AS throughMessageId, message_count AS messageCount, version, updated_at AS updatedAt FROM thread_summaries WHERE thread_id = ?',
+      )
+      .get(threadId) as ThreadSummaryRow | undefined;
+    return row;
+  }
+
+  compactThread(
+    threadId: string,
+    keepMessages = 80,
+    maxSummaryBytes = 12_000,
+  ): ThreadSummaryRow | undefined {
+    const messages = this.listMessages(threadId, 100_000);
+    if (messages.length <= keepMessages) return this.getThreadSummary(threadId);
+    let split = messages.length - keepMessages;
+    while (split > 0 && messages[split]?.role === 'tool') split -= 1;
+    if (split <= 0) return this.getThreadSummary(threadId);
+    const compacted = messages.slice(0, split);
+    const lines = compacted.map((message) => `${message.role}: ${message.content}`);
+    let summary = lines.join('\n');
+    if (Buffer.byteLength(summary, 'utf8') > maxSummaryBytes) {
+      summary = summary.slice(-Math.max(0, maxSummaryBytes - 48));
+      summary = `[older transcript truncated]\n${summary}`;
+    }
+    const previous = this.getThreadSummary(threadId);
+    const summaryRow: ThreadSummaryRow = {
+      threadId,
+      summary,
+      throughMessageId: compacted[compacted.length - 1].id,
+      messageCount: compacted.length,
+      version: (previous?.version ?? 0) + 1,
+      updatedAt: Date.now(),
+    };
+    this.database.raw
+      .prepare(
+        'INSERT INTO thread_summaries (thread_id, summary, through_message_id, message_count, version, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET summary = excluded.summary, through_message_id = excluded.through_message_id, message_count = excluded.message_count, version = excluded.version, updated_at = excluded.updated_at',
+      )
+      .run(
+        summaryRow.threadId,
+        summaryRow.summary,
+        summaryRow.throughMessageId,
+        summaryRow.messageCount,
+        summaryRow.version,
+        summaryRow.updatedAt,
+      );
+    return summaryRow;
+  }
+
+  listContextMessages(
+    threadId: string,
+    limit = 100,
+  ): Array<MessageRow | { role: 'system'; content: string }> {
+    const summary = this.getThreadSummary(threadId);
+    if (!summary) return this.listMessages(threadId, limit);
+    const messages = this.listMessages(threadId, 100_000);
+    const index = messages.findIndex((message) => message.id === summary.throughMessageId);
+    const recent = (index >= 0 ? messages.slice(index + 1) : messages).slice(-limit);
+    return [
+      {
+        role: 'system',
+        content: `Compacted transcript summary v${summary.version} through ${summary.throughMessageId}:\n${summary.summary}`,
+      },
+      ...recent,
+    ];
+  }
+
+  listContextMessagesThrough(
+    threadId: string,
+    throughMessageId: string,
+    limit = 100,
+  ): Array<MessageRow | { role: 'system'; content: string }> {
+    const messages = this.listMessages(threadId, 100_000);
+    const throughIndex = messages.findIndex((message) => message.id === throughMessageId);
+    if (throughIndex < 0) throw new Error(`Unknown message: ${throughMessageId}`);
+    const through = messages.slice(0, throughIndex + 1);
+    const summary = this.getThreadSummary(threadId);
+    if (!summary) return through.slice(-limit);
+    const summaryIndex = messages.findIndex((message) => message.id === summary.throughMessageId);
+    if (summaryIndex < 0 || summaryIndex > throughIndex) return through.slice(-limit);
+    return [
+      {
+        role: 'system',
+        content: `Compacted transcript summary v${summary.version} through ${summary.throughMessageId}:\n${summary.summary}`,
+      },
+      ...through.slice(summaryIndex + 1).slice(-limit),
+    ];
   }
 
   createRun(
@@ -525,11 +842,86 @@ export class DatabaseStore {
     };
   }
 
+  listRuns(threadId: string, limit = 10): RunRow[] {
+    const boundedLimit = Math.min(20, Math.max(1, Math.trunc(limit)));
+    const rows = this.database.raw
+      .prepare(
+        'SELECT id FROM runs WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?',
+      )
+      .all(threadId, boundedLimit) as Array<{ id: string }>;
+    return rows.map(({ id }) => this.getRun(id)).filter((run): run is RunRow => Boolean(run));
+  }
+
+  getLatestRun(threadId: string): RunRow | undefined {
+    const row = this.database.raw
+      .prepare(
+        'SELECT id FROM runs WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1',
+      )
+      .get(threadId) as { id: string } | undefined;
+    return row ? this.getRun(row.id) : undefined;
+  }
+
+  getRunByCorrelationId(correlationId: string): RunRow | undefined {
+    const row = this.database.raw
+      .prepare('SELECT id FROM runs WHERE correlation_id = ?')
+      .get(correlationId) as { id: string } | undefined;
+    return row ? this.getRun(row.id) : undefined;
+  }
+
   listActiveRuns(): RunRow[] {
     const rows = this.database.raw
       .prepare("SELECT id FROM runs WHERE status IN ('queued', 'running') ORDER BY created_at")
       .all() as Array<{ id: string }>;
     return rows.map(({ id }) => this.getRun(id)).filter((run): run is RunRow => Boolean(run));
+  }
+
+  listActiveRunsForThread(threadId: string): RunRow[] {
+    const rows = this.database.raw
+      .prepare(
+        "SELECT id FROM runs WHERE thread_id = ? AND status IN ('queued', 'running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at ASC, rowid ASC",
+      )
+      .all(threadId) as Array<{ id: string }>;
+    return rows.map(({ id }) => this.getRun(id)).filter((run): run is RunRow => Boolean(run));
+  }
+
+  claimRunWriter(
+    threadId: string,
+    runId: string,
+    ownerId: string,
+    leaseMs = 120_000,
+    now = Date.now(),
+  ): boolean {
+    const claim = this.database.raw.transaction(() => {
+      const current = this.database.raw
+        .prepare(
+          'SELECT run_id AS runId, owner_id AS ownerId, lease_until AS leaseUntil FROM run_writers WHERE thread_id = ?',
+        )
+        .get(threadId) as { runId: string; ownerId: string; leaseUntil: number } | undefined;
+      if (
+        current &&
+        current.leaseUntil > now &&
+        current.runId !== runId &&
+        current.ownerId !== ownerId
+      )
+        return false;
+      this.database.raw
+        .prepare(
+          'INSERT INTO run_writers (thread_id, run_id, owner_id, claimed_at, lease_until) VALUES (?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET run_id = excluded.run_id, owner_id = excluded.owner_id, claimed_at = excluded.claimed_at, lease_until = excluded.lease_until',
+        )
+        .run(threadId, runId, ownerId, now, now + leaseMs);
+      return true;
+    });
+    return claim();
+  }
+
+  releaseRunWriter(threadId: string, runId: string, ownerId: string): void {
+    this.database.raw
+      .prepare('DELETE FROM run_writers WHERE thread_id = ? AND run_id = ? AND owner_id = ?')
+      .run(threadId, runId, ownerId);
+  }
+
+  releaseAllRunWriters(): void {
+    this.database.raw.prepare('DELETE FROM run_writers').run();
   }
 
   updateRun(
@@ -629,6 +1021,34 @@ export class DatabaseStore {
           : undefined;
       })
       .filter((memory): memory is NonNullable<typeof memory> => Boolean(memory));
+  }
+
+  searchMemoryLexical(
+    query: string,
+    limit = 8,
+  ): Array<{
+    id: string;
+    content: string;
+    metadata: Record<string, unknown>;
+    score: number;
+    createdAt: number;
+  }> {
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+    return this.searchMemoryRows()
+      .map((memory) => {
+        const haystack = memory.content.toLowerCase();
+        const score = terms.reduce((total, term) => total + (haystack.includes(term) ? 1 : 0), 0);
+        return {
+          id: memory.id,
+          content: memory.content,
+          metadata: memory.metadata,
+          score,
+          createdAt: memory.createdAt,
+        };
+      })
+      .filter((memory) => memory.score > 0)
+      .sort((left, right) => right.score - left.score || right.createdAt - left.createdAt)
+      .slice(0, limit);
   }
 
   deleteMemory(id: string): boolean {

@@ -2,7 +2,9 @@ import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { type Interface, createInterface } from 'node:readline';
 
 import type { RuntimeConfig } from '../config/index.js';
+import { sanitizedSubprocessEnvironment } from '../security/environment.js';
 import type { PermissionContext, PermissionLevel } from '../security/permissions.js';
+import { getVersion } from '../version.js';
 
 export interface McpToolSchema {
   name: string;
@@ -37,7 +39,7 @@ class McpServerClient {
     const child = spawn(this.config.command, this.config.args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
-      env: { ...process.env, ...this.config.env },
+      env: sanitizedSubprocessEnvironment(this.config.env),
     });
     this.process = child;
     child.on('error', (error) => this.failPending(error));
@@ -50,7 +52,7 @@ class McpServerClient {
     await this.request(child, 'initialize', {
       protocolVersion: '2025-06-18',
       capabilities: {},
-      clientInfo: { name: 'nuaai', version: '0.1.0' },
+      clientInfo: { name: 'nuaai', version: getVersion() },
     });
     this.notify('notifications/initialized', {});
     const response = (await this.request(child, 'tools/list', {})) as {
@@ -76,7 +78,11 @@ class McpServerClient {
     return this.tools;
   }
 
-  async call(tool: McpToolSchema, argumentsValue: Record<string, unknown>): Promise<unknown> {
+  async call(
+    tool: McpToolSchema,
+    argumentsValue: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
     const result = (await this.request(
       this.process as ChildProcessWithoutNullStreams,
       'tools/call',
@@ -84,6 +90,7 @@ class McpServerClient {
         name: tool.remoteName,
         arguments: argumentsValue,
       },
+      signal,
     )) as {
       isError?: boolean;
       structuredContent?: unknown;
@@ -112,29 +119,52 @@ class McpServerClient {
     process: ChildProcessWithoutNullStreams,
     method: string,
     params: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
+      const rejectReason = (): Error =>
+        signal?.reason instanceof Error ? signal.reason : new Error('MCP request cancelled');
+      if (signal?.aborted) {
+        reject(rejectReason());
+        return;
+      }
+      const cleanup = (): void => signal?.removeEventListener('abort', abort);
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        cleanup();
         reject(new Error(`MCP request timed out: ${this.name}.${method}`));
       }, 30_000);
+      const abort = (): void => {
+        if (!this.pending.delete(id)) return;
+        clearTimeout(timer);
+        cleanup();
+        this.notify('notifications/cancelled', {
+          requestId: id,
+          reason: rejectReason().message,
+        });
+        reject(rejectReason());
+      };
       this.pending.set(id, {
         resolve: (value) => {
           clearTimeout(timer);
+          cleanup();
           resolve(value);
         },
         reject: (error) => {
           clearTimeout(timer);
+          cleanup();
           reject(error);
         },
       });
+      signal?.addEventListener('abort', abort, { once: true });
       process.stdin.write(
         `${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`,
         (error) => {
           if (error) {
             this.pending.delete(id);
             clearTimeout(timer);
+            cleanup();
             reject(error);
           }
         },
@@ -208,6 +238,7 @@ export class McpManager {
     name: string,
     argumentsValue: Record<string, unknown>,
     permissions: PermissionContext,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const allTools = [...this.servers.values()].flatMap((server) => server.listTools());
     const tool = allTools.find((candidate) => candidate.name === name);
@@ -215,7 +246,7 @@ export class McpManager {
     if (!permissions.approved.has(tool.permission))
       throw new Error(`Permission required: ${tool.permission}`);
     const server = this.servers.get(tool.server) as McpServerClient;
-    return server.call(tool, argumentsValue);
+    return server.call(tool, argumentsValue, signal);
   }
 
   status(): {
@@ -252,6 +283,7 @@ export class McpManager {
     action: string,
     args: Record<string, unknown>,
     permissions: PermissionContext,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const actionName = action.trim().toLowerCase();
     const readActions = new Set(['capture', 'list_apps', 'list_windows']);
@@ -368,7 +400,7 @@ export class McpManager {
     if (!tool) throw new Error(`Computer-use MCP tool unavailable: ${remoteName}`);
     const server = this.servers.get(tool.server);
     if (!server) throw new Error(`Computer-use MCP server unavailable: ${tool.server}`);
-    return server.call(tool, forwarded);
+    return server.call(tool, forwarded, signal);
   }
   stop(): void {
     for (const server of this.servers.values()) server.stop();

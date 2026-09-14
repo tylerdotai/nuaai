@@ -1,17 +1,30 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { basename, resolve, sep } from 'node:path';
+import { basename, resolve } from 'node:path';
+
+import { assertSafeProjectFile } from '../workspace/fs.js';
 
 export interface MatrixConfig {
   homeserverUrl: string;
   accessToken: string;
   userId: string;
   pollTimeoutMs?: number;
+  retryDelayMs?: number;
   since?: string;
-  onSince?: (since: string) => void;
+  onSince?: (since: string) => void | Promise<void>;
   downloadDirectory?: string;
   workspaceRoot?: string;
   maxAttachmentBytes?: number;
+  allowedUsers?: string[];
+  allowedRooms?: string[];
+  freeResponseRooms?: string[];
+  ignoreUserPatterns?: string[];
+  requireMention?: boolean;
+  processNotices?: boolean;
+  allowRoomMentions?: boolean;
+  autoThread?: boolean;
+  reactions?: boolean;
+  maxMessageLength?: number;
 }
 
 export interface MatrixAttachment {
@@ -28,7 +41,41 @@ export interface MatrixMessage {
   eventId: string;
   sender: string;
   body: string;
+  threadRootEventId?: string;
   attachments?: MatrixAttachment[];
+}
+
+export function matrixConversationThreadSourceKey(
+  sourceKey: string,
+  message: Pick<MatrixMessage, 'threadRootEventId'>,
+  autoThread: boolean,
+): string {
+  return autoThread ? `${sourceKey}:main` : `${sourceKey}:${message.threadRootEventId ?? 'main'}`;
+}
+
+export function matrixReplyOptions(
+  message: Pick<MatrixMessage, 'eventId' | 'threadRootEventId'>,
+): MatrixRelationOptions {
+  return {
+    ...(message.threadRootEventId ? { threadRootEventId: message.threadRootEventId } : {}),
+    transactionId: `event-${Buffer.from(message.eventId).toString('base64url')}-reply`,
+  };
+}
+
+export interface MatrixRelationOptions {
+  threadRootEventId?: string;
+  transactionId?: string;
+}
+
+interface MatrixMessageExtractionOptions {
+  allowedUsers?: string[];
+  allowedRooms?: string[];
+  freeResponseRooms?: string[];
+  ignoreUserPatterns?: string[];
+  requireMention?: boolean;
+  processNotices?: boolean;
+  allowRoomMentions?: boolean;
+  minimumTimestampMs?: number;
 }
 
 export interface MatrixCommand {
@@ -58,7 +105,56 @@ export function matrixHelpText(): string {
   ].join('\n');
 }
 
+export function matrixProgressText(eventType: string, name: string): string | undefined {
+  if (eventType === 'tool.failed') return `⚠️ ${name} failed`;
+  if (eventType === 'run.failed') return `⚠️ NUAAI run failed: ${name}`;
+  if (eventType === 'run.cancelled') return '🛑 NUAAI run cancelled';
+  return undefined;
+}
+
+export function matrixTerminalProgress(status: string): string | undefined {
+  return status === 'completed' ? undefined : `⚠️ NUAAI ${status}`;
+}
+
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+
+type MatrixEndpoint =
+  | 'sync'
+  | 'join'
+  | 'receipt'
+  | 'typing'
+  | 'message'
+  | 'reaction'
+  | 'redaction'
+  | 'media-upload'
+  | 'media-download'
+  | 'request';
+
+export class MatrixRequestError extends Error {
+  readonly status: number;
+  readonly errcode: string | undefined;
+  readonly retryAfterMs: number | undefined;
+  readonly endpoint: MatrixEndpoint;
+
+  constructor(options: {
+    status: number;
+    endpoint: MatrixEndpoint;
+    errcode?: string;
+    retryAfterMs?: number;
+    detail?: string;
+  }) {
+    const fields = [`status=${options.status}`];
+    if (options.errcode) fields.push(`errcode=${options.errcode}`);
+    if (options.retryAfterMs !== undefined) fields.push(`retry_after_ms=${options.retryAfterMs}`);
+    if (options.detail) fields.push(`message=${options.detail}`);
+    super(`Matrix ${options.endpoint} request failed: ${fields.join(' ')}`);
+    this.name = 'MatrixRequestError';
+    this.status = options.status;
+    this.errcode = options.errcode;
+    this.retryAfterMs = options.retryAfterMs;
+    this.endpoint = options.endpoint;
+  }
+}
 
 function apiUrl(homeserverUrl: string, path: string): URL {
   const base = homeserverUrl.endsWith('/') ? homeserverUrl : `${homeserverUrl}/`;
@@ -150,14 +246,59 @@ export function formatMatrixBody(body: string): {
   return { format: 'org.matrix.custom.html', formattedBody: html.join('') };
 }
 
-function assertOk(response: Response): void {
-  if (!response.ok) throw new Error(`Matrix request failed: ${response.status}`);
+function endpointCategory(url: URL): MatrixEndpoint {
+  const path = url.pathname;
+  if (path.endsWith('/sync')) return 'sync';
+  if (path.includes('/join/')) return 'join';
+  if (path.includes('/receipt/')) return 'receipt';
+  if (path.includes('/typing/')) return 'typing';
+  if (path.includes('/send/m.reaction/')) return 'reaction';
+  if (path.includes('/send/m.room.message/')) return 'message';
+  if (path.includes('/redact/')) return 'redaction';
+  if (path.endsWith('/upload')) return 'media-upload';
+  if (path.includes('/download/')) return 'media-download';
+  return 'request';
 }
 
-export function extractMatrixMessages(value: unknown, ownUserId: string): MatrixMessage[] {
+function sanitizeMatrixDetail(value: unknown, secrets: string[]): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  let sanitized = value.replace(/[\r\n\t]+/gu, ' ').trim();
+  for (const secret of secrets) if (secret) sanitized = sanitized.split(secret).join('[REDACTED]');
+  return sanitized.length <= 200 ? sanitized : `${sanitized.slice(0, 199)}…`;
+}
+
+async function matrixRequestError(
+  response: Response,
+  endpoint: MatrixEndpoint,
+  secrets: string[],
+): Promise<MatrixRequestError> {
+  const payload = (await response
+    .clone()
+    .json()
+    .catch(() => ({}))) as { errcode?: unknown; retry_after_ms?: unknown; error?: unknown };
+  const retryAfterMs = Number(payload.retry_after_ms);
+  const detail = sanitizeMatrixDetail(payload.error, secrets);
+  const errcode = sanitizeMatrixDetail(payload.errcode, secrets);
+  return new MatrixRequestError({
+    status: response.status,
+    endpoint,
+    ...(errcode && /^M_[A-Z0-9_]{1,78}$/u.test(errcode) ? { errcode } : {}),
+    ...(Number.isFinite(retryAfterMs) && retryAfterMs >= 0 ? { retryAfterMs } : {}),
+    ...(detail ? { detail } : {}),
+  });
+}
+
+export function extractMatrixMessages(
+  value: unknown,
+  ownUserId: string,
+  options: MatrixMessageExtractionOptions = {},
+): MatrixMessage[] {
   if (!value || typeof value !== 'object') return [];
   const rooms = (value as { rooms?: { join?: Record<string, unknown> } }).rooms?.join ?? {};
   const messages: MatrixMessage[] = [];
+  const ignoredUserPatterns = (options.ignoreUserPatterns ?? []).map(
+    (pattern) => new RegExp(pattern),
+  );
   for (const [roomId, room] of Object.entries(rooms)) {
     const events = (room as { timeline?: { events?: unknown[] } }).timeline?.events ?? [];
     for (const event of events) {
@@ -166,6 +307,7 @@ export function extractMatrixMessages(value: unknown, ownUserId: string): Matrix
         type?: string;
         sender?: string;
         event_id?: string;
+        origin_server_ts?: number;
         content?: {
           msgtype?: string;
           body?: string;
@@ -173,9 +315,40 @@ export function extractMatrixMessages(value: unknown, ownUserId: string): Matrix
           filename?: string;
           info?: { mimetype?: string; size?: number };
           file?: { url?: string; name?: string; mimetype?: string; size?: number };
+          'm.relates_to'?: { rel_type?: string; event_id?: string };
+          'm.mentions'?: { user_ids?: unknown[]; room?: boolean };
         };
       };
       const content = item.content;
+      if (
+        options.minimumTimestampMs !== undefined &&
+        typeof item.origin_server_ts === 'number' &&
+        item.origin_server_ts < options.minimumTimestampMs
+      )
+        continue;
+      if (options.allowedRooms?.length && !options.allowedRooms.includes(roomId)) continue;
+      const sender = item.sender ?? '';
+      if (options.allowedUsers?.length && !options.allowedUsers.includes(sender)) continue;
+      if (sender && ignoredUserPatterns.some((pattern) => pattern.test(sender))) continue;
+      if (content?.msgtype === 'm.notice' && !options.processNotices) continue;
+      if (content?.['m.relates_to']?.rel_type === 'm.replace') continue;
+      const mentionedUserIds = (content?.['m.mentions']?.user_ids ?? []).filter(
+        (userId): userId is string => typeof userId === 'string',
+      );
+      const mentioned = content?.body?.includes(ownUserId) || mentionedUserIds.includes(ownUserId);
+      const roomMentioned =
+        content?.['m.mentions']?.room === true || content?.body?.split(/\s+/).includes('@room');
+      if (
+        options.requireMention &&
+        !options.freeResponseRooms?.includes(roomId) &&
+        !mentioned &&
+        !(options.allowRoomMentions && roomMentioned)
+      )
+        continue;
+      const threadRootEventId =
+        content?.['m.relates_to']?.rel_type === 'm.thread'
+          ? content['m.relates_to'].event_id
+          : undefined;
       const attachmentUrl = content?.url ?? content?.file?.url;
       const attachmentName =
         content?.filename || content?.file?.name || content?.body || 'attachment';
@@ -199,12 +372,13 @@ export function extractMatrixMessages(value: unknown, ownUserId: string): Matrix
         item.type !== 'm.room.message' ||
         item.sender === ownUserId ||
         !content ||
-        (content.msgtype !== 'm.text' && !attachments.length) ||
         !item.event_id ||
-        !item.sender ||
-        (!content.body?.trim() && !attachments.length)
+        !item.sender
       )
         continue;
+      if (content.msgtype !== 'm.text' && content.msgtype !== 'm.notice' && !attachments.length)
+        continue;
+      if (!content.body?.trim() && !attachments.length) continue;
       messages.push({
         roomId,
         eventId: item.event_id,
@@ -212,6 +386,7 @@ export function extractMatrixMessages(value: unknown, ownUserId: string): Matrix
         body:
           content.body?.trim() ||
           attachments.map((attachment) => `[Attachment: ${attachment.name}]`).join('\n'),
+        ...(threadRootEventId ? { threadRootEventId } : {}),
         ...(attachments.length ? { attachments } : {}),
       });
     }
@@ -244,33 +419,123 @@ function matrixMediaUrl(homeserverUrl: string, mxcUrl: string): URL {
   );
 }
 
+function splitMatrixBody(body: string, maxLength: number): string[] {
+  if (body.length <= maxLength) return [body];
+  const chunks: string[] = [];
+  let remaining = body;
+  while (remaining.length > maxLength) {
+    const newline = remaining.lastIndexOf('\n', maxLength);
+    const boundary = newline >= Math.floor(maxLength / 2) ? newline : maxLength;
+    chunks.push(remaining.slice(0, boundary));
+    remaining = remaining.slice(boundary);
+  }
+  if (remaining.length) chunks.push(remaining);
+  return chunks;
+}
+
 export class MatrixBridge {
   private since: string | undefined;
+  private pendingSince: string | undefined;
   private running = false;
+  private hasSynced = false;
+  private readonly startupTimestampMs = Date.now();
+  private readonly seenEventIds = new Set<string>();
 
   constructor(
     private readonly config: MatrixConfig,
     private readonly fetchImpl: FetchLike = fetch,
+    private readonly timing: {
+      sleep?: (delayMs: number) => Promise<void>;
+      random?: () => number;
+    } = {},
   ) {
     this.since = config.since;
   }
 
+  private async request(url: URL, init?: RequestInit): Promise<Response> {
+    const maxRetries = 2;
+    const endpoint = endpointCategory(url);
+    for (let attempt = 0; ; attempt += 1) {
+      let response: Response;
+      try {
+        response = await this.fetchImpl(url, init);
+      } catch (error) {
+        throw new MatrixRequestError({
+          status: 0,
+          endpoint,
+          ...(sanitizeMatrixDetail(error instanceof Error ? error.message : String(error), [
+            this.config.accessToken,
+          ])
+            ? {
+                detail: sanitizeMatrixDetail(
+                  error instanceof Error ? error.message : String(error),
+                  [this.config.accessToken],
+                ),
+              }
+            : {}),
+        });
+      }
+      if (response.ok) return response;
+      if (response.status !== 429 || attempt >= maxRetries)
+        throw await matrixRequestError(response, endpoint, [this.config.accessToken]);
+      const payload = (await response
+        .clone()
+        .json()
+        .catch(() => ({}))) as { retry_after_ms?: unknown };
+      const retryAfterHeader = response.headers.get('retry-after');
+      const headerDelay = retryAfterHeader === null ? Number.NaN : Number(retryAfterHeader) * 1_000;
+      const payloadDelay = Number(payload.retry_after_ms);
+      const retryDelayMs = Math.max(
+        0,
+        Math.trunc(
+          Number.isFinite(payloadDelay)
+            ? payloadDelay
+            : Number.isFinite(headerDelay)
+              ? headerDelay
+              : 500,
+        ),
+      );
+      const randomValue = Math.min(1, Math.max(0, this.timing.random?.() ?? Math.random()));
+      const jitterMs = Math.min(1_000, Math.floor(retryDelayMs * 0.1 * randomValue));
+      await (
+        this.timing.sleep ??
+        ((delayMs: number) =>
+          new Promise<void>((resolveDelay) => setTimeout(resolveDelay, delayMs)))
+      )(retryDelayMs + jitterMs);
+    }
+  }
+
   async syncOnce(): Promise<MatrixMessage[]> {
+    const initialSync = !this.hasSynced && !this.since;
     const url = apiUrl(this.config.homeserverUrl, '/_matrix/client/v3/sync');
     url.searchParams.set('timeout', String(this.config.pollTimeoutMs ?? 25_000));
     if (this.since) url.searchParams.set('since', this.since);
-    const response = await this.fetchImpl(url, {
+    const response = await this.request(url, {
       headers: { authorization: `Bearer ${this.config.accessToken}` },
       signal: AbortSignal.timeout((this.config.pollTimeoutMs ?? 25_000) + 10_000),
     });
-    assertOk(response);
     const value = (await response.json()) as { next_batch?: string };
-    if (value.next_batch) {
-      this.since = value.next_batch;
-      this.config.onSince?.(value.next_batch);
-    }
+    if (value.next_batch) this.pendingSince = value.next_batch;
     for (const roomId of extractMatrixInvites(value)) await this.joinRoom(roomId);
-    const messages = extractMatrixMessages(value, this.config.userId);
+    const extracted = extractMatrixMessages(value, this.config.userId, {
+      allowedUsers: this.config.allowedUsers,
+      allowedRooms: this.config.allowedRooms,
+      freeResponseRooms: this.config.freeResponseRooms,
+      ignoreUserPatterns: this.config.ignoreUserPatterns,
+      requireMention: this.config.requireMention,
+      processNotices: this.config.processNotices,
+      allowRoomMentions: this.config.allowRoomMentions,
+      ...(initialSync ? { minimumTimestampMs: this.startupTimestampMs - 5_000 } : {}),
+    });
+    const messages = extracted.filter((message) => {
+      if (this.seenEventIds.has(message.eventId)) return false;
+      this.seenEventIds.add(message.eventId);
+      if (this.seenEventIds.size > 8_192) {
+        const oldest = this.seenEventIds.values().next().value;
+        if (oldest) this.seenEventIds.delete(oldest);
+      }
+      return true;
+    });
     if (!this.config.downloadDirectory) return messages;
     for (const message of messages) {
       if (!message.attachments) continue;
@@ -286,13 +551,12 @@ export class MatrixBridge {
   }
 
   private async downloadAttachment(attachment: MatrixAttachment): Promise<{ localPath: string }> {
-    const response = await this.fetchImpl(
+    const response = await this.request(
       matrixMediaUrl(this.config.homeserverUrl, attachment.mxcUrl),
       {
         headers: { authorization: `Bearer ${this.config.accessToken}` },
       },
     );
-    assertOk(response);
     const limit = this.config.maxAttachmentBytes ?? 50_000_000;
     const advertised = Number(response.headers.get('content-length') ?? 0);
     if (advertised > limit) throw new Error('Matrix attachment exceeds the configured size limit');
@@ -313,7 +577,7 @@ export class MatrixBridge {
       this.config.homeserverUrl,
       `/_matrix/client/v3/join/${encodeURIComponent(roomId)}`,
     );
-    const response = await this.fetchImpl(url, {
+    await this.request(url, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${this.config.accessToken}`,
@@ -321,7 +585,6 @@ export class MatrixBridge {
       },
       body: '{}',
     });
-    assertOk(response);
   }
 
   async sendReceipt(roomId: string, eventId: string): Promise<void> {
@@ -329,7 +592,7 @@ export class MatrixBridge {
       this.config.homeserverUrl,
       `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/receipt/m.read/${encodeURIComponent(eventId)}`,
     );
-    const response = await this.fetchImpl(url, {
+    await this.request(url, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${this.config.accessToken}`,
@@ -337,7 +600,6 @@ export class MatrixBridge {
       },
       body: '{}',
     });
-    assertOk(response);
   }
 
   async setTyping(roomId: string, typing: boolean): Promise<void> {
@@ -345,7 +607,7 @@ export class MatrixBridge {
       this.config.homeserverUrl,
       `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/typing/${encodeURIComponent(this.config.userId)}`,
     );
-    const response = await this.fetchImpl(url, {
+    await this.request(url, {
       method: 'PUT',
       headers: {
         authorization: `Bearer ${this.config.accessToken}`,
@@ -353,18 +615,20 @@ export class MatrixBridge {
       },
       body: JSON.stringify({ typing, timeout: typing ? 30_000 : 0 }),
     });
-    assertOk(response);
   }
 
-  async sendText(roomId: string, body: string): Promise<{ eventId: string }> {
-    if (!body.trim()) throw new Error('Matrix message body is required');
+  private async sendTextChunk(
+    roomId: string,
+    body: string,
+    options: MatrixRelationOptions = {},
+  ): Promise<{ eventId: string }> {
     const formatted = formatMatrixBody(body);
-    const txnId = randomUUID();
+    const txnId = options.transactionId ?? randomUUID();
     const url = apiUrl(
       this.config.homeserverUrl,
       `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`,
     );
-    const response = await this.fetchImpl(url, {
+    const response = await this.request(url, {
       method: 'PUT',
       headers: {
         authorization: `Bearer ${this.config.accessToken}`,
@@ -375,12 +639,76 @@ export class MatrixBridge {
         body,
         format: formatted.format,
         formatted_body: formatted.formattedBody,
+        ...(options.threadRootEventId
+          ? {
+              'm.relates_to': {
+                rel_type: 'm.thread',
+                event_id: options.threadRootEventId,
+                'm.in_reply_to': { event_id: options.threadRootEventId },
+              },
+            }
+          : {}),
       }),
     });
-    assertOk(response);
     const value = (await response.json()) as { event_id?: string };
     if (!value.event_id) throw new Error('Matrix send response did not include event_id');
     return { eventId: value.event_id };
+  }
+
+  async sendText(
+    roomId: string,
+    body: string,
+    options: MatrixRelationOptions = {},
+  ): Promise<{ eventId: string }> {
+    if (!body.trim()) throw new Error('Matrix message body is required');
+    let lastEventId = '';
+    for (const [index, chunk] of splitMatrixBody(
+      body,
+      this.config.maxMessageLength ?? 16_000,
+    ).entries())
+      lastEventId = (
+        await this.sendTextChunk(roomId, chunk, {
+          ...options,
+          ...(options.transactionId ? { transactionId: `${options.transactionId}-${index}` } : {}),
+        })
+      ).eventId;
+    return { eventId: lastEventId };
+  }
+
+  async sendReaction(roomId: string, eventId: string, key: string): Promise<{ eventId: string }> {
+    if (!key.trim()) throw new Error('Matrix reaction key is required');
+    const url = apiUrl(
+      this.config.homeserverUrl,
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.reaction/${randomUUID()}`,
+    );
+    const response = await this.request(url, {
+      method: 'PUT',
+      headers: {
+        authorization: `Bearer ${this.config.accessToken}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        'm.relates_to': { rel_type: 'm.annotation', event_id: eventId, key },
+      }),
+    });
+    const value = (await response.json()) as { event_id?: string };
+    if (!value.event_id) throw new Error('Matrix reaction response did not include event_id');
+    return { eventId: value.event_id };
+  }
+
+  async redact(roomId: string, eventId: string): Promise<void> {
+    const url = apiUrl(
+      this.config.homeserverUrl,
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/redact/${encodeURIComponent(eventId)}/${randomUUID()}`,
+    );
+    await this.request(url, {
+      method: 'PUT',
+      headers: {
+        authorization: `Bearer ${this.config.accessToken}`,
+        'content-type': 'application/json',
+      },
+      body: '{}',
+    });
   }
 
   async editText(roomId: string, eventId: string, body: string): Promise<void> {
@@ -396,7 +724,7 @@ export class MatrixBridge {
       this.config.homeserverUrl,
       `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${randomUUID()}`,
     );
-    const response = await this.fetchImpl(url, {
+    await this.request(url, {
       method: 'PUT',
       headers: {
         authorization: `Bearer ${this.config.accessToken}`,
@@ -410,18 +738,19 @@ export class MatrixBridge {
         'm.relates_to': { rel_type: 'm.replace', event_id: eventId },
       }),
     });
-    assertOk(response);
   }
 
   async sendFile(
     roomId: string,
     path: string,
-    options: { msgtype?: 'm.file' | 'm.audio'; mimeType?: string } = {},
+    options: MatrixRelationOptions & {
+      msgtype?: 'm.file' | 'm.audio';
+      mimeType?: string;
+      voice?: boolean;
+    } = {},
   ): Promise<{ eventId: string }> {
     const root = this.config.workspaceRoot ? resolve(this.config.workspaceRoot) : undefined;
-    const target = resolve(path);
-    if (root && target !== root && !target.startsWith(`${root}${sep}`))
-      throw new Error('Outbound Matrix files must be inside the NUAAI workspace');
+    const target = root ? await assertSafeProjectFile(root, path) : resolve(path);
     const file = await stat(target);
     if (!file.isFile()) throw new Error(`Not a regular file: ${path}`);
     const bytes = await readFile(target);
@@ -430,7 +759,7 @@ export class MatrixBridge {
       throw new Error('Outbound Matrix attachment exceeds the configured size limit');
     const upload = apiUrl(this.config.homeserverUrl, '/_matrix/media/v3/upload');
     upload.searchParams.set('filename', basename(target));
-    const uploadResponse = await this.fetchImpl(upload, {
+    const uploadResponse = await this.request(upload, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${this.config.accessToken}`,
@@ -438,14 +767,13 @@ export class MatrixBridge {
       },
       body: bytes,
     });
-    assertOk(uploadResponse);
     const uploaded = (await uploadResponse.json()) as { content_uri?: string };
     if (!uploaded.content_uri) throw new Error('Matrix media upload did not return content_uri');
     const sendUrl = apiUrl(
       this.config.homeserverUrl,
-      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${randomUUID()}`,
+      `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${options.transactionId ?? randomUUID()}`,
     );
-    const sendResponse = await this.fetchImpl(sendUrl, {
+    const sendResponse = await this.request(sendUrl, {
       method: 'PUT',
       headers: {
         authorization: `Bearer ${this.config.accessToken}`,
@@ -460,44 +788,82 @@ export class MatrixBridge {
           size: bytes.byteLength,
           ...(options.mimeType ? { mimetype: options.mimeType } : {}),
         },
+        ...(options.voice ? { 'org.matrix.msc3245.voice': true } : {}),
+        ...(options.threadRootEventId
+          ? { 'm.relates_to': { rel_type: 'm.thread', event_id: options.threadRootEventId } }
+          : {}),
       }),
     });
-    assertOk(sendResponse);
     const sent = (await sendResponse.json()) as { event_id?: string };
     if (!sent.event_id) throw new Error('Matrix file send response did not include event_id');
     return { eventId: sent.event_id };
   }
 
-  async sendAudio(roomId: string, path: string): Promise<{ eventId: string }> {
-    return this.sendFile(roomId, path, { msgtype: 'm.audio', mimeType: 'audio/wav' });
+  async sendAudio(
+    roomId: string,
+    path: string,
+    options: MatrixRelationOptions = {},
+  ): Promise<{ eventId: string }> {
+    return this.sendFile(roomId, path, {
+      ...options,
+      msgtype: 'm.audio',
+      mimeType: 'audio/wav',
+      voice: true,
+    });
   }
 
-  async sendOutput(roomId: string, output: string): Promise<void> {
+  async sendOutput(
+    roomId: string,
+    output: string,
+    options: MatrixRelationOptions = {},
+  ): Promise<void> {
     const mediaPaths = [...output.matchAll(/^MEDIA:\s*(.+)$/gm)].map((match) => match[1].trim());
     const text = output.replace(/^MEDIA:\s*.+$/gm, '').trim();
-    if (text) await this.sendText(roomId, text);
-    for (const path of mediaPaths) await this.sendFile(roomId, path);
+    if (text)
+      await this.sendText(roomId, text, {
+        ...options,
+        ...(options.transactionId ? { transactionId: `${options.transactionId}-text` } : {}),
+      });
+    for (const [index, path] of mediaPaths.entries())
+      await this.sendFile(roomId, path, {
+        ...options,
+        ...(options.transactionId
+          ? { transactionId: `${options.transactionId}-media-${index}` }
+          : {}),
+      });
     if (!text && !mediaPaths.length)
-      await this.sendText(roomId, 'NUAAI completed the run without output.');
+      await this.sendText(roomId, 'NUAAI completed the run without output.', options);
   }
 
   async start(onMessage: (message: MatrixMessage) => Promise<void>): Promise<void> {
     if (this.running) return;
     this.running = true;
     while (this.running) {
+      let messages: MatrixMessage[] = [];
       try {
-        const messages = await this.syncOnce();
+        messages = await this.syncOnce();
         for (const message of messages) {
           if (this.running) await onMessage(message);
         }
+        await this.checkpoint();
       } catch (error) {
+        for (const message of messages) this.seenEventIds.delete(message.eventId);
+        this.pendingSince = undefined;
         if (!this.running) break;
         process.stderr.write(
           `Matrix sync unavailable: ${error instanceof Error ? error.message : String(error)}\n`,
         );
-        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        await new Promise((resolve) => setTimeout(resolve, this.config.retryDelayMs ?? 2_000));
       }
     }
+  }
+
+  private async checkpoint(): Promise<void> {
+    if (!this.pendingSince) return;
+    await this.config.onSince?.(this.pendingSince);
+    this.since = this.pendingSince;
+    this.pendingSince = undefined;
+    this.hasSynced = true;
   }
 
   stop(): void {
