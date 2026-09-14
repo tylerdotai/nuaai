@@ -171,6 +171,28 @@ describe('durable run artifact persistence', () => {
     expect(store.listRunArtifacts(run.id)).toEqual([artifact]);
   });
 
+  it('stores quoted JSON credentials as valid redacted JSON', async () => {
+    const { run, thread, registry } = await fixture();
+    const artifact = await registry.capture({
+      runId: run.id,
+      threadId: thread.id,
+      kind: 'file',
+      title: 'config.json',
+      mimeType: 'application/json',
+      sourceTool: 'workspace.write',
+      content: '{"password":"hunter2","access_token":"abc123","safe":"kept"}',
+    });
+
+    const stored = await registry.readStored(artifact);
+    expect(JSON.parse(stored.toString('utf8'))).toEqual({
+      password: '[REDACTED]',
+      access_token: '[REDACTED]',
+      safe: 'kept',
+    });
+    expect(stored.toString('utf8')).not.toContain('hunter2');
+    expect(stored.toString('utf8')).not.toContain('abc123');
+  });
+
   it('rejects traversal, absolute, symlink, hard-link, and protected runtime sources', async () => {
     const { root, run, thread, registry } = await fixture();
     const outside = await mkdtemp(join(tmpdir(), 'nuaai-artifact-outside-'));
