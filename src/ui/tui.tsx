@@ -5,11 +5,13 @@ import { WebSocket } from 'ws';
 
 import { parseScheduleCommand } from './tui-schedule.js';
 import {
+  type TuiConversationMessage,
   type TuiEvent,
   type TuiView,
   initialTuiState,
   nextSelection,
   reduceTuiEvent,
+  tuiMessagesFromPresentation,
 } from './tui-state.js';
 
 interface TuiProps {
@@ -24,10 +26,6 @@ interface Session {
 interface Thread {
   id: string;
   title: string;
-}
-interface Message {
-  role: string;
-  content: string;
 }
 
 function toTuiEvent(value: {
@@ -91,6 +89,17 @@ async function request<T>(
   return body;
 }
 
+async function loadConversationMessages(
+  baseUrl: string,
+  token: string,
+  threadId: string,
+): Promise<TuiConversationMessage[]> {
+  const presentation = await request<{
+    messages: Array<{ role: string; markdown: string }>;
+  }>(baseUrl, token, `/api/threads/${threadId}/presentation`);
+  return tuiMessagesFromPresentation(presentation.messages);
+}
+
 async function loadCatalog(baseUrl: string, token: string): Promise<TuiEvent> {
   const [tasks, schedules, memories, skills, plugins, providers, secrets] = await Promise.all([
     request<{
@@ -150,7 +159,7 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
   const { sessions, threads, stream } = tuiState;
   const selectedSessionRef = useRef<string | null>(null);
   const [thread, setThread] = useState<Thread | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<TuiConversationMessage[]>([]);
   const [input, setInput] = useState('');
   const [status, setStatus] = useState('Connecting…');
   const [error, setError] = useState<string | null>(null);
@@ -196,16 +205,7 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
           sessions: result.sessions,
           threads: detail.threads.map((value) => ({ ...value, sessionId: session.id })),
         });
-        if (nextThread)
-          setMessages(
-            (
-              await request<{ messages: Message[] }>(
-                baseUrl,
-                token,
-                `/api/threads/${nextThread.id}/messages`,
-              )
-            ).messages,
-          );
+        if (nextThread) setMessages(await loadConversationMessages(baseUrl, token, nextThread.id));
       }
       selectedSessionRef.current = session.id;
       dispatch(await loadCatalog(baseUrl, token));
@@ -237,15 +237,7 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
         const nextThread = detail.threads[0] ?? null;
         setThread(nextThread);
         setMessages(
-          nextThread
-            ? (
-                await request<{ messages: Message[] }>(
-                  baseUrl,
-                  token,
-                  `/api/threads/${nextThread.id}/messages`,
-                )
-              ).messages
-            : [],
+          nextThread ? await loadConversationMessages(baseUrl, token, nextThread.id) : [],
         );
         setStatus(
           `Connected · ${sessions.find((entry) => entry.id === sessionId)?.title ?? sessionId}`,
@@ -262,13 +254,9 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
       try {
         const selected = threads.find((entry) => entry.id === threadId);
         if (!selected) return;
-        const result = await request<{ messages: Message[] }>(
-          baseUrl,
-          token,
-          `/api/threads/${threadId}/messages`,
-        );
+        const messages = await loadConversationMessages(baseUrl, token, threadId);
         setThread({ id: selected.id, title: selected.title });
-        setMessages(result.messages);
+        setMessages(messages);
         dispatch({ type: 'thread.selected', threadId });
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : String(cause));

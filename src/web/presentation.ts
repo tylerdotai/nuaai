@@ -184,7 +184,7 @@ export function buildThreadPresentation(
   const getEvents = (runId: string): Array<EventRecord & { id: number }> => {
     const cached = eventCache.get(runId);
     if (cached) return cached;
-    const events = store.listRecentEventsForRun(runId, 250);
+    const events = store.listProjectionEventsForRun(runId, 250);
     eventCache.set(runId, events);
     return events;
   };

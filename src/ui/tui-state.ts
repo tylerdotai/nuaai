@@ -22,6 +22,22 @@ export interface TuiThread {
   title: string;
 }
 
+export interface TuiConversationMessage {
+  role: string;
+  content: string;
+}
+
+export function tuiMessagesFromPresentation(
+  messages: Array<{ role: string; markdown: string }>,
+): TuiConversationMessage[] {
+  return messages
+    .filter(
+      (message) =>
+        (message.role === 'user' || message.role === 'assistant') && message.markdown.trim(),
+    )
+    .map((message) => ({ role: message.role, content: message.markdown }));
+}
+
 export interface TuiToolActivity {
   name: string;
   status: 'running' | 'completed' | 'failed';

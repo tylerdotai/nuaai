@@ -47,6 +47,8 @@ import {
 } from './scroll.js';
 import {
   type ActiveRunsByThread,
+  EventReplayBuffer,
+  EventReplayCursor,
   type LiveOutputByRun,
   type QueuedRunsByThread,
   type SelectionIdentity,
@@ -56,10 +58,12 @@ import {
   type WebEventRecord,
   activeRunForThread,
   liveOutputSnapshot,
+  loadReplaySafeThreadSnapshot,
   projectRunEvents,
   reduceActiveRunsByThread,
   reduceLiveOutputByRun,
   reduceQueuedRunsByThread,
+  runStateSnapshotCanReplaceLiveState,
   selectionIdentityMatches,
   selectionSnapshotCanCommit,
 } from './state.js';
@@ -360,15 +364,18 @@ function App(): React.JSX.Element {
         sessionId: selectedSessionRef.current,
         threadId,
       },
+      subscriptionWillReset = false,
     ): Promise<ThreadRunState | null> => {
-      const [presentation, runState] = await Promise.all([
-        request<ThreadPresentation>(`/api/threads/${encodeURIComponent(threadId)}/presentation`, {
-          signal: load.signal,
-        }),
-        request<ThreadRunState>(`/api/threads/${encodeURIComponent(threadId)}/run-state`, {
-          signal: load.signal,
-        }),
-      ]);
+      const { runState, presentation } = await loadReplaySafeThreadSnapshot(
+        () =>
+          request<ThreadRunState>(`/api/threads/${encodeURIComponent(threadId)}/run-state`, {
+            signal: load.signal,
+          }),
+        () =>
+          request<ThreadPresentation>(`/api/threads/${encodeURIComponent(threadId)}/presentation`, {
+            signal: load.signal,
+          }),
+      );
       if (
         !snapshotCanCommit(coordinator, load, expectedSelection, {
           sessionId: selectedSessionRef.current,
@@ -380,21 +387,28 @@ function App(): React.JSX.Element {
       setHistoryCursor(presentation.nextCursor);
       setHasEarlierMessages(presentation.hasMore);
       setLoadingEarlierMessages(false);
-      setEvents(runState.events);
-      setLiveOutputByRun(liveOutputSnapshot(runState));
-      setActiveRunsByThread((current) => ({
-        ...current,
-        [threadId]: runState.activeRunId,
-      }));
-      setQueuedRunsByThread((current) => ({
-        ...current,
-        [threadId]: runState.queuedRunIds,
-      }));
-      setQueuedPromptsByRun((current) => ({
-        ...current,
-        ...Object.fromEntries(runState.queuedRuns.map((run) => [run.id, run.input])),
-      }));
-      lastEventId.current = runState.lastEventId;
+      const replaceLiveState = runStateSnapshotCanReplaceLiveState(
+        runState.lastEventId,
+        lastEventId.current,
+        subscriptionWillReset,
+      );
+      if (replaceLiveState) {
+        setEvents(runState.events);
+        setLiveOutputByRun(liveOutputSnapshot(runState));
+        setActiveRunsByThread((current) => ({
+          ...current,
+          [threadId]: runState.activeRunId,
+        }));
+        setQueuedRunsByThread((current) => ({
+          ...current,
+          [threadId]: runState.queuedRunIds,
+        }));
+        setQueuedPromptsByRun((current) => ({
+          ...current,
+          ...Object.fromEntries(runState.queuedRuns.map((run) => [run.id, run.input])),
+        }));
+        lastEventId.current = Math.max(lastEventId.current, runState.lastEventId);
+      }
       return runState;
     },
     [snapshotCanCommit],
@@ -425,7 +439,13 @@ function App(): React.JSX.Element {
       selectedThreadRef.current = nextThread?.id ?? null;
       if (!nextThread) return true;
 
-      const runState = await loadThread(nextThread.id, load);
+      const runState = await loadThread(
+        nextThread.id,
+        load,
+        selectionLoads.current,
+        { sessionId, threadId: nextThread.id },
+        true,
+      );
       if (
         !runState ||
         !snapshotCanCommit(
@@ -527,13 +547,14 @@ function App(): React.JSX.Element {
     let socket: WebSocket | undefined;
     let reconnectTimer: number | undefined;
     let eventFrame: number | undefined;
-    const pendingEvents: WebEventRecord[] = [];
+    const eventBuffer = new EventReplayBuffer();
+    const replayCursor = new EventReplayCursor(eventSubscription.after);
     let retry = 0;
     lastEventId.current = eventSubscription.after;
 
     const flushEvents = (): void => {
       eventFrame = undefined;
-      const batch = pendingEvents.splice(0);
+      const batch = eventBuffer.drain();
       if (!batch.length) return;
       setActiveRunsByThread((current) => batch.reduce(reduceActiveRunsByThread, current));
       setLiveOutputByRun((current) => batch.reduce(reduceLiveOutputByRun, current));
@@ -569,8 +590,8 @@ function App(): React.JSX.Element {
     };
 
     const scheduleEvent = (event: WebEventRecord): void => {
-      pendingEvents.push(event);
-      eventFrame ??= window.requestAnimationFrame(flushEvents);
+      if (!eventBuffer.add(event)) return;
+      if (!replayCursor.isReplaying()) eventFrame ??= window.requestAnimationFrame(flushEvents);
     };
 
     const subscribe = (after: number): void => {
@@ -591,7 +612,7 @@ function App(): React.JSX.Element {
       socket.onopen = () => {
         retry = 0;
         setConnection('connected');
-        subscribe(lastEventId.current);
+        subscribe(replayCursor.beginReplay());
       };
       socket.onmessage = (message) => {
         try {
@@ -602,14 +623,19 @@ function App(): React.JSX.Element {
             hasMore?: boolean;
           };
           if (value.type === 'replay.complete') {
-            const nextCursor = Math.max(lastEventId.current, value.nextCursor ?? 0);
-            lastEventId.current = nextCursor;
-            if (value.hasMore) subscribe(nextCursor);
+            const continuation = replayCursor.completePage(
+              value.nextCursor ?? 0,
+              value.hasMore === true,
+            );
+            lastEventId.current = Math.max(lastEventId.current, replayCursor.highWater());
+            if (continuation !== null) subscribe(continuation);
+            else if (eventBuffer.size) eventFrame ??= window.requestAnimationFrame(flushEvents);
             return;
           }
           if (value.type !== 'event' || !value.event) return;
           const nextEvent = value.event;
           if (nextEvent.sessionId && nextEvent.sessionId !== subscribedSessionId) return;
+          if (nextEvent.id !== undefined) replayCursor.observe(nextEvent.id);
           lastEventId.current = Math.max(lastEventId.current, nextEvent.id ?? 0);
           scheduleEvent(nextEvent);
           if (
@@ -952,7 +978,13 @@ function App(): React.JSX.Element {
     setSelectedThreadId(threadId);
     selectedThreadRef.current = threadId;
     try {
-      const runState = await loadThread(threadId, load);
+      const runState = await loadThread(
+        threadId,
+        load,
+        selectionLoads.current,
+        { sessionId, threadId },
+        true,
+      );
       if (!runState || !snapshotLoadIsCurrent(selectionLoads.current, load)) return;
       setEventSubscription({
         sessionId,

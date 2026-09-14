@@ -112,3 +112,16 @@ Production routing now uses direct streaming Responses. The endpoint is fixed, r
 
 - [x] RED/GREEN tests cover catalog completeness, read-only denial for computer control, weighted cost exhaustion, per-tool ceilings, and manifest disclosure.
 - [x] Full canonical gate passes on the revised exact tree before deployment.
+
+## Delayed review follow-up
+
+- [x] Enforce `maxOutputBytes` across all generated model attempts while retaining current-attempt snapshots.
+- [x] Give run-state a session-scoped event watermark and prevent stale background snapshots from replacing newer live state.
+- [x] Keep a contiguous replay cursor separate from higher live event IDs during paginated catch-up.
+- [x] Flush short pending deltas on a real 50 ms timer and clear the timer on completion or cancellation.
+- [x] Hydrate TUI conversations from structured presentation so persisted provisional tool-turn messages stay hidden.
+- [x] Reject bounded polite promise-only finals while preserving substantive quoted examples.
+- [x] Treat `model.completed.text` as canonical for the current live attempt.
+- [x] Preserve bounded non-delta lifecycle events so long output cannot erase early action history.
+- [x] Apply promise-only finalization truth to provider-owned loops and grant stale-snapshot replacement only to paths that reset event subscription.
+- [ ] Run the complete gate, obtain fresh independent review, push, redeploy, and repeat production pairing/readback.

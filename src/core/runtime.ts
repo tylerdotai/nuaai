@@ -54,6 +54,8 @@ const modelDeltaBatchBytes = 256;
 const modelDeltaBatchIntervalMs = 50;
 const finalizationInstruction =
   'The ordinary model-turn budget is exhausted. Do not request more tools. Provide the final answer now using only evidence already returned by completed calls, and state any remaining limitation plainly.';
+const completionCorrectionInstruction =
+  'Provide the final answer now using only completed work. Do not describe future work or promise another action. If the request was not completed, say so plainly.';
 
 function appendUserInstruction(messages: ProviderMessage[], instruction: string): void {
   const last = messages.at(-1);
@@ -92,7 +94,7 @@ function looksLikeFutureIntent(value: string): boolean {
   const trimmed = value.trim();
   return (
     Buffer.byteLength(trimmed, 'utf8') <= 320 &&
-    /^(?:okay[,.:;!\s-]*)?(?:i['’]ll|i will|let me)\s+(?:run|check|inspect|verify|try|look|explore|do)\b/i.test(
+    /^(?:(?:okay|ok|sure|certainly|got it)[,.:;!\s-]*)?(?:i['’]ll|i will|let me)\s+(?:run|check|inspect|verify|try|look|explore|do)\b/i.test(
       trimmed,
     )
   );
@@ -679,6 +681,7 @@ export class AgentRuntime {
         },
       );
       let output = '';
+      let generatedOutputBytes = 0;
       let finalResponseAccepted = false;
       let toolBudgetExhausted = false;
       let toolBudgetNoticeAdded = false;
@@ -911,7 +914,8 @@ export class AgentRuntime {
         let turnOutputBytes = 0;
         let pendingDelta = '';
         let pendingDeltaBytes = 0;
-        let lastDeltaFlush = Date.now();
+        let deltaFlushTimer: ReturnType<typeof setTimeout> | undefined;
+        let deltaFlushError: unknown;
         const eventContext = {
           sessionId: thread.sessionId,
           threadId: thread.id,
@@ -919,31 +923,44 @@ export class AgentRuntime {
           correlationId: run.correlationId,
         };
         const flushModelDelta = (): void => {
+          if (deltaFlushTimer) {
+            clearTimeout(deltaFlushTimer);
+            deltaFlushTimer = undefined;
+          }
           if (!pendingDelta) return;
           this.options.store.updateRun(run.id, { output: turnOutput.text });
           this.emit('model.delta', { text: pendingDelta, turn }, eventContext);
           pendingDelta = '';
           pendingDeltaBytes = 0;
-          lastDeltaFlush = Date.now();
         };
         const appendModelText = (text: string): void => {
           if (!text) return;
+          const textBytes = Buffer.byteLength(text, 'utf8');
           turnOutput.text += text;
-          turnOutputBytes += Buffer.byteLength(text, 'utf8');
-          if (turnOutputBytes > this.options.config.limits.maxOutputBytes)
+          turnOutputBytes += textBytes;
+          generatedOutputBytes += textBytes;
+          if (
+            turnOutputBytes > this.options.config.limits.maxOutputBytes ||
+            generatedOutputBytes > this.options.config.limits.maxOutputBytes
+          )
             throw new Error('Run output limit exceeded');
           output = turnOutput.text;
           pendingDelta += text;
-          pendingDeltaBytes += Buffer.byteLength(text, 'utf8');
-          if (
-            pendingDeltaBytes >= modelDeltaBatchBytes ||
-            Date.now() - lastDeltaFlush >= modelDeltaBatchIntervalMs
-          )
-            flushModelDelta();
+          pendingDeltaBytes += textBytes;
+          if (pendingDeltaBytes >= modelDeltaBatchBytes) flushModelDelta();
+          else
+            deltaFlushTimer ??= setTimeout(() => {
+              try {
+                flushModelDelta();
+              } catch (cause) {
+                deltaFlushError = cause;
+                controller.abort(cause);
+              }
+            }, modelDeltaBatchIntervalMs);
         };
         output = '';
         this.options.store.updateRun(run.id, { output });
-        const toolsDisabled = finalizationGrace || toolBudgetExhausted;
+        const toolsDisabled = finalizationGrace || finalizationRequested || toolBudgetExhausted;
         const turnProviderTools = toolsDisabled ? [] : providerTools;
         const turnDynamicTools = toolsDisabled ? [] : providerDynamicTools;
         this.emit(
@@ -956,6 +973,7 @@ export class AgentRuntime {
           },
           eventContext,
         );
+        let providerStreamError: unknown;
         try {
           for await (const event of provider.stream({
             model,
@@ -1015,9 +1033,12 @@ export class AgentRuntime {
                 appendModelText(event.text);
             }
           }
-        } finally {
-          flushModelDelta();
+        } catch (cause) {
+          providerStreamError = cause;
         }
+        if (deltaFlushError) throw deltaFlushError;
+        flushModelDelta();
+        if (providerStreamError) throw providerStreamError;
         const currentAfterStream = this.options.store.getRun(run.id);
         if (currentAfterStream?.cancelRequested) {
           this.options.store.updateRun(run.id, { status: 'cancelled', output });
@@ -1066,7 +1087,17 @@ export class AgentRuntime {
           }
           if (providerOwnsToolLoop) {
             output = turnOutput.text;
-            finalResponseAccepted = Boolean(output.trim());
+            if (
+              !finalizationRequested &&
+              !finalizationGrace &&
+              (!output.trim() || looksLikeFutureIntent(output))
+            ) {
+              output = '';
+              finalizationRequested = true;
+              appendUserInstruction(messages, completionCorrectionInstruction);
+              continue;
+            }
+            finalResponseAccepted = Boolean(output.trim()) && !looksLikeFutureIntent(output);
             break;
           }
           if (unresolvedToolFailures.length) {

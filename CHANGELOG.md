@@ -10,6 +10,11 @@ All notable NUAAI changes are recorded here.
 - Substantive final answers are no longer rejected for quoting future-intent examples; genuine model-turn exhaustion receives one no-tools grace turn before a truthful terminal failure.
 - The existing tool registry now owns explicit governance metadata, profile approval integrity, weighted and per-tool budgets, pre-execution admission, durable policy audit events, and execute-level protection for computer control.
 - Configured MCP tools now stay behind the stable registry discovery/execution pair instead of being duplicated into provider catalogs.
+- Generated output is bounded across the whole run rather than per model attempt, and short deltas flush to the durable live snapshot on a real 50 ms timer.
+- Browser replay now uses a session-wide watermark, buffers and orders paginated catch-up, rejects duplicate events, and refuses stale background snapshots that would overwrite newer live output.
+- Browser completion text is canonical for the current attempt, TUI refreshes use the structured conversation projection, and bounded polite promise-only replies receive the existing finalization correction.
+- Long output no longer evicts early tool lifecycle records from browser presentation or run-state, preserving truthful action history alongside bounded recent deltas.
+- Provider-owned loops now receive the same one-shot promise-only finalization correction, and same-thread send/retry snapshots cannot replace live state unless their watermark is current.
 
 ## [1.0.0] - 2026-09-14
 

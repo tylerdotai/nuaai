@@ -251,11 +251,13 @@ export function createApp(services: GatewayServices): Hono {
   });
   app.get('/api/threads/:id/run-state', (context) => {
     const threadId = context.req.param('id');
-    if (!services.store.getThread(threadId))
-      return context.json({ error: 'Thread not found' }, 404);
+    const thread = services.store.getThread(threadId);
+    if (!thread) return context.json({ error: 'Thread not found' }, 404);
     const activeRuns = services.store.listActiveRunsForThread(threadId);
     const run = activeRuns[0] ?? services.store.getLatestRun(threadId);
-    const events = run ? services.store.listRecentEventsForRun(run.id, runSnapshotEventLimit) : [];
+    const events = run
+      ? services.store.listProjectionEventsForRun(run.id, runSnapshotEventLimit)
+      : [];
     return context.json({
       version: 1,
       threadId,
@@ -272,7 +274,7 @@ export function createApp(services: GatewayServices): Hono {
           createdAt: queuedRun.createdAt,
         })),
       events,
-      lastEventId: events.at(-1)?.id ?? 0,
+      lastEventId: services.store.eventHighWaterForSession(thread.sessionId),
     });
   });
   app.post('/api/runs', async (context) => {

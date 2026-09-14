@@ -5,9 +5,24 @@ import {
   initialTuiState,
   nextSelection,
   reduceTuiEvent,
+  tuiMessagesFromPresentation,
 } from '../src/ui/tui-state.js';
 
 describe('TUI event state', () => {
+  it('hydrates only user-visible messages from structured presentation', () => {
+    expect(
+      tuiMessagesFromPresentation([
+        { role: 'user', markdown: 'Prompt' },
+        { role: 'assistant', markdown: 'Final answer' },
+        { role: 'tool', markdown: 'hidden tool result' },
+        { role: 'assistant', markdown: '   ' },
+      ]),
+    ).toEqual([
+      { role: 'user', content: 'Prompt' },
+      { role: 'assistant', content: 'Final answer' },
+    ]);
+  });
+
   it('wraps session and thread selection in both directions', () => {
     expect(nextSelection('session-2', ['session-1', 'session-2', 'session-3'], 1)).toBe(
       'session-3',

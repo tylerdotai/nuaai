@@ -244,6 +244,20 @@ describe('structured conversation presentation', () => {
       runId: run.id,
     };
     store.appendEvent(createEvent('run.started', {}, context));
+    store.appendEvent(
+      createEvent(
+        'tool.started',
+        { id: 'early-tool', name: 'workspace.read', arguments: { path: 'src/core/runtime.ts' } },
+        context,
+      ),
+    );
+    store.appendEvent(
+      createEvent(
+        'tool.completed',
+        { id: 'early-tool', name: 'workspace.read', result: { bytes: 42 } },
+        context,
+      ),
+    );
     for (let index = 0; index < 400; index += 1)
       store.appendEvent(createEvent('model.delta', { text: String(index % 10) }, context));
 
@@ -254,6 +268,11 @@ describe('structured conversation presentation', () => {
         id: `run:${run.id}:assistant`,
         markdown: snapshot,
         status: 'streaming',
+        activities: [
+          expect.objectContaining({
+            items: [expect.objectContaining({ id: 'early-tool', status: 'completed' })],
+          }),
+        ],
       }),
     ]);
   });

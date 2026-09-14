@@ -453,7 +453,9 @@ describe('authenticated daemon client routes', () => {
       getThread: () => ({ id: 'thread-a', sessionId: 'session-a' }),
       getLatestRun: () => run,
       listActiveRunsForThread: () => [run, queued],
-      listRecentEventsForRun: () => events,
+      listRecentEventsForRun: () => [],
+      listProjectionEventsForRun: () => events,
+      eventHighWaterForSession: () => 99,
     } as never;
     const handle = await startServer(gateway);
     handles.push(handle);
@@ -470,7 +472,7 @@ describe('authenticated daemon client routes', () => {
       queuedRunIds: ['run-b'],
       queuedRuns: [{ id: 'run-b', input: 'inspect', createdAt: 102 }],
       events,
-      lastEventId: 41,
+      lastEventId: 99,
     });
   });
 
@@ -514,6 +516,7 @@ describe('authenticated daemon client routes', () => {
       getRun: () => run,
       getLatestRun: () => run,
       listRecentEventsForRun: () => [],
+      listProjectionEventsForRun: () => [],
     } as never;
     gateway.runtime.listMessages = () => {
       throw new Error('plain messages must not back the presentation route');

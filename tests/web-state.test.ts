@@ -2,14 +2,18 @@ import { describe, expect, it } from 'vitest';
 
 import { displayModel, displayProviderName } from '../src/web/format.js';
 import {
+  EventReplayBuffer,
+  EventReplayCursor,
   SelectionLoadCoordinator,
   type WebEventRecord,
   activeRunForThread,
   liveOutputSnapshot,
+  loadReplaySafeThreadSnapshot,
   projectRunEvents,
   reduceActiveRunsByThread,
   reduceLiveOutputByRun,
   reduceQueuedRunsByThread,
+  runStateSnapshotCanReplaceLiveState,
   selectionIdentityMatches,
   selectionLoadCanCommit,
   selectionSnapshotCanCommit,
@@ -71,6 +75,19 @@ describe('web run event projection', () => {
     });
   });
 
+  it('adopts model.completed text as the canonical current attempt', () => {
+    const events = [
+      event(1, 'run-1', 'model.started', { turn: 0 }),
+      event(2, 'run-1', 'model.delta', { turn: 0, text: 'partial' }),
+      event(3, 'run-1', 'model.completed', { turn: 0, text: 'canonical answer' }),
+    ];
+
+    expect(projectRunEvents(events)).toMatchObject({ liveOutput: 'canonical answer' });
+    expect(events.reduce(reduceLiveOutputByRun, {})).toEqual({
+      'run-1': 'canonical answer',
+    });
+  });
+
   it('seeds reconnect output from the durable run snapshot and appends later deltas', () => {
     const runState = {
       version: 1 as const,
@@ -100,6 +117,57 @@ describe('web run event projection', () => {
     expect(
       reduceLiveOutputByRun(seeded, event(502, 'run-1', 'model.started', { turn: 2 })),
     ).toEqual({ 'run-1': '' });
+  });
+
+  it('allows a stale run-state snapshot only when the subscription will reset', () => {
+    expect(runStateSnapshotCanReplaceLiveState(500, 501, false)).toBe(false);
+    expect(runStateSnapshotCanReplaceLiveState(501, 501, false)).toBe(true);
+    expect(runStateSnapshotCanReplaceLiveState(500, 501, true)).toBe(true);
+  });
+
+  it('captures the replay cursor before loading presentation content', async () => {
+    const calls: string[] = [];
+    const snapshot = await loadReplaySafeThreadSnapshot(
+      async () => {
+        calls.push('run-state');
+        return { lastEventId: 500 };
+      },
+      async () => {
+        calls.push('presentation');
+        return { messages: ['final answer'] };
+      },
+    );
+
+    expect(calls).toEqual(['run-state', 'presentation']);
+    expect(snapshot).toEqual({
+      runState: { lastEventId: 500 },
+      presentation: { messages: ['final answer'] },
+    });
+  });
+
+  it('keeps replay continuation separate from a higher live event id', () => {
+    const cursor = new EventReplayCursor(0);
+    expect(cursor.beginReplay()).toBe(0);
+    cursor.observe(1_000);
+    expect(cursor.completePage(250, true)).toBe(250);
+    expect(cursor.beginReplay()).toBe(250);
+    cursor.observe(251);
+    cursor.observe(500);
+    expect(cursor.completePage(500, true)).toBe(500);
+    expect(cursor.beginReplay()).toBe(500);
+    cursor.observe(600);
+    expect(cursor.completePage(600, false)).toBeNull();
+    expect(cursor.beginReplay()).toBe(1_000);
+  });
+
+  it('deduplicates and orders replay events before projection', () => {
+    const buffer = new EventReplayBuffer();
+    expect(buffer.add(event(1_000, 'run-1', 'model.delta', { text: 'live' }))).toBe(true);
+    expect(buffer.add(event(2, 'run-1', 'model.delta', { text: 'second' }))).toBe(true);
+    expect(buffer.add(event(1, 'run-1', 'model.delta', { text: 'first' }))).toBe(true);
+    expect(buffer.add(event(2, 'run-1', 'model.delta', { text: 'duplicate' }))).toBe(false);
+    expect(buffer.drain().map((entry) => entry.id)).toEqual([1, 2, 1_000]);
+    expect(buffer.size).toBe(0);
   });
 
   it('projects readable action states and retains failed outcomes', () => {

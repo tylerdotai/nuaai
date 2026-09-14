@@ -264,6 +264,7 @@ function createSchema(db: MemoryDatabase, vector = false): void {
     CREATE INDEX IF NOT EXISTS events_created_at_idx ON events(created_at, id);
     CREATE INDEX IF NOT EXISTS events_session_id_idx ON events(session_id, id);
     CREATE INDEX IF NOT EXISTS events_thread_id_idx ON events(thread_id, id);
+    CREATE INDEX IF NOT EXISTS events_run_id_idx ON events(run_id, id);
     CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages(thread_id, created_at);
     CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs(thread_id, created_at);
     CREATE UNIQUE INDEX IF NOT EXISTS runs_correlation_id_idx ON runs(correlation_id);
@@ -422,6 +423,13 @@ export class DatabaseStore {
     return this.listScopedEvents('session_id', sessionId, afterId, limit);
   }
 
+  eventHighWaterForSession(sessionId: string): number {
+    const row = this.database.raw
+      .prepare('SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE session_id = ?')
+      .get(sessionId) as { id: number };
+    return row.id;
+  }
+
   listEventsForThread(threadId: string, afterId = 0, limit = 200): EventPage {
     return this.listScopedEvents('thread_id', threadId, afterId, limit);
   }
@@ -436,6 +444,25 @@ export class DatabaseStore {
       )
       .all(runId, boundedLimit) as Array<Record<string, unknown>>;
     return rows.map((row) => this.eventFromRow(row));
+  }
+
+  listProjectionEventsForRun(
+    runId: string,
+    recentLimit = 250,
+  ): Array<EventRecord & { id: number }> {
+    const recent = this.listRecentEventsForRun(runId, recentLimit);
+    const lifecycleRows = this.database.raw
+      .prepare(
+        "SELECT * FROM events WHERE run_id = ? AND type <> 'model.delta' ORDER BY id DESC LIMIT 1000",
+      )
+      .all(runId) as Array<Record<string, unknown>>;
+    const byId = new Map<number, EventRecord & { id: number }>();
+    for (const event of recent) byId.set(event.id, event);
+    for (const row of lifecycleRows) {
+      const event = this.eventFromRow(row);
+      byId.set(event.id, event);
+    }
+    return [...byId.values()].sort((left, right) => left.id - right.id);
   }
 
   private listScopedEvents(

@@ -559,6 +559,10 @@ describe('SQLite persistence and vector memory', () => {
       hasMore: false,
       nextCursor: selectedEvents[2]?.id,
     });
+    expect(store.eventHighWaterForSession(selected.session.id)).toBe(selectedEvents[2]?.id);
+    expect(store.eventHighWaterForSession(crowded.session.id)).toBeLessThan(
+      selectedEvents[0]?.id ?? 0,
+    );
 
     const run = store.createRun(
       created.thread.id,
@@ -2407,6 +2411,78 @@ describe('agent runtime orchestration', () => {
     ).toEqual(expect.arrayContaining(['tool.started', 'tool.completed', 'run.completed']));
   });
 
+  it('requests finalization when a provider-owned loop returns a polite promise only', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let requests = 0;
+    const provider: ProviderAdapter = {
+      ...makeAgentProvider('codex', async function* () {
+        requests += 1;
+        yield {
+          type: 'done',
+          text:
+            requests === 1
+              ? "Sure, I'll check the remaining files next."
+              : 'Provider-owned final answer from completed work.',
+        };
+      }),
+      ownsToolLoop: true,
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ codex: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Provider-owned finalization');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Inspect and report.',
+      provider: 'codex',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Provider-owned final answer from completed work.',
+    });
+    expect(requests).toBe(2);
+  });
+
+  it('fails a provider-owned loop that repeats a promise after correction', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let requests = 0;
+    const promise = "Sure, I'll check the remaining files next.";
+    const provider: ProviderAdapter = {
+      ...makeAgentProvider('codex', async function* () {
+        requests += 1;
+        yield { type: 'done', text: promise };
+      }),
+      ownsToolLoop: true,
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ codex: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Repeated provider-owned promise');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Inspect and report.',
+      provider: 'codex',
+      permissions: permissive,
+    });
+
+    const completed = await runtime.waitForRun(run.id);
+    expect(completed.status).toBe('failed');
+    expect(completed.output).not.toBe(promise);
+    expect(requests).toBe(2);
+  });
+
   it('fails provider-owned runs when an action reports an error', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
@@ -3735,6 +3811,138 @@ describe('agent runtime orchestration', () => {
     });
     expect(deltas.join('')).toBe(response);
     expect(deltas.length).toBeLessThan(100);
+  });
+
+  it('enforces maxOutputBytes across all generated model attempts', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let turn = 0;
+    const provider = makeAgentProvider('cumulative-output', async function* () {
+      turn += 1;
+      if (turn === 1) {
+        yield { type: 'delta', text: 'a'.repeat(600) };
+        yield { type: 'tool_call', id: 'tool-1', name: 'workspace.list', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'b'.repeat(600) };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: { ...defaults, limits: { ...defaults.limits, maxOutputBytes: 1_000 } },
+      store,
+      providers: providerMap({ 'cumulative-output': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Cumulative output');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect and report',
+      provider: 'cumulative-output',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('Run output limit exceeded'),
+    });
+  });
+
+  it('flushes a short pending delta while the provider remains paused', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let releaseProvider: (() => void) | undefined;
+    const providerHold = new Promise<void>((resolvePromise) => {
+      releaseProvider = resolvePromise;
+    });
+    let deltaReceived: (() => void) | undefined;
+    const providerPaused = new Promise<void>((resolvePromise) => {
+      deltaReceived = resolvePromise;
+    });
+    const provider = makeAgentProvider('timed-delta', async function* () {
+      yield { type: 'delta', text: 'ok' };
+      deltaReceived?.();
+      await providerHold;
+      yield { type: 'done', text: '' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'timed-delta': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Timed delta');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'say ok',
+      provider: 'timed-delta',
+      permissions: permissive,
+    });
+
+    await providerPaused;
+    try {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+      expect(store.getRun(run.id)?.output).toBe('ok');
+      expect(
+        store.listEvents().some((event) => event.runId === run.id && event.type === 'model.delta'),
+      ).toBe(true);
+    } finally {
+      releaseProvider?.();
+    }
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'ok',
+    });
+  });
+
+  it('requests finalization for a polite promise-only response', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let requests = 0;
+    const provider = makeAgentProvider('polite-promise', async function* () {
+      requests += 1;
+      if (requests === 1) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'workspace.list', arguments: {} };
+        return;
+      }
+      yield {
+        type: 'done',
+        text:
+          requests === 2
+            ? "Sure, I'll check the remaining files next."
+            : 'Verified final answer from completed tool evidence.',
+      };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'polite-promise': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Polite promise');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect the workspace',
+      provider: 'polite-promise',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Verified final answer from completed tool evidence.',
+    });
+    expect(requests).toBe(3);
   });
 
   it('keeps a non-empty final response when tool activity reaches the turn limit', async () => {
