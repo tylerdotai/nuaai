@@ -14,6 +14,13 @@ All notable NUAAI changes are recorded here.
 - Payload-bound per-action approvals now pause profile-governed tools before side effects, persist a durable one-time SQLite state machine, revalidate current permission and tool authority, and resume the same run only for the exact SHA-256-bound payload.
 - Authenticated approval list/detail/approve/deny APIs, approval lifecycle events, a functional PWA approval inbox, and TUI pending-action visibility.
 
+### Fixed
+
+- Artifact storage now rejects pre-existing artifact-root and run-directory symbolic links, validates physical containment and inode identity before writes, and retains exclusive owner-only immutable copies.
+- Citation and external artifact URLs now reject every query and fragment in addition to URL userinfo, preventing signed URL and credential persistence through artifacts, events, or APIs.
+- Provider requests now carry one canonical system prompt outside conversation rows; Ollama, OpenAI-compatible, and Codex adapters deduplicate legacy system rows, and runtime token metrics account for one transported copy.
+- Compaction schema v7 records summary budget, summarizer version, and policy version; stale, under-budget, changed-policy, and invalid-estimate checkpoints regenerate and remain restart-idempotent under a compatible policy.
+
 ### Security
 
 - Artifact capture rejects traversal, absolute paths, symlinks, hard links, protected runtime/credential paths, unsupported kind/MIME pairs, oversized content/metadata, and non-HTTPS or credential-bearing URLs. Text checksums cover stored sanitized bytes and are labeled accordingly.

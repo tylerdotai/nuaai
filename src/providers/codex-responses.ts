@@ -8,6 +8,7 @@ import { createInterface } from 'node:readline';
 import { sanitizedSubprocessEnvironment } from '../security/environment.js';
 import { redactText } from '../security/redaction.js';
 import { getVersion } from '../version.js';
+import { canonicalProviderMessages } from './request.js';
 import type {
   ProviderAdapter,
   ProviderHealth,
@@ -422,14 +423,14 @@ export class CodexResponsesProvider implements ProviderAdapter {
     const manifest = toolManifest(request.tools);
     const model = request.model.trim() || this.model;
     if (!model) throw new Error('Codex Responses requires a model');
+    const canonical = canonicalProviderMessages(request.systemPrompt, request.messages);
     const instructions =
-      request.systemPrompt?.trim() ||
-      request.messages.find((message) => message.role === 'system')?.content.trim() ||
+      canonical.systemPrompt?.trim() ||
       'You are NUAAI. Use tools for real actions and report only verified results.';
     const body = {
       model,
       instructions,
-      input: responseInput(request.messages, manifest.names),
+      input: responseInput(canonical.messages, manifest.names),
       ...(manifest.wire.length
         ? { tools: manifest.wire, tool_choice: 'auto', parallel_tool_calls: true }
         : {}),

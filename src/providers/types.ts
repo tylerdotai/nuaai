@@ -34,7 +34,9 @@ export interface ProviderDynamicTool extends ProviderTool {
 
 export interface ProviderRequest {
   model: string;
+  /** Canonical conversation rows. System instructions travel in systemPrompt. */
   messages: ProviderMessage[];
+  /** Canonical system-instruction transport, serialized once by each adapter. */
   systemPrompt?: string;
   tools?: ProviderTool[];
   dynamicTools?: ProviderDynamicTool[];

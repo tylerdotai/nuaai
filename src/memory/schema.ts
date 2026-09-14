@@ -26,6 +26,23 @@ export const messages = sqliteTable('messages', {
   createdAt: integer('created_at').notNull(),
 });
 
+export const threadSummaries = sqliteTable('thread_summaries', {
+  threadId: text('thread_id').primaryKey(),
+  summary: text('summary').notNull(),
+  throughMessageId: text('through_message_id').notNull(),
+  messageCount: integer('message_count').notNull(),
+  sourceStartMessageId: text('source_start_message_id').notNull().default(''),
+  sourceSha256: text('source_sha256').notNull().default(''),
+  sourceProvenance: text('source_provenance').notNull().default('sha256:canonical-message-v1'),
+  estimatedOriginalTokens: integer('estimated_original_tokens').notNull().default(0),
+  estimatedSummaryTokens: integer('estimated_summary_tokens').notNull().default(0),
+  summaryBudgetTokens: integer('summary_budget_tokens').notNull().default(-1),
+  summarizerVersion: text('summarizer_version').notNull().default('legacy'),
+  policyVersion: text('policy_version').notNull().default('legacy'),
+  version: integer('version').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+});
+
 export const events = sqliteTable('events', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   eventId: text('event_id').notNull().unique(),

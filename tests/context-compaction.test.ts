@@ -200,6 +200,9 @@ describe('durable compaction checkpoints', () => {
       sourceStartMessageId: first.id,
       sourceEndMessageId: third.id,
       sourceMessageCount: 3,
+      summaryBudgetTokens: 120,
+      summarizerVersion: 'deterministic-extractive-v1',
+      policyVersion: 'pinned-important-recent-v1',
       version: 1,
       sourceProvenance: 'sha256:canonical-message-v1',
     });
@@ -221,6 +224,56 @@ describe('durable compaction checkpoints', () => {
     expect(rolled.summary).toContain('café 🙂');
     expect(rolled.sourceSha256).not.toBe(checkpoint.sourceSha256);
     expect(store.listMessages(created.thread.id, 100)).toHaveLength(4);
+  });
+
+  it('regenerates same-source checkpoints for budget and policy changes and reuses compatible rows after reopen', async () => {
+    const { root, store } = await makeStore();
+    const created = store.createSession('checkpoint compatibility');
+    const message = store.addMessage(
+      created.thread.id,
+      'user',
+      'A complete source record that cannot fit inside a one-token summary.',
+    );
+
+    const tiny = store.compactThreadThrough(created.thread.id, message.id, 1, 10);
+    expect(tiny.summary).toBe('');
+    expect(tiny).toMatchObject({
+      summaryBudgetTokens: 1,
+      summarizerVersion: 'deterministic-extractive-v1',
+      policyVersion: 'pinned-important-recent-v1',
+      estimatedSummaryTokens: 0,
+      version: 1,
+    });
+
+    const expanded = store.compactThreadThrough(created.thread.id, message.id, 1_000, 20);
+    expect(expanded.summary).toContain('complete source record');
+    expect(expanded).toMatchObject({
+      summaryBudgetTokens: 1_000,
+      summarizerVersion: tiny.summarizerVersion,
+      policyVersion: tiny.policyVersion,
+      version: 2,
+    });
+    expect(expanded.estimatedSummaryTokens).toBeLessThanOrEqual(1_000);
+
+    store.database.raw
+      .prepare("UPDATE thread_summaries SET policy_version = 'legacy-policy' WHERE thread_id = ?")
+      .run(created.thread.id);
+    const policyRegenerated = store.compactThreadThrough(created.thread.id, message.id, 1_000, 30);
+    expect(policyRegenerated).toMatchObject({
+      summary: expanded.summary,
+      summaryBudgetTokens: 1_000,
+      summarizerVersion: tiny.summarizerVersion,
+      policyVersion: tiny.policyVersion,
+      version: 3,
+      updatedAt: 30,
+    });
+
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const reopened = new DatabaseStore(openAppDatabase(root));
+    stores.push(reopened);
+    const unchanged = reopened.compactThreadThrough(created.thread.id, message.id, 1_000, 40);
+    expect(unchanged).toEqual(policyRegenerated);
   });
 
   it('selects identical structured context after reopening the database', async () => {
@@ -258,6 +311,52 @@ describe('durable compaction checkpoints', () => {
 });
 
 describe('runtime context contract', () => {
+  it('transports and accounts for the assembled system prompt exactly once', async () => {
+    const { root, store } = await makeStore();
+    const requests: ProviderRequest[] = [];
+    const adapter = provider(requests);
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providers(adapter),
+      tools: new ToolRegistry(root),
+      identityContext: 'Canonical system policy.',
+    });
+    const created = runtime.createSession('canonical system transport');
+    store.addMessage(
+      created.thread.id,
+      'system',
+      'Pinned transport constraint: never publish without approval.',
+    );
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'continue once',
+      provider: 'capture',
+    });
+    await runtime.waitForRun(run.id);
+
+    const request = requests[0];
+    expect(request?.systemPrompt).toContain('Canonical system policy.');
+    expect(request?.systemPrompt).toContain(
+      'Pinned transport constraint: never publish without approval.',
+    );
+    expect(request?.messages.filter((message) => message.role === 'system')).toEqual([]);
+    const selected = store
+      .listEvents()
+      .find((event) => event.runId === run.id && event.type === 'context.selected');
+    expect(selected?.payload).toMatchObject({
+      systemPromptContextUnits: estimateMessageTokens({
+        role: 'system',
+        content: request?.systemPrompt ?? '',
+      }),
+    });
+    expect(
+      Number(selected?.payload.estimatedContextUnits) -
+        Number(selected?.payload.reservedContextUnits),
+    ).toBe(request?.messages.reduce((total, message) => total + estimateMessageTokens(message), 0));
+  });
+
   it('replays durable tool calls and matching results as structured provider messages', async () => {
     const { root, store } = await makeStore();
     const requests: ProviderRequest[] = [];

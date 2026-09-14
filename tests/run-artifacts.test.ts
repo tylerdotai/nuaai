@@ -1,5 +1,14 @@
 import { createHash } from 'node:crypto';
-import { link, lstat, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import {
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -42,7 +51,20 @@ describe('durable run artifact persistence', () => {
     const legacy = new Database(join(workspaceDirectory(root), 'memory.db'));
     legacy.exec(`
       CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3');
+      INSERT INTO schema_meta (key, value) VALUES ('schema_version', '6');
+      CREATE TABLE thread_summaries (
+        thread_id TEXT PRIMARY KEY,
+        summary TEXT NOT NULL,
+        through_message_id TEXT NOT NULL,
+        message_count INTEGER NOT NULL,
+        source_start_message_id TEXT NOT NULL DEFAULT '',
+        source_sha256 TEXT NOT NULL DEFAULT '',
+        source_provenance TEXT NOT NULL DEFAULT 'sha256:canonical-message-v1',
+        estimated_original_tokens INTEGER NOT NULL DEFAULT 0,
+        estimated_summary_tokens INTEGER NOT NULL DEFAULT 0,
+        version INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
     legacy.close();
 
@@ -57,7 +79,7 @@ describe('durable run artifact persistence', () => {
           value: string;
         }
       ).value,
-    ).toBe('6');
+    ).toBe('7');
     expect(
       (
         database.raw.prepare('PRAGMA table_info(run_artifacts)').all() as Array<{ name: string }>
@@ -79,7 +101,15 @@ describe('durable run artifact persistence', () => {
         'created_at',
       ]),
     );
-
+    expect(
+      (
+        database.raw.prepare('PRAGMA table_info(thread_summaries)').all() as Array<{
+          name: string;
+        }>
+      ).map((column) => column.name),
+    ).toEqual(
+      expect.arrayContaining(['summary_budget_tokens', 'summarizer_version', 'policy_version']),
+    );
     const created = store.createSession('Migrated artifacts', 1);
     const run = store.createRun(created.thread.id, 'input', 'test', 'model', 'migration-run', 2);
     const artifact = store.createRunArtifact({
@@ -167,6 +197,46 @@ describe('durable run artifact persistence', () => {
     await expect(capture('.nuaai/runtime.json')).rejects.toThrow('Protected workspace file');
   });
 
+  it('refuses pre-existing artifact-root and run-directory symbolic links before writing bytes', async () => {
+    const artifactRootFixture = await fixture();
+    const outsideArtifactRoot = await mkdtemp(join(tmpdir(), 'nuaai-artifact-root-outside-'));
+    await symlink(
+      outsideArtifactRoot,
+      join(workspaceDirectory(artifactRootFixture.root), 'artifacts'),
+      'dir',
+    );
+    await expect(
+      artifactRootFixture.registry.capture({
+        runId: artifactRootFixture.run.id,
+        threadId: artifactRootFixture.thread.id,
+        kind: 'file',
+        title: 'Blocked root',
+        mimeType: 'text/plain',
+        sourceTool: 'custom.tool',
+        content: 'must stay private',
+      }),
+    ).rejects.toThrow('symbolic link');
+    expect(await readdir(outsideArtifactRoot)).toEqual([]);
+
+    const runDirectoryFixture = await fixture();
+    const storageRoot = join(workspaceDirectory(runDirectoryFixture.root), 'artifacts');
+    const outsideRunDirectory = await mkdtemp(join(tmpdir(), 'nuaai-artifact-run-outside-'));
+    await mkdir(storageRoot, { mode: 0o700 });
+    await symlink(outsideRunDirectory, join(storageRoot, runDirectoryFixture.run.id), 'dir');
+    await expect(
+      runDirectoryFixture.registry.capture({
+        runId: runDirectoryFixture.run.id,
+        threadId: runDirectoryFixture.thread.id,
+        kind: 'file',
+        title: 'Blocked run',
+        mimeType: 'text/plain',
+        sourceTool: 'custom.tool',
+        content: 'must stay private',
+      }),
+    ).rejects.toThrow('symbolic link');
+    expect(await readdir(outsideRunDirectory)).toEqual([]);
+  });
+
   it('rejects unsupported kinds, MIME types, oversized metadata, and oversized content', async () => {
     const { run, thread, registry } = await fixture({ maxContentBytes: 16, maxMetadataBytes: 32 });
     const base = {
@@ -196,7 +266,7 @@ describe('durable run artifact persistence', () => {
     ).rejects.toThrow('metadata exceeds');
   });
 
-  it('accepts only bounded credential-free HTTPS external URLs', async () => {
+  it('accepts only bounded HTTPS external URLs without userinfo, query, or fragments', async () => {
     const { run, thread, registry } = await fixture();
     const capture = (externalUrl: string) =>
       registry.capture({
@@ -212,6 +282,16 @@ describe('durable run artifact persistence', () => {
     await expect(capture('http://example.com')).rejects.toThrow('HTTPS');
     await expect(capture('file:///etc/passwd')).rejects.toThrow('HTTPS');
     await expect(capture('https://user:pass@example.com')).rejects.toThrow('credentials');
+    for (const externalUrl of [
+      'https://example.com/reference?token=private',
+      'https://example.com/reference?signature=private',
+      'https://example.com/reference?X-Amz-Signature=private',
+      'https://example.com/reference?page=1',
+    ])
+      await expect(capture(externalUrl)).rejects.toThrow('query');
+    await expect(capture('https://example.com/reference#token=private')).rejects.toThrow(
+      'fragment',
+    );
     await expect(capture(`https://example.com/${'x'.repeat(2_100)}`)).rejects.toThrow('too long');
 
     const artifact = await capture('https://example.com/reference');

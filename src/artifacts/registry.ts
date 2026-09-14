@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { workspaceDirectory } from '../config/index.js';
@@ -105,6 +105,45 @@ async function assertNoSymlinkComponents(root: string, target: string): Promise<
   }
 }
 
+async function privateDirectory(
+  path: string,
+  label: string,
+  physicalParent?: string,
+  create = false,
+): Promise<string> {
+  if (create)
+    try {
+      await mkdir(path, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  const entry = await lstat(path);
+  if (entry.isSymbolicLink()) throw new Error(`Refusing artifact ${label} symbolic link`);
+  if (!entry.isDirectory()) throw new Error(`Artifact ${label} is not a private directory`);
+  const handle = await open(
+    path,
+    constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const opened = await handle.stat();
+    const current = await lstat(path);
+    if (
+      !opened.isDirectory() ||
+      current.isSymbolicLink() ||
+      !current.isDirectory() ||
+      opened.dev !== current.dev ||
+      opened.ino !== current.ino
+    )
+      throw new Error(`Artifact ${label} changed during validation`);
+    const physicalPath = await realpath(path);
+    if (physicalParent) assertContained(physicalParent, physicalPath, label);
+    await handle.chmod(0o700);
+    return physicalPath;
+  } finally {
+    await handle.close();
+  }
+}
+
 function normalizedMetadata(
   metadata: Record<string, unknown> | undefined,
   maximum: number,
@@ -135,6 +174,8 @@ function normalizedExternalUrl(value: string | undefined, maximum: number): stri
   if (url.protocol !== 'https:') throw new Error('Artifact external URL must use HTTPS');
   if (url.username || url.password)
     throw new Error('Artifact external URL cannot contain credentials');
+  if (url.href.includes('?')) throw new Error('Artifact external URL cannot contain a query');
+  if (url.href.includes('#')) throw new Error('Artifact external URL cannot contain a fragment');
   return url.toString();
 }
 
@@ -245,17 +286,48 @@ export class RunArtifactRegistry {
       storagePath = `artifacts/${input.runId}/${artifactId}${safeExtension(input)}`;
       const destination = safePath(this.runtimeRoot, storagePath);
       assertContained(this.storageRoot, destination, storagePath);
-      await mkdir(resolve(destination, '..'), { recursive: true, mode: 0o700 });
-      await chmod(this.storageRoot, 0o700);
-      await chmod(resolve(destination, '..'), 0o700);
-      const destinationHandle = await open(destination, 'wx', 0o600);
+      const physicalRuntimeRoot = await privateDirectory(this.runtimeRoot, 'runtime root');
+      const physicalStorageRoot = await privateDirectory(
+        this.storageRoot,
+        'storage root',
+        physicalRuntimeRoot,
+        true,
+      );
+      const physicalRunDirectory = await privateDirectory(
+        resolve(destination, '..'),
+        'run directory',
+        physicalStorageRoot,
+        true,
+      );
+      const destinationHandle = await open(
+        destination,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      let wroteBytes = false;
       try {
+        const opened = await destinationHandle.stat();
+        const current = await lstat(destination);
+        const physicalDestination = await realpath(destination);
+        if (
+          !opened.isFile() ||
+          opened.nlink !== 1 ||
+          current.isSymbolicLink() ||
+          !current.isFile() ||
+          current.nlink !== 1 ||
+          opened.dev !== current.dev ||
+          opened.ino !== current.ino
+        )
+          throw new Error('Artifact destination is not a private file');
+        assertContained(physicalRunDirectory, physicalDestination, storagePath);
+        await destinationHandle.chmod(0o600);
         await destinationHandle.writeFile(bytes);
         await destinationHandle.sync();
+        wroteBytes = true;
       } finally {
         await destinationHandle.close();
+        if (!wroteBytes) await unlink(destination).catch(() => undefined);
       }
-      await chmod(destination, 0o600);
     }
 
     try {
@@ -283,20 +355,48 @@ export class RunArtifactRegistry {
   async readStored(artifact: RunArtifactRow): Promise<Buffer> {
     if (!artifact.storagePath) throw new Error('Artifact has no stored content');
     const normalized = artifact.storagePath.replaceAll('\\', '/');
-    if (isAbsolute(artifact.storagePath) || !normalized.startsWith('artifacts/'))
+    const parts = normalized.split('/');
+    if (
+      isAbsolute(artifact.storagePath) ||
+      parts.length !== 3 ||
+      parts[0] !== 'artifacts' ||
+      !parts[1] ||
+      !parts[2]
+    )
       throw new Error('Invalid artifact storage path');
-    await assertNoSymlinkComponents(this.runtimeRoot, artifact.storagePath);
     const path = safePath(this.runtimeRoot, artifact.storagePath);
-    const resolvedStorage = await realpath(this.storageRoot);
-    const resolvedPath = await realpath(path);
-    assertContained(resolvedStorage, resolvedPath, artifact.storagePath);
-    const stats = await lstat(resolvedPath);
-    if (!stats.isFile() || stats.nlink > 1)
+    const physicalRuntimeRoot = await privateDirectory(this.runtimeRoot, 'runtime root');
+    const physicalStorageRoot = await privateDirectory(
+      this.storageRoot,
+      'storage root',
+      physicalRuntimeRoot,
+    );
+    const physicalRunDirectory = await privateDirectory(
+      resolve(path, '..'),
+      'run directory',
+      physicalStorageRoot,
+    );
+    const entry = await lstat(path);
+    if (entry.isSymbolicLink() || !entry.isFile() || entry.nlink !== 1)
       throw new Error('Artifact storage entry is not a private file');
-    if (stats.size !== artifact.byteSize || stats.size > this.limits.maxContentBytes)
-      throw new Error('Artifact stored size does not match its immutable record');
-    const handle = await open(resolvedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
+      const stats = await handle.stat();
+      const current = await lstat(path);
+      const resolvedPath = await realpath(path);
+      assertContained(physicalRunDirectory, resolvedPath, artifact.storagePath);
+      if (
+        !stats.isFile() ||
+        stats.nlink !== 1 ||
+        current.isSymbolicLink() ||
+        !current.isFile() ||
+        current.nlink !== 1 ||
+        stats.dev !== current.dev ||
+        stats.ino !== current.ino
+      )
+        throw new Error('Artifact storage entry is not a private file');
+      if (stats.size !== artifact.byteSize || stats.size > this.limits.maxContentBytes)
+        throw new Error('Artifact stored size does not match its immutable record');
       const bytes = await handle.readFile();
       if (createHash('sha256').update(bytes).digest('hex') !== artifact.sha256)
         throw new Error('Artifact checksum does not match its immutable record');

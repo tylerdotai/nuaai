@@ -5,6 +5,7 @@ import type { RuntimeConfig } from '../config/index.js';
 import type { McpManager } from '../integrations/mcp.js';
 import type { DatabaseStore, MessageRow, RunRow, SessionRow, ThreadRow } from '../memory/db.js';
 import type { ProviderRegistry } from '../providers/registry.js';
+import { canonicalProviderMessages } from '../providers/request.js';
 import type {
   ProviderAdapter,
   ProviderDynamicTool,
@@ -1363,6 +1364,12 @@ export class AgentRuntime {
         })),
       ]);
       let checkpoint = this.options.store.getThreadSummary(thread.id);
+      if (checkpoint)
+        checkpoint = this.options.store.compactThreadThrough(
+          thread.id,
+          checkpoint.sourceEndMessageId,
+          this.options.config.limits.maxContextSummaryTokens,
+        );
       let prompt = assemblePrompt(checkpoint);
       let structuredContext = this.options.store.listStructuredMessagesThrough(
         thread.id,
@@ -1423,21 +1430,46 @@ export class AgentRuntime {
       const selectedContextMessages = isolatedRequest
         ? selection.messages.filter((message) => message.id === inputMessage.id)
         : selection.messages;
+      const canonicalContext = canonicalProviderMessages(
+        prompt.systemPrompt,
+        selectedContextMessages.map((message) => ({
+          role: message.role,
+          content: message.content,
+          ...(message.toolCalls?.length ? { toolCalls: message.toolCalls } : {}),
+          ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+          ...(message.toolName ? { toolName: message.toolName } : {}),
+          ...(message.id === inputMessage.id && images?.length ? { images } : {}),
+        })),
+      );
+      const systemPrompt = canonicalContext.systemPrompt ?? '';
+      const messages = canonicalContext.messages;
+      const assembledSystemPromptTokens = estimateMessageTokens({
+        role: 'system',
+        content: prompt.systemPrompt,
+      });
+      const selectedSystemMessageTokens = selectedContextMessages
+        .filter((message) => message.role === 'system')
+        .reduce((total, message) => total + estimateMessageTokens(message), 0);
+      const systemPromptTokens = estimateMessageTokens({ role: 'system', content: systemPrompt });
+      const canonicalReservedTokens =
+        selection.reservedTokens - assembledSystemPromptTokens + systemPromptTokens;
+      const canonicalEstimatedTokens =
+        selection.estimatedTokens -
+        assembledSystemPromptTokens -
+        selectedSystemMessageTokens +
+        systemPromptTokens;
       this.emit(
         'context.selected',
         {
           selectedMessageCount: selectedContextMessages.length,
           droppedMessageCount: initiallyDroppedMessageCount,
           compactedMessageCount: checkpoint?.sourceMessageCount ?? 0,
-          estimatedContextUnits: selection.estimatedTokens,
-          reservedContextUnits: selection.reservedTokens,
-          systemPromptContextUnits: estimateMessageTokens({
-            role: 'system',
-            content: prompt.systemPrompt,
-          }),
+          estimatedContextUnits: canonicalEstimatedTokens,
+          reservedContextUnits: canonicalReservedTokens,
+          systemPromptContextUnits: systemPromptTokens,
           toolSchemaContextUnits: toolSchemaTokens,
           maxContextUnits: maxContextTokens,
-          overBudget: selection.overBudget,
+          overBudget: canonicalEstimatedTokens > maxContextTokens,
         },
         {
           sessionId: thread.sessionId,
@@ -1483,20 +1515,6 @@ export class AgentRuntime {
           correlationId: run.correlationId,
         },
       );
-      const messages: ProviderMessage[] = [
-        {
-          role: 'system',
-          content: prompt.systemPrompt,
-        },
-        ...selectedContextMessages.map((message) => ({
-          role: message.role,
-          content: message.content,
-          ...(message.toolCalls?.length ? { toolCalls: message.toolCalls } : {}),
-          ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
-          ...(message.toolName ? { toolName: message.toolName } : {}),
-          ...(message.id === inputMessage.id && images?.length ? { images } : {}),
-        })),
-      ];
       for (let turn = 0; turn <= this.options.config.limits.maxTurns; turn += 1) {
         const current = this.options.store.getRun(run.id);
         if (!current || current.cancelRequested) {
@@ -1598,7 +1616,7 @@ export class AgentRuntime {
             messages,
             tools: turnProviderTools,
             dynamicTools: turnDynamicTools,
-            systemPrompt: prompt.systemPrompt,
+            systemPrompt,
             reasoning: turnProviderTools.length > 0,
             conversationId: thread.id,
             signal: controller.signal,

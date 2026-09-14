@@ -31,6 +31,10 @@ export interface AppDatabase {
   root: string;
 }
 
+export const threadSummarySourceProvenance = 'sha256:canonical-message-v1' as const;
+export const threadSummarySummarizerVersion = 'deterministic-extractive-v1' as const;
+export const threadSummaryPolicyVersion = 'pinned-important-recent-v1' as const;
+
 export interface MemoryRow {
   id: number;
   content: string;
@@ -81,9 +85,12 @@ export interface ThreadSummaryRow {
   sourceEndMessageId: string;
   sourceMessageCount: number;
   sourceSha256: string;
-  sourceProvenance: 'sha256:canonical-message-v1';
+  sourceProvenance: typeof threadSummarySourceProvenance;
   estimatedOriginalTokens: number;
   estimatedSummaryTokens: number;
+  summaryBudgetTokens: number;
+  summarizerVersion: string;
+  policyVersion: string;
   version: number;
   updatedAt: number;
 }
@@ -208,6 +215,9 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       source_provenance TEXT NOT NULL DEFAULT 'sha256:canonical-message-v1',
       estimated_original_tokens INTEGER NOT NULL DEFAULT 0,
       estimated_summary_tokens INTEGER NOT NULL DEFAULT 0,
+      summary_budget_tokens INTEGER NOT NULL DEFAULT -1,
+      summarizer_version TEXT NOT NULL DEFAULT 'legacy',
+      policy_version TEXT NOT NULL DEFAULT 'legacy',
       version INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -403,10 +413,24 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       'estimated_summary_tokens',
       'ALTER TABLE thread_summaries ADD COLUMN estimated_summary_tokens INTEGER NOT NULL DEFAULT 0',
     ],
+    [
+      'summary_budget_tokens',
+      'ALTER TABLE thread_summaries ADD COLUMN summary_budget_tokens INTEGER NOT NULL DEFAULT -1',
+    ],
+    [
+      'summarizer_version',
+      "ALTER TABLE thread_summaries ADD COLUMN summarizer_version TEXT NOT NULL DEFAULT 'legacy'",
+    ],
+    [
+      'policy_version',
+      "ALTER TABLE thread_summaries ADD COLUMN policy_version TEXT NOT NULL DEFAULT 'legacy'",
+    ],
   ];
   for (const [name, migration] of summaryMigrations)
     if (!summaryColumns.some((column) => column.name === name)) db.exec(migration);
-  db.prepare("UPDATE schema_meta SET value = '6' WHERE key = 'schema_version'").run();
+  db.prepare(
+    "UPDATE schema_meta SET value = '7' WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 7",
+  ).run();
   if (vector) {
     db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(embedding float[768]);');
   }
@@ -944,6 +968,9 @@ export class DatabaseStore {
           source_provenance AS sourceProvenance,
           estimated_original_tokens AS estimatedOriginalTokens,
           estimated_summary_tokens AS estimatedSummaryTokens,
+          summary_budget_tokens AS summaryBudgetTokens,
+          summarizer_version AS summarizerVersion,
+          policy_version AS policyVersion,
           version, updated_at AS updatedAt
         FROM thread_summaries WHERE thread_id = ?`,
       )
@@ -1005,9 +1032,9 @@ export class DatabaseStore {
     const previousIndex = previous
       ? allMessages.findIndex((message) => message.id === previous.sourceEndMessageId)
       : -1;
-    if (previous && previousIndex > throughIndex) return previous;
-
-    const sourceMessages = allMessages.slice(0, throughIndex + 1);
+    const effectiveThroughIndex = Math.max(throughIndex, previousIndex);
+    const effectiveThroughMessageId = allMessages[effectiveThroughIndex].id;
+    const sourceMessages = allMessages.slice(0, effectiveThroughIndex + 1);
     const artifacts = new Map<string, MessageArtifactRow[]>();
     for (const artifact of this.listThreadArtifacts(threadId)) {
       const existing = artifacts.get(artifact.messageId) ?? [];
@@ -1037,30 +1064,50 @@ export class DatabaseStore {
     });
     const sourceSha256 = summarySourceHash(structured);
     const boundedSummaryTokens = Math.max(0, Math.trunc(maxSummaryTokens));
+    const previousSummaryEstimate = previous ? estimateTokens(previous.summary) : -1;
     if (
       previous &&
-      previous.sourceEndMessageId === throughMessageId &&
+      previous.sourceEndMessageId === effectiveThroughMessageId &&
       previous.sourceSha256 === sourceSha256 &&
-      previous.estimatedSummaryTokens <= boundedSummaryTokens
+      previous.sourceProvenance === threadSummarySourceProvenance &&
+      previous.summaryBudgetTokens === boundedSummaryTokens &&
+      previous.summarizerVersion === threadSummarySummarizerVersion &&
+      previous.policyVersion === threadSummaryPolicyVersion &&
+      previous.estimatedSummaryTokens === previousSummaryEstimate &&
+      previousSummaryEstimate <= boundedSummaryTokens
     )
       return previous;
 
-    const summary = extractiveSummary(structured, boundedSummaryTokens, previous?.summary);
+    const compatiblePreviousPolicy =
+      previous?.sourceProvenance === threadSummarySourceProvenance &&
+      previous.summarizerVersion === threadSummarySummarizerVersion &&
+      previous.policyVersion === threadSummaryPolicyVersion;
+    const summary = extractiveSummary(
+      structured,
+      boundedSummaryTokens,
+      compatiblePreviousPolicy ? previous.summary : '',
+    );
+    const estimatedSummaryTokens = estimateTokens(summary);
+    if (estimatedSummaryTokens > boundedSummaryTokens)
+      throw new Error('Extractive summary exceeded its current token budget');
     const summaryRow: ThreadSummaryRow = {
       threadId,
       summary,
-      throughMessageId,
+      throughMessageId: effectiveThroughMessageId,
       messageCount: structured.length,
       sourceStartMessageId: structured[0].id,
-      sourceEndMessageId: throughMessageId,
+      sourceEndMessageId: effectiveThroughMessageId,
       sourceMessageCount: structured.length,
       sourceSha256,
-      sourceProvenance: 'sha256:canonical-message-v1',
+      sourceProvenance: threadSummarySourceProvenance,
       estimatedOriginalTokens: structured.reduce(
         (total, message) => total + estimateMessageTokens(message),
         0,
       ),
-      estimatedSummaryTokens: estimateTokens(summary),
+      estimatedSummaryTokens,
+      summaryBudgetTokens: boundedSummaryTokens,
+      summarizerVersion: threadSummarySummarizerVersion,
+      policyVersion: threadSummaryPolicyVersion,
       version: (previous?.version ?? 0) + 1,
       updatedAt: now,
     };
@@ -1069,8 +1116,9 @@ export class DatabaseStore {
         `INSERT INTO thread_summaries
           (thread_id, summary, through_message_id, message_count, source_start_message_id,
             source_sha256, source_provenance, estimated_original_tokens,
-            estimated_summary_tokens, version, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            estimated_summary_tokens, summary_budget_tokens, summarizer_version, policy_version,
+            version, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(thread_id) DO UPDATE SET
           summary = excluded.summary,
           through_message_id = excluded.through_message_id,
@@ -1080,6 +1128,9 @@ export class DatabaseStore {
           source_provenance = excluded.source_provenance,
           estimated_original_tokens = excluded.estimated_original_tokens,
           estimated_summary_tokens = excluded.estimated_summary_tokens,
+          summary_budget_tokens = excluded.summary_budget_tokens,
+          summarizer_version = excluded.summarizer_version,
+          policy_version = excluded.policy_version,
           version = excluded.version,
           updated_at = excluded.updated_at`,
       )
@@ -1093,6 +1144,9 @@ export class DatabaseStore {
         summaryRow.sourceProvenance,
         summaryRow.estimatedOriginalTokens,
         summaryRow.estimatedSummaryTokens,
+        summaryRow.summaryBudgetTokens,
+        summaryRow.summarizerVersion,
+        summaryRow.policyVersion,
         summaryRow.version,
         summaryRow.updatedAt,
       );
@@ -1105,7 +1159,12 @@ export class DatabaseStore {
     maxSummaryTokens = 4_096,
   ): ThreadSummaryRow | undefined {
     const messages = this.listMessages(threadId, 100_000);
-    if (messages.length <= keepMessages) return this.getThreadSummary(threadId);
+    if (messages.length <= keepMessages) {
+      const previous = this.getThreadSummary(threadId);
+      return previous
+        ? this.compactThreadThrough(threadId, previous.sourceEndMessageId, maxSummaryTokens)
+        : undefined;
+    }
     let split = messages.length - keepMessages;
     while (split > 0 && messages[split]?.role === 'tool') split -= 1;
     if (split <= 0) return this.getThreadSummary(threadId);
