@@ -186,11 +186,23 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
     timeout: 30_000,
   });
   const writeResponse = page.locator('.message-assistant').last();
+  const approvalInbox = page.getByRole('region', { name: 'Action approvals' });
+  await expect(approvalInbox).toBeVisible({ timeout: 30_000 });
+  const writeApproval = approvalInbox
+    .locator('.approval-card')
+    .filter({ hasText: 'workspace.write' });
+  await expect(writeApproval).toContainText('work-sample-output.txt');
+  await expect(writeApproval.locator('.approval-hash')).toHaveText(/^[a-f0-9]{64}$/);
+  await writeApproval.getByRole('button', { name: 'Approve once' }).click();
+  await expect(writeApproval).toHaveCount(0, { timeout: 30_000 });
   await expect(writeResponse).toContainText('NUAAI deterministic test response', {
     timeout: 30_000,
   });
   await writeResponse.getByRole('button', { name: 'Inspect run activity' }).click();
   await expect(writeResponse).toContainText('workspace.write');
+  await expect(writeResponse.getByRole('region', { name: 'Run artifacts' })).toContainText(
+    'work-sample-output.txt',
+  );
   await expect
     .poll(async () => readFile(join(e2eRoot, 'work-sample-output.txt'), 'utf8').catch(() => null), {
       timeout: 30_000,
