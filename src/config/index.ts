@@ -155,6 +155,9 @@ export const runtimeConfigSchema = z.object({
       runTimeoutMs: z.number().int().positive().max(3_600_000).default(960_000),
       providerTimeoutMs: z.number().int().positive().max(600_000).default(180_000),
       toolTimeoutMs: z.number().int().positive().max(120_000).default(30_000),
+      maxContextTokens: z.number().int().positive().max(1_000_000).default(131_072),
+      contextResponseReserveTokens: z.number().int().nonnegative().max(262_144).default(8_192),
+      maxContextSummaryTokens: z.number().int().positive().max(65_536).default(4_096),
       maxContextBytes: z.number().int().positive().max(2_000_000).default(1_000_000),
       maxMemoryContextBytes: z.number().int().positive().max(200_000).default(64_000),
       maxToolResultBytes: z.number().int().positive().max(200_000).default(16_000),
@@ -195,6 +198,17 @@ export function defaultRuntimeConfig(root = process.cwd()): RuntimeConfig {
 export function parseRuntimeConfig(value: unknown, root = process.cwd()): RuntimeConfig {
   const raw = value && typeof value === 'object' ? { ...(value as Record<string, unknown>) } : {};
   raw.version = 1;
+  const rawLimits =
+    raw.limits && typeof raw.limits === 'object'
+      ? { ...(raw.limits as Record<string, unknown>) }
+      : {};
+  if (
+    rawLimits.maxContextTokens === undefined &&
+    typeof rawLimits.maxContextBytes === 'number' &&
+    Number.isFinite(rawLimits.maxContextBytes)
+  )
+    rawLimits.maxContextTokens = Math.max(1, Math.ceil(rawLimits.maxContextBytes / 3));
+  raw.limits = rawLimits;
   const rawProvider =
     raw.provider && typeof raw.provider === 'object'
       ? { ...(raw.provider as Record<string, unknown>) }

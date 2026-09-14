@@ -4,6 +4,11 @@ All notable NUAAI changes are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Token-aware provider-neutral context selection now reserves prompt, tool-schema, current-input, and response headroom while preserving current input, project/session constraints, pinned memory, recent complete turns, and atomic structured tool-call/result groups.
+- Durable bounded extractive compaction checkpoints now record canonical SHA-256 provenance, source ranges/counts, token estimates, versions, and update times without deleting the full transcript; context selection and compaction emit content-free metrics and are reported in status diagnostics.
+
 ## [1.0.1] - 2026-09-14
 
 ### Fixed

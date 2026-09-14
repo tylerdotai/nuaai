@@ -24,6 +24,11 @@ import {
   classifyVerificationPolicy,
   verificationRequiresEvidence,
 } from './capabilities.js';
+import {
+  estimateMessageTokens,
+  estimateToolSchemaTokens,
+  selectContextMessages,
+} from './context.js';
 import { type EventRecord, createEvent } from './events.js';
 import { assembleSystemPrompt } from './prompt.js';
 import { SessionRunQueue } from './queue.js';
@@ -52,6 +57,7 @@ export type RuntimeListener = (event: EventRecord & { id: number }) => void;
 
 const modelDeltaBatchBytes = 256;
 const modelDeltaBatchIntervalMs = 50;
+const summaryCheckpointEnvelopeTokens = 192;
 const finalizationInstruction =
   'The ordinary model-turn budget is exhausted. Do not request more tools. Provide the final answer now using only evidence already returned by completed calls, and state any remaining limitation plainly.';
 const completionCorrectionInstruction =
@@ -66,20 +72,26 @@ function appendUserInstruction(messages: ProviderMessage[], instruction: string)
   messages.push({ role: 'user', content: instruction });
 }
 
-function selectContextMessages<T extends { role: string; content: string }>(
-  messages: T[],
-  maxBytes: number,
-): T[] {
-  const selected: T[] = [];
-  let bytes = 0;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    const messageBytes = Buffer.byteLength(message.content, 'utf8') + 32;
-    if (selected.length && bytes + messageBytes > maxBytes) break;
-    selected.unshift(message);
-    bytes += messageBytes;
-  }
-  return selected;
+function transcriptSummaryContext(
+  summary:
+    | {
+        version: number;
+        sourceStartMessageId: string;
+        sourceEndMessageId: string;
+        sourceMessageCount: number;
+        sourceSha256: string;
+        sourceProvenance: string;
+        summary: string;
+      }
+    | undefined,
+): string | undefined {
+  if (!summary) return undefined;
+  return [
+    `Deterministic extractive checkpoint v${summary.version}.`,
+    `Source: ${summary.sourceStartMessageId}..${summary.sourceEndMessageId} (${summary.sourceMessageCount} messages).`,
+    `Provenance: ${summary.sourceProvenance}:${summary.sourceSha256}.`,
+    summary.summary || '[No complete source record fit within the summary token budget.]',
+  ].join('\n');
 }
 
 function isCapabilityRefusal(value: string): boolean {
@@ -609,6 +621,12 @@ export class AgentRuntime {
     providers: string[];
     active: { name: string; model: string };
     capabilities: ReturnType<AgentRuntime['capabilities']>;
+    context: {
+      estimator: 'utf8-bytes-per-3-v1';
+      maxTokens: number;
+      responseReserveTokens: number;
+      maxSummaryTokens: number;
+    };
   } {
     return {
       activeRuns: this.controllers.size,
@@ -617,6 +635,15 @@ export class AgentRuntime {
       providers: this.options.providers.list(),
       active: this.activeProvider(),
       capabilities: this.capabilities(),
+      context: {
+        estimator: 'utf8-bytes-per-3-v1',
+        maxTokens: Math.min(
+          this.options.config.limits.maxContextTokens,
+          this.options.config.provider.contextWindow,
+        ),
+        responseReserveTokens: this.options.config.limits.contextResponseReserveTokens,
+        maxSummaryTokens: this.options.config.limits.maxContextSummaryTokens,
+      },
     };
   }
 
@@ -668,7 +695,6 @@ export class AgentRuntime {
       writerClaimed = this.options.store.claimRunWriter(thread.id, run.id, this.writerOwnerId);
       if (!writerClaimed) throw new Error('Run could not claim the active transcript writer');
       const model = run.model;
-      this.options.store.compactThread(thread.id);
       const inputMessage = this.addRunMessage(run, 'user', run.input, provider.name, model);
       this.emit(
         'run.started',
@@ -770,6 +796,17 @@ export class AgentRuntime {
           },
         );
       }
+      const pinnedMemory = this.options.store
+        .searchMemoryRows()
+        .filter((memory) => memory.metadata.pinned === true && !isCapabilityRefusal(memory.content))
+        .map((memory) => `- ${memory.content}`);
+      if (pinnedMemory.length) {
+        const existingEntries = new Set(memoryContext ? memoryContext.split('\n') : []);
+        memoryContext = [
+          ...pinnedMemory,
+          ...[...existingEntries].filter((entry) => entry && !pinnedMemory.includes(entry)),
+        ].join('\n');
+      }
       const registeredTools = this.options.tools.schemas(permissions);
       const registeredToolNames = new Set(registeredTools.map((tool) => tool.name));
       const registryOwnsMcp =
@@ -799,18 +836,6 @@ export class AgentRuntime {
             30_000,
             new Set(availableTools.map((tool) => tool.name)),
           ) ?? 'No skills are registered.');
-      const selectedContextMessages = selectContextMessages(
-        this.options.store.listContextMessagesThrough(thread.id, inputMessage.id, 400),
-        this.options.config.limits.maxContextBytes,
-      ).filter((message) => message.role !== 'tool');
-      const contextMessages = isolatedRequest
-        ? selectedContextMessages.filter(
-            (message) => message.role === 'user' && message.content === run.input,
-          )
-        : selectedContextMessages;
-      const currentInputMessage = [...contextMessages]
-        .reverse()
-        .find((message) => message.role === 'user' && message.content === run.input);
       const manifest = buildCapabilityManifest({
         provider,
         model,
@@ -820,17 +845,116 @@ export class AgentRuntime {
         dynamicTools: providerDynamicTools,
         verificationPolicy,
       });
-      const prompt = assembleSystemPrompt({
-        identity: this.options.identityContext,
-        projectContext:
-          thread.sessionId &&
-          this.options.store.getSession(thread.sessionId)?.context !== this.options.identityContext
-            ? this.options.store.getSession(thread.sessionId)?.context
-            : undefined,
-        memory: memoryContext,
-        skills: skillContext,
-        manifest,
+      const sessionContext = thread.sessionId
+        ? this.options.store.getSession(thread.sessionId)?.context
+        : undefined;
+      const assemblePrompt = (summary: ReturnType<DatabaseStore['getThreadSummary']>) =>
+        assembleSystemPrompt({
+          identity: this.options.identityContext,
+          projectContext:
+            sessionContext !== this.options.identityContext ? sessionContext : undefined,
+          memory: memoryContext,
+          skills: skillContext,
+          transcriptSummary: transcriptSummaryContext(summary),
+          manifest,
+        });
+      const maxContextTokens = Math.min(
+        this.options.config.limits.maxContextTokens,
+        this.options.config.provider.contextWindow,
+      );
+      const toolSchemaTokens = estimateToolSchemaTokens([
+        ...providerTools,
+        ...providerDynamicTools.map(({ namespace, name, description, parameters }) => ({
+          namespace,
+          name,
+          description,
+          parameters,
+        })),
+      ]);
+      let checkpoint = this.options.store.getThreadSummary(thread.id);
+      let prompt = assemblePrompt(checkpoint);
+      let structuredContext = this.options.store.listStructuredMessagesThrough(
+        thread.id,
+        inputMessage.id,
+      );
+      const reservedTokens = (reserveSummary: boolean): number =>
+        estimateMessageTokens({ role: 'system', content: prompt.systemPrompt }) +
+        toolSchemaTokens +
+        this.options.config.limits.contextResponseReserveTokens +
+        (reserveSummary
+          ? this.options.config.limits.maxContextSummaryTokens + summaryCheckpointEnvelopeTokens
+          : 0);
+      let selection = selectContextMessages(structuredContext, {
+        maxTokens: maxContextTokens,
+        currentMessageId: inputMessage.id,
+        reservedTokens: reservedTokens(!checkpoint),
       });
+      const initiallyDroppedMessageCount = selection.droppedMessageCount;
+      while (selection.droppedMessageCount > 0) {
+        const selectedIds = new Set(selection.messages.map((message) => message.id));
+        const firstSelectedIndex = structuredContext.findIndex((message) =>
+          selectedIds.has(message.id),
+        );
+        const compactThrough =
+          firstSelectedIndex > 0 ? structuredContext[firstSelectedIndex - 1] : undefined;
+        if (!compactThrough || compactThrough.id === inputMessage.id) break;
+        checkpoint = this.options.store.compactThreadThrough(
+          thread.id,
+          compactThrough.id,
+          this.options.config.limits.maxContextSummaryTokens,
+        );
+        this.emit(
+          'context.compacted',
+          {
+            sourceMessageCount: checkpoint.sourceMessageCount,
+            originalContextUnits: checkpoint.estimatedOriginalTokens,
+            summaryContextUnits: checkpoint.estimatedSummaryTokens,
+            version: checkpoint.version,
+          },
+          {
+            sessionId: thread.sessionId,
+            threadId: thread.id,
+            runId: run.id,
+            correlationId: run.correlationId,
+          },
+        );
+        prompt = assemblePrompt(checkpoint);
+        structuredContext = this.options.store.listStructuredMessagesThrough(
+          thread.id,
+          inputMessage.id,
+        );
+        selection = selectContextMessages(structuredContext, {
+          maxTokens: maxContextTokens,
+          currentMessageId: inputMessage.id,
+          reservedTokens: reservedTokens(false),
+        });
+      }
+      const selectedContextMessages = isolatedRequest
+        ? selection.messages.filter((message) => message.id === inputMessage.id)
+        : selection.messages;
+      this.emit(
+        'context.selected',
+        {
+          selectedMessageCount: selectedContextMessages.length,
+          droppedMessageCount: initiallyDroppedMessageCount,
+          compactedMessageCount: checkpoint?.sourceMessageCount ?? 0,
+          estimatedContextUnits: selection.estimatedTokens,
+          reservedContextUnits: selection.reservedTokens,
+          systemPromptContextUnits: estimateMessageTokens({
+            role: 'system',
+            content: prompt.systemPrompt,
+          }),
+          toolSchemaContextUnits: toolSchemaTokens,
+          maxContextUnits: maxContextTokens,
+          overBudget: selection.overBudget,
+        },
+        {
+          sessionId: thread.sessionId,
+          threadId: thread.id,
+          runId: run.id,
+          correlationId: run.correlationId,
+        },
+      );
       this.emit(
         'capabilities.assembled',
         {
@@ -873,10 +997,13 @@ export class AgentRuntime {
           role: 'system',
           content: prompt.systemPrompt,
         },
-        ...contextMessages.map((message) => ({
-          role: message.role as ProviderMessage['role'],
+        ...selectedContextMessages.map((message) => ({
+          role: message.role,
           content: message.content,
-          ...(message === currentInputMessage && images?.length ? { images } : {}),
+          ...(message.toolCalls?.length ? { toolCalls: message.toolCalls } : {}),
+          ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+          ...(message.toolName ? { toolName: message.toolName } : {}),
+          ...(message.id === inputMessage.id && images?.length ? { images } : {}),
         })),
       ];
       for (let turn = 0; turn <= this.options.config.limits.maxTurns; turn += 1) {
