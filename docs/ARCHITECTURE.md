@@ -34,9 +34,13 @@ Ink TUI / React web client
 5. **Continuation:** the loop repeats until a verified final response, explicit failure, cancellation, timeout, or configured turn limit. Exhausting the tool budget disables further tools and requests a final answer from gathered evidence.
 6. **Commit:** authoritative output and lifecycle evidence are written by the active thread writer and projected to connected clients.
 
+Before each provider turn, the runtime applies a provider-neutral token budget using a deterministic UTF-8 estimator. It reserves system-prompt, tool-schema, current-input, and response headroom; keeps project/session constraints and pinned memory; selects recent complete turns; and treats each structured assistant tool-call artifact plus all matching tool-result messages as one atomic group. Incomplete groups and orphan tool rows never cross the provider boundary.
+
 ## Persistence
 
 SQLite stores sessions, threads, messages, runs, events, memories, tasks, schedules, secrets, skills, and plugins. Runtime initialization uses idempotent schema creation. Events are versioned, redacted before persistence, and replayable by cursor through HTTP or WebSocket subscription.
+
+Token pressure creates a durable deterministic extractive checkpoint without deleting transcript rows. Each checkpoint records source start/end message IDs, source message count, canonical source SHA-256 and provenance version, estimated original/summary tokens, checkpoint version, and update time. Rolling checkpoints retain previously selected records when possible, never cut a UTF-8 string or source record, and produce identical provider context after restart. `context.compacted` and `context.selected` events expose counts and token estimates only, never message content.
 
 Active queued/running model runs are marked failed on runtime construction and require explicit manual resume, preventing automatic action replay. Exceptional terminal failure text is also persisted as an assistant message so the next turn can identify the actual cause. Queued/running scheduled tasks are marked interrupted on scheduler restart; enabled schedules become eligible for the next poll without silently losing task history.
 

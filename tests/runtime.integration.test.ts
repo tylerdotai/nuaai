@@ -276,6 +276,10 @@ describe('runtime configuration and security primitives', () => {
     expect(
       redactValue({ token: 'secret', nested: [{ password: 'hidden' }, 'Bearer abc'] }),
     ).toEqual({ token: '[REDACTED]', nested: [{ password: '[REDACTED]' }, 'Bearer [REDACTED]'] });
+    expect(redactValue({ accessToken: 123_456, authorization: 42 })).toEqual({
+      accessToken: '[REDACTED]',
+      authorization: '[REDACTED]',
+    });
     assertPermission(permissive, 'read');
     expect(() =>
       assertPermission({ approved: new Set(['read']), capabilities: {} }, 'write'),
@@ -432,7 +436,7 @@ describe('SQLite persistence and vector memory', () => {
           value: string;
         }
       ).value,
-    ).toBe('3');
+    ).toBe('4');
     const legacyRoot = await makeRoot();
     await mkdir(workspaceDirectory(legacyRoot), { recursive: true });
     const legacyDb = new Database(join(workspaceDirectory(legacyRoot), 'memory.db'));
@@ -456,7 +460,7 @@ describe('SQLite persistence and vector memory', () => {
           .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
           .get() as { value: string }
       ).value,
-    ).toBe('3');
+    ).toBe('4');
     expect(
       (upgraded.raw.prepare('PRAGMA table_info(plugins)').all() as Array<{ name: string }>).map(
         (column) => column.name,

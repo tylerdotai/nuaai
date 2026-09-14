@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
@@ -7,7 +7,9 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { load as loadSqliteVec } from 'sqlite-vec';
 
 import { workspaceDirectory } from '../config/index.js';
+import { type ContextMessage, estimateMessageTokens, estimateTokens } from '../core/context.js';
 import type { EventRecord } from '../core/events.js';
+import type { ProviderToolCall } from '../providers/types.js';
 import { redactValue } from '../security/redaction.js';
 
 export type MemoryDatabase = Database.Database;
@@ -66,9 +68,18 @@ export interface ThreadSummaryRow {
   summary: string;
   throughMessageId: string;
   messageCount: number;
+  sourceStartMessageId: string;
+  sourceEndMessageId: string;
+  sourceMessageCount: number;
+  sourceSha256: string;
+  sourceProvenance: 'sha256:canonical-message-v1';
+  estimatedOriginalTokens: number;
+  estimatedSummaryTokens: number;
   version: number;
   updatedAt: number;
 }
+
+export type StructuredMessageRow = Omit<MessageRow, 'role'> & ContextMessage;
 
 export interface MessageArtifactRow {
   messageId: string;
@@ -167,6 +178,11 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       summary TEXT NOT NULL,
       through_message_id TEXT NOT NULL,
       message_count INTEGER NOT NULL,
+      source_start_message_id TEXT NOT NULL DEFAULT '',
+      source_sha256 TEXT NOT NULL DEFAULT '',
+      source_provenance TEXT NOT NULL DEFAULT 'sha256:canonical-message-v1',
+      estimated_original_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_summary_tokens INTEGER NOT NULL DEFAULT 0,
       version INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -293,7 +309,34 @@ function createSchema(db: MemoryDatabase, vector = false): void {
   ];
   for (const [name, migration] of pluginMigrations)
     if (!pluginColumns.some((column) => column.name === name)) db.exec(migration);
-  db.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
+  const summaryColumns = db.prepare('PRAGMA table_info(thread_summaries)').all() as Array<{
+    name: string;
+  }>;
+  const summaryMigrations: Array<[string, string]> = [
+    [
+      'source_start_message_id',
+      "ALTER TABLE thread_summaries ADD COLUMN source_start_message_id TEXT NOT NULL DEFAULT ''",
+    ],
+    [
+      'source_sha256',
+      "ALTER TABLE thread_summaries ADD COLUMN source_sha256 TEXT NOT NULL DEFAULT ''",
+    ],
+    [
+      'source_provenance',
+      "ALTER TABLE thread_summaries ADD COLUMN source_provenance TEXT NOT NULL DEFAULT 'sha256:canonical-message-v1'",
+    ],
+    [
+      'estimated_original_tokens',
+      'ALTER TABLE thread_summaries ADD COLUMN estimated_original_tokens INTEGER NOT NULL DEFAULT 0',
+    ],
+    [
+      'estimated_summary_tokens',
+      'ALTER TABLE thread_summaries ADD COLUMN estimated_summary_tokens INTEGER NOT NULL DEFAULT 0',
+    ],
+  ];
+  for (const [name, migration] of summaryMigrations)
+    if (!summaryColumns.some((column) => column.name === name)) db.exec(migration);
+  db.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
   if (vector) {
     db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(embedding float[768]);');
   }
@@ -378,6 +421,96 @@ export function listMemories(db: MemoryDatabase): MemoryRow[] {
   return db
     .prepare('SELECT id, content, created_at AS createdAt FROM memories ORDER BY id ASC')
     .all() as MemoryRow[];
+}
+
+function providerToolCalls(value: unknown): ProviderToolCall[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const calls = value.filter(
+    (call): call is ProviderToolCall =>
+      Boolean(call) &&
+      typeof call === 'object' &&
+      typeof (call as ProviderToolCall).id === 'string' &&
+      typeof (call as ProviderToolCall).name === 'string' &&
+      Boolean((call as ProviderToolCall).arguments) &&
+      typeof (call as ProviderToolCall).arguments === 'object' &&
+      !Array.isArray((call as ProviderToolCall).arguments),
+  );
+  return calls.length === value.length && calls.length ? calls : undefined;
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, entry]) => [key, stableValue(entry)]),
+  );
+}
+
+function summarySourceHash(messages: StructuredMessageRow[]): string {
+  const canonical = messages.map((message) =>
+    stableValue({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      provider: message.provider,
+      model: message.model,
+      toolCalls: message.toolCalls,
+      toolCallId: message.toolCallId,
+      toolName: message.toolName,
+      pinned: message.pinned === true,
+    }),
+  );
+  return createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
+}
+
+function extractiveSummary(
+  messages: StructuredMessageRow[],
+  maxTokens: number,
+  previousSummary = '',
+): string {
+  const boundedMax = Math.max(0, Math.trunc(maxTokens));
+  const records = messages.map((message, index) => ({
+    index,
+    important:
+      message.pinned === true ||
+      previousSummary.includes(`[${message.id}] ${message.role}: ${message.content}`) ||
+      /\b(?:always|never|must|remember|constraint|require|required|prefer|fact|do not|don't)\b/iu.test(
+        message.content,
+      ),
+    text: `[${message.id}] ${message.role}: ${message.content}`,
+  }));
+  const selected = new Set<number>();
+  let used = 0;
+  const trySelect = (record: (typeof records)[number]): void => {
+    if (selected.has(record.index)) return;
+    const separator = selected.size ? 1 : 0;
+    const tokens = separator + estimateTokens(record.text);
+    if (used + tokens > boundedMax) return;
+    selected.add(record.index);
+    used += tokens;
+  };
+  for (const record of records) if (record.important) trySelect(record);
+  for (let index = records.length - 1; index >= 0; index -= 1) trySelect(records[index]);
+
+  const omitted = records.length - selected.size;
+  if (omitted) {
+    const marker = `[${omitted} complete source record${omitted === 1 ? '' : 's'} omitted by summary token budget]`;
+    const separator = selected.size ? 1 : 0;
+    const markerTokens = separator + estimateTokens(marker);
+    if (used + markerTokens <= boundedMax) {
+      selected.add(records.length);
+      records.push({ index: records.length, important: false, text: marker });
+    }
+  }
+  const summary = records
+    .filter((record) => selected.has(record.index))
+    .sort((left, right) => left.index - right.index)
+    .map((record) => record.text)
+    .join('\n');
+  if (estimateTokens(summary) <= boundedMax) return summary;
+  throw new Error('Extractive summary exceeded its token budget');
 }
 
 export class DatabaseStore {
@@ -731,51 +864,182 @@ export class DatabaseStore {
   getThreadSummary(threadId: string): ThreadSummaryRow | undefined {
     const row = this.database.raw
       .prepare(
-        'SELECT thread_id AS threadId, summary, through_message_id AS throughMessageId, message_count AS messageCount, version, updated_at AS updatedAt FROM thread_summaries WHERE thread_id = ?',
+        `SELECT thread_id AS threadId, summary,
+          through_message_id AS throughMessageId,
+          through_message_id AS sourceEndMessageId,
+          message_count AS messageCount,
+          message_count AS sourceMessageCount,
+          source_start_message_id AS sourceStartMessageId,
+          source_sha256 AS sourceSha256,
+          source_provenance AS sourceProvenance,
+          estimated_original_tokens AS estimatedOriginalTokens,
+          estimated_summary_tokens AS estimatedSummaryTokens,
+          version, updated_at AS updatedAt
+        FROM thread_summaries WHERE thread_id = ?`,
       )
       .get(threadId) as ThreadSummaryRow | undefined;
     return row;
   }
 
+  listStructuredMessagesThrough(
+    threadId: string,
+    throughMessageId: string,
+  ): StructuredMessageRow[] {
+    const messages = this.listMessages(threadId, 100_000);
+    const throughIndex = messages.findIndex((message) => message.id === throughMessageId);
+    if (throughIndex < 0) throw new Error(`Unknown message: ${throughMessageId}`);
+    const summary = this.getThreadSummary(threadId);
+    const summaryIndex = summary
+      ? messages.findIndex((message) => message.id === summary.sourceEndMessageId)
+      : -1;
+    const source = messages.slice(Math.max(0, summaryIndex + 1), throughIndex + 1);
+    const artifacts = new Map<string, MessageArtifactRow[]>();
+    for (const artifact of this.listThreadArtifacts(threadId)) {
+      const existing = artifacts.get(artifact.messageId) ?? [];
+      existing.push(artifact);
+      artifacts.set(artifact.messageId, existing);
+    }
+    return source.map((message) => {
+      const messageArtifacts = artifacts.get(message.id) ?? [];
+      const callsArtifact = messageArtifacts.find((artifact) => artifact.kind === 'tool_calls');
+      const resultArtifact = messageArtifacts.find((artifact) => artifact.kind === 'tool_result');
+      const pinArtifact = messageArtifacts.find((artifact) => artifact.kind === 'context_pin');
+      const toolCalls = providerToolCalls(callsArtifact?.payload.calls);
+      const toolCallId =
+        typeof resultArtifact?.payload.callId === 'string'
+          ? resultArtifact.payload.callId
+          : undefined;
+      const toolName =
+        typeof resultArtifact?.payload.name === 'string' ? resultArtifact.payload.name : undefined;
+      return {
+        ...message,
+        role: message.role as ContextMessage['role'],
+        ...(toolCalls ? { toolCalls } : {}),
+        ...(toolCallId ? { toolCallId } : {}),
+        ...(toolName ? { toolName } : {}),
+        ...(pinArtifact && pinArtifact.payload.pinned !== false ? { pinned: true } : {}),
+      };
+    });
+  }
+
+  compactThreadThrough(
+    threadId: string,
+    throughMessageId: string,
+    maxSummaryTokens = 4_096,
+    now = Date.now(),
+  ): ThreadSummaryRow {
+    const allMessages = this.listMessages(threadId, 100_000);
+    const throughIndex = allMessages.findIndex((message) => message.id === throughMessageId);
+    if (throughIndex < 0) throw new Error(`Unknown message: ${throughMessageId}`);
+    const previous = this.getThreadSummary(threadId);
+    const previousIndex = previous
+      ? allMessages.findIndex((message) => message.id === previous.sourceEndMessageId)
+      : -1;
+    if (previous && previousIndex > throughIndex) return previous;
+
+    const sourceMessages = allMessages.slice(0, throughIndex + 1);
+    const artifacts = new Map<string, MessageArtifactRow[]>();
+    for (const artifact of this.listThreadArtifacts(threadId)) {
+      const existing = artifacts.get(artifact.messageId) ?? [];
+      existing.push(artifact);
+      artifacts.set(artifact.messageId, existing);
+    }
+    const structured = sourceMessages.map((message) => {
+      const messageArtifacts = artifacts.get(message.id) ?? [];
+      const calls = providerToolCalls(
+        messageArtifacts.find((artifact) => artifact.kind === 'tool_calls')?.payload.calls,
+      );
+      const result = messageArtifacts.find((artifact) => artifact.kind === 'tool_result');
+      return {
+        ...message,
+        role: message.role as ContextMessage['role'],
+        ...(calls ? { toolCalls: calls } : {}),
+        ...(typeof result?.payload.callId === 'string'
+          ? { toolCallId: result.payload.callId }
+          : {}),
+        ...(typeof result?.payload.name === 'string' ? { toolName: result.payload.name } : {}),
+        ...(messageArtifacts.some(
+          (artifact) => artifact.kind === 'context_pin' && artifact.payload.pinned !== false,
+        )
+          ? { pinned: true }
+          : {}),
+      } satisfies StructuredMessageRow;
+    });
+    const sourceSha256 = summarySourceHash(structured);
+    const boundedSummaryTokens = Math.max(0, Math.trunc(maxSummaryTokens));
+    if (
+      previous &&
+      previous.sourceEndMessageId === throughMessageId &&
+      previous.sourceSha256 === sourceSha256 &&
+      previous.estimatedSummaryTokens <= boundedSummaryTokens
+    )
+      return previous;
+
+    const summary = extractiveSummary(structured, boundedSummaryTokens, previous?.summary);
+    const summaryRow: ThreadSummaryRow = {
+      threadId,
+      summary,
+      throughMessageId,
+      messageCount: structured.length,
+      sourceStartMessageId: structured[0].id,
+      sourceEndMessageId: throughMessageId,
+      sourceMessageCount: structured.length,
+      sourceSha256,
+      sourceProvenance: 'sha256:canonical-message-v1',
+      estimatedOriginalTokens: structured.reduce(
+        (total, message) => total + estimateMessageTokens(message),
+        0,
+      ),
+      estimatedSummaryTokens: estimateTokens(summary),
+      version: (previous?.version ?? 0) + 1,
+      updatedAt: now,
+    };
+    this.database.raw
+      .prepare(
+        `INSERT INTO thread_summaries
+          (thread_id, summary, through_message_id, message_count, source_start_message_id,
+            source_sha256, source_provenance, estimated_original_tokens,
+            estimated_summary_tokens, version, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+          summary = excluded.summary,
+          through_message_id = excluded.through_message_id,
+          message_count = excluded.message_count,
+          source_start_message_id = excluded.source_start_message_id,
+          source_sha256 = excluded.source_sha256,
+          source_provenance = excluded.source_provenance,
+          estimated_original_tokens = excluded.estimated_original_tokens,
+          estimated_summary_tokens = excluded.estimated_summary_tokens,
+          version = excluded.version,
+          updated_at = excluded.updated_at`,
+      )
+      .run(
+        summaryRow.threadId,
+        summaryRow.summary,
+        summaryRow.sourceEndMessageId,
+        summaryRow.sourceMessageCount,
+        summaryRow.sourceStartMessageId,
+        summaryRow.sourceSha256,
+        summaryRow.sourceProvenance,
+        summaryRow.estimatedOriginalTokens,
+        summaryRow.estimatedSummaryTokens,
+        summaryRow.version,
+        summaryRow.updatedAt,
+      );
+    return summaryRow;
+  }
+
   compactThread(
     threadId: string,
     keepMessages = 80,
-    maxSummaryBytes = 12_000,
+    maxSummaryTokens = 4_096,
   ): ThreadSummaryRow | undefined {
     const messages = this.listMessages(threadId, 100_000);
     if (messages.length <= keepMessages) return this.getThreadSummary(threadId);
     let split = messages.length - keepMessages;
     while (split > 0 && messages[split]?.role === 'tool') split -= 1;
     if (split <= 0) return this.getThreadSummary(threadId);
-    const compacted = messages.slice(0, split);
-    const lines = compacted.map((message) => `${message.role}: ${message.content}`);
-    let summary = lines.join('\n');
-    if (Buffer.byteLength(summary, 'utf8') > maxSummaryBytes) {
-      summary = summary.slice(-Math.max(0, maxSummaryBytes - 48));
-      summary = `[older transcript truncated]\n${summary}`;
-    }
-    const previous = this.getThreadSummary(threadId);
-    const summaryRow: ThreadSummaryRow = {
-      threadId,
-      summary,
-      throughMessageId: compacted[compacted.length - 1].id,
-      messageCount: compacted.length,
-      version: (previous?.version ?? 0) + 1,
-      updatedAt: Date.now(),
-    };
-    this.database.raw
-      .prepare(
-        'INSERT INTO thread_summaries (thread_id, summary, through_message_id, message_count, version, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET summary = excluded.summary, through_message_id = excluded.through_message_id, message_count = excluded.message_count, version = excluded.version, updated_at = excluded.updated_at',
-      )
-      .run(
-        summaryRow.threadId,
-        summaryRow.summary,
-        summaryRow.throughMessageId,
-        summaryRow.messageCount,
-        summaryRow.version,
-        summaryRow.updatedAt,
-      );
-    return summaryRow;
+    return this.compactThreadThrough(threadId, messages[split - 1].id, maxSummaryTokens);
   }
 
   listContextMessages(

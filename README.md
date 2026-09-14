@@ -322,7 +322,9 @@ The daemon is the source of truth. Clients do not call providers directly or mai
   },
   "limits": {
     "runTimeoutMs": 960000,
-    "maxContextBytes": 32000,
+    "maxContextTokens": 131072,
+    "contextResponseReserveTokens": 8192,
+    "maxContextSummaryTokens": 4096,
     "maxMemoryContextBytes": 8000
   },
   "matrix": {
@@ -357,6 +359,8 @@ The daemon is the source of truth. Clients do not call providers directly or mai
 ```
 
 The audio paths are local configuration examples only. Do not commit host-specific paths or model assets. `voiceEnabled` and `ttsEnabled` are independent startup defaults; Matrix commands can toggle either feature for the running daemon.
+
+Context selection uses the deterministic `utf8-bytes-per-3-v1` estimator. The configured token ceiling is also capped by the provider context window, and selection reserves the assembled system prompt, advertised tool schemas, the current input, and response headroom before retaining recent complete turns. The current input, project/session constraints, and memories stored with `{ "pinned": true }` remain present even when they put a request over budget. Older complete turns roll into bounded deterministic extractive checkpoints; tool-call assistants and matching tool results are atomic, the full transcript remains in SQLite, and `/api/status` reports the active context limits. Existing `maxContextBytes` configurations are still accepted and migrate to a conservative token budget at three UTF-8 bytes per estimated token.
 
 NUAAI generates distinct high loopback ports for the daemon, Synapse, SearXNG, Crawl4AI, and FlareSolverr during initialization. The generated values are written to `.nuaai/config.json` and the ignored Docker environment file; do not copy fixed service-port examples into production configuration.
 

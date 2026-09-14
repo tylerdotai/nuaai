@@ -22,6 +22,8 @@ export const eventTypes = [
   'model.completed',
   'capabilities.assembled',
   'prompt.assembled',
+  'context.compacted',
+  'context.selected',
   'tool.started',
   'tool.completed',
   'tool.failed',
