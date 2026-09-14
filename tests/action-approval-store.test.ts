@@ -263,7 +263,7 @@ describe('approval persistence state machine', () => {
         { label: 'Action', value: 'click' },
         { label: 'Process ID', value: '42' },
         { label: 'Element', value: '7' },
-        { label: 'Coordinate', value: '[120, 240]' },
+        { label: 'Coordinate', value: '[120,240]' },
       ]),
     );
 
