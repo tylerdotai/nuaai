@@ -180,17 +180,24 @@ describe('durable run artifact persistence', () => {
       title: 'config.json',
       mimeType: 'application/json',
       sourceTool: 'workspace.write',
-      content: '{"password":"hunter2","access_token":"abc123","safe":"kept"}',
+      content: JSON.stringify({
+        password: 'hunter"2\\tail',
+        access_token: 'abc123',
+        nested: { api_key: 'nested-secret' },
+        safe: 'kept',
+      }),
     });
 
     const stored = await registry.readStored(artifact);
     expect(JSON.parse(stored.toString('utf8'))).toEqual({
       password: '[REDACTED]',
       access_token: '[REDACTED]',
+      nested: { api_key: '[REDACTED]' },
       safe: 'kept',
     });
-    expect(stored.toString('utf8')).not.toContain('hunter2');
+    expect(stored.toString('utf8')).not.toContain('hunter');
     expect(stored.toString('utf8')).not.toContain('abc123');
+    expect(stored.toString('utf8')).not.toContain('nested-secret');
   });
 
   it('rejects traversal, absolute, symlink, hard-link, and protected runtime sources', async () => {

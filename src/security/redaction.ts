@@ -11,7 +11,21 @@ const SECRET_ASSIGNMENT = new RegExp(
   'gi',
 );
 
+function redactStructuredJson(value: string): string | undefined {
+  const trimmed = value.trim();
+  const isObject = trimmed.startsWith('{') && trimmed.endsWith('}');
+  const isArray = trimmed.startsWith('[') && trimmed.endsWith(']');
+  if (!isObject && !isArray) return undefined;
+  try {
+    return JSON.stringify(redactValue(JSON.parse(trimmed)));
+  } catch {
+    return undefined;
+  }
+}
+
 export function redactText(value: string): string {
+  const structured = redactStructuredJson(value);
+  if (structured !== undefined) return structured;
   return value
     .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [REDACTED]')
     .replace(/(sk-[A-Za-z0-9_-]{8,})/g, '[REDACTED]')

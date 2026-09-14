@@ -282,10 +282,18 @@ describe('runtime configuration and security primitives', () => {
     expect(assignmentText).toContain('password=[REDACTED]');
     expect(assignmentText).toContain('api_key: [REDACTED]');
     expect(assignmentText).toContain('?token=[REDACTED]&ok=1');
-    const jsonText = redactText('{"password":"hunter2","access_token":"abc123","safe":"kept"}');
+    const jsonText = redactText(
+      JSON.stringify({
+        password: 'hunter"2\\tail',
+        access_token: 'abc123',
+        nested: { api_key: 'nested-secret' },
+        safe: 'kept',
+      }),
+    );
     expect(JSON.parse(jsonText)).toEqual({
       password: '[REDACTED]',
       access_token: '[REDACTED]',
+      nested: { api_key: '[REDACTED]' },
       safe: 'kept',
     });
     const environmentText = redactText('OPENAI_API_KEY=prefix/SECRET+suffix== SAFE=value');
