@@ -47,6 +47,7 @@ import {
 } from './scroll.js';
 import {
   type ActiveRunsByThread,
+  type LiveOutputByRun,
   type QueuedRunsByThread,
   type SelectionIdentity,
   type SelectionLoad,
@@ -54,8 +55,10 @@ import {
   type ThreadRunState,
   type WebEventRecord,
   activeRunForThread,
+  liveOutputSnapshot,
   projectRunEvents,
   reduceActiveRunsByThread,
+  reduceLiveOutputByRun,
   reduceQueuedRunsByThread,
   selectionIdentityMatches,
   selectionSnapshotCanCommit,
@@ -109,6 +112,7 @@ function App(): React.JSX.Element {
   const [connection, setConnection] = useState<ConnectionState>('connecting');
   const [input, setInput] = useState('');
   const [activeRunsByThread, setActiveRunsByThread] = useState<ActiveRunsByThread>({});
+  const [liveOutputByRun, setLiveOutputByRun] = useState<LiveOutputByRun>({});
   const [queuedRunsByThread, setQueuedRunsByThread] = useState<QueuedRunsByThread>({});
   const [queuedPromptsByRun, setQueuedPromptsByRun] = useState<Record<string, string>>({});
   const [eventSubscription, setEventSubscription] = useState<{
@@ -217,6 +221,7 @@ function App(): React.JSX.Element {
   const clearThreadView = useCallback((): void => {
     setMessages([]);
     setEvents([]);
+    setLiveOutputByRun({});
     setHistoryCursor(null);
     setHasEarlierMessages(false);
     setLoadingEarlierMessages(false);
@@ -376,6 +381,7 @@ function App(): React.JSX.Element {
       setHasEarlierMessages(presentation.hasMore);
       setLoadingEarlierMessages(false);
       setEvents(runState.events);
+      setLiveOutputByRun(liveOutputSnapshot(runState));
       setActiveRunsByThread((current) => ({
         ...current,
         [threadId]: runState.activeRunId,
@@ -530,6 +536,7 @@ function App(): React.JSX.Element {
       const batch = pendingEvents.splice(0);
       if (!batch.length) return;
       setActiveRunsByThread((current) => batch.reduce(reduceActiveRunsByThread, current));
+      setLiveOutputByRun((current) => batch.reduce(reduceLiveOutputByRun, current));
       setQueuedRunsByThread((current) => batch.reduce(reduceQueuedRunsByThread, current));
       setQueuedPromptsByRun((current) => {
         const next = { ...current };
@@ -792,7 +799,7 @@ function App(): React.JSX.Element {
       id: `run:${runProjection.runId}:assistant`,
       runId: runProjection.runId,
       role: 'assistant',
-      markdown: runProjection.liveOutput,
+      markdown: liveOutputByRun[runProjection.runId] ?? runProjection.liveOutput,
       createdAt: startedAt,
       ...(activeProvider ? { provider: activeProvider } : {}),
       status: 'streaming',
@@ -813,7 +820,7 @@ function App(): React.JSX.Element {
       attachments: [],
       artifacts: [],
     };
-  }, [activeProvider, runProjection, threadEvents]);
+  }, [activeProvider, liveOutputByRun, runProjection, threadEvents]);
 
   const createSession = async (): Promise<void> => {
     followNextOutput();

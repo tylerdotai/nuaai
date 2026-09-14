@@ -3,9 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 
 import type { PermissionContext } from '../src/security/permissions.js';
-import { type ToolContext, ToolRegistry } from '../src/tools/registry.js';
+import { type ToolContext, ToolRegistry, createToolBudget } from '../src/tools/registry.js';
 import { initWorkspace, writeWorkspaceFile } from '../src/workspace/fs.js';
 
 const allPermissions: PermissionContext = {
@@ -91,6 +92,104 @@ function services() {
 }
 
 describe('model-facing tool registry contracts', () => {
+  it('publishes complete governance metadata for every registered tool', async () => {
+    const root = await makeRoot();
+    const dependencies = services();
+    const registry = new ToolRegistry(
+      root,
+      dependencies.search as never,
+      { browserEnabled: true },
+      dependencies as never,
+    );
+
+    const tools = registry.list();
+    expect(tools.length).toBeGreaterThan(0);
+    for (const tool of tools) {
+      expect(tool.governance).toMatchObject({
+        owner: expect.any(String),
+        costClass: expect.stringMatching(/^(low|medium|high)$/),
+        authMode: expect.stringMatching(/^(none|host|configured)$/),
+        sideEffects: expect.stringMatching(/^(none|workspace|durable|external|unknown)$/),
+        approval: expect.stringMatching(/^(none|profile)$/),
+        maxCallsPerRun: expect.any(Number),
+      });
+      expect(tool.governance.owner).not.toBe('');
+      expect(tool.governance.maxCallsPerRun).toBeGreaterThan(0);
+    }
+    expect(tools.find((tool) => tool.name === 'computer.use')).toMatchObject({
+      permission: 'execute',
+      governance: {
+        owner: 'computer',
+        costClass: 'high',
+        authMode: 'configured',
+        sideEffects: 'external',
+        approval: 'profile',
+      },
+    });
+  });
+
+  it('does not expose a public authorization bypass', async () => {
+    const root = await makeRoot();
+    const registry = new ToolRegistry(root);
+
+    expect('authorize' in registry).toBe(false);
+    expect('executeAuthorized' in registry).toBe(false);
+  });
+
+  it('rejects side-effecting tools that bypass profile approval', async () => {
+    const root = await makeRoot();
+    const registry = new ToolRegistry(root);
+
+    expect(() =>
+      registry.register({
+        name: 'unsafe.external',
+        description: 'Unsafe external mutation',
+        permission: 'read',
+        governance: {
+          owner: 'unsafe',
+          costClass: 'high',
+          authMode: 'configured',
+          sideEffects: 'external',
+          approval: 'none',
+          maxCallsPerRun: 1,
+        },
+        parameters: { type: 'object', properties: {} },
+        input: z.object({}),
+        execute: async () => ({ ok: true }),
+      }),
+    ).toThrow('Side-effecting tool requires profile approval');
+  });
+
+  it('enforces each tool call ceiling inside the registry gatekeeper', async () => {
+    const root = await makeRoot();
+    const registry = new ToolRegistry(root);
+    let executions = 0;
+    registry.register({
+      name: 'probe.read',
+      description: 'Read one bounded probe',
+      permission: 'read',
+      governance: {
+        owner: 'probe',
+        costClass: 'low',
+        authMode: 'none',
+        sideEffects: 'none',
+        approval: 'none',
+        maxCallsPerRun: 1,
+      },
+      parameters: { type: 'object', properties: {} },
+      input: z.object({}),
+      execute: async () => ({ executions: ++executions }),
+    });
+    const budget = createToolBudget(10, 10);
+    const context = { root, permissions: allPermissions, budget };
+
+    await expect(registry.execute('probe.read', {}, context)).resolves.toEqual({ executions: 1 });
+    await expect(registry.execute('probe.read', {}, context)).rejects.toMatchObject({
+      reason: 'per_tool_budget_exhausted',
+    });
+    expect(executions).toBe(1);
+  });
+
   it('exposes browser automation independently of search when configured that way', async () => {
     const root = await makeRoot();
     const stack = {
@@ -324,6 +423,7 @@ describe('model-facing tool registry contracts', () => {
       capabilities: { filesystem: true },
     };
     expect(registry.schemas(readOnly).some((tool) => tool.name === 'workspace.write')).toBe(false);
+    expect(registry.schemas(readOnly).some((tool) => tool.name === 'computer.use')).toBe(false);
     expect(registry.schemas().some((tool) => tool.name === 'browser.open')).toBe(false);
     await expect(
       registry.execute('web.search', { query: 'blocked' }, { root, permissions: readOnly }),
@@ -341,6 +441,9 @@ describe('model-facing tool registry contracts', () => {
         { root, permissions: readOnly },
       ),
     ).rejects.toThrow('Permission required: write');
+    await expect(
+      registry.execute('computer.use', { action: 'capture' }, { root, permissions: readOnly }),
+    ).rejects.toThrow('Permission required: execute');
     await expect(
       registry.execute('does.not.exist', {}, { root, permissions: readOnly }),
     ).rejects.toThrow('Unknown tool');

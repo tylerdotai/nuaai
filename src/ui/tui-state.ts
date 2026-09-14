@@ -117,6 +117,7 @@ export type TuiEvent =
   | { type: 'thread.selected'; threadId: string }
   | { type: 'connection.changed'; status: TuiConnection; error?: string }
   | { type: 'run.started'; runId: string; provider: string; model: string }
+  | { type: 'model.started'; runId: string }
   | { type: 'model.delta'; runId: string; text: string }
   | { type: 'tool.started'; runId: string; name: string }
   | { type: 'tool.completed'; runId: string; name: string }
@@ -211,6 +212,8 @@ export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
         lastRunStatus: null,
         error: null,
       };
+    case 'model.started':
+      return event.runId === state.activeRunId ? { ...state, stream: '' } : state;
     case 'model.delta':
       return event.runId === state.activeRunId
         ? { ...state, stream: `${state.stream}${event.text}` }

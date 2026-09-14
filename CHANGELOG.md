@@ -2,6 +2,15 @@
 
 All notable NUAAI changes are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- Long provider responses now retain only the current model attempt, batch token-sized deltas, persist an authoritative reconnect snapshot, and survive bounded event replay without clipping or concatenating discarded drafts.
+- Substantive final answers are no longer rejected for quoting future-intent examples; genuine model-turn exhaustion receives one no-tools grace turn before a truthful terminal failure.
+- The existing tool registry now owns explicit governance metadata, profile approval integrity, weighted and per-tool budgets, pre-execution admission, durable policy audit events, and execute-level protection for computer control.
+- Configured MCP tools now stay behind the stable registry discovery/execution pair instead of being duplicated into provider catalogs.
+
 ## [1.0.0] - 2026-09-14
 
 ### Added

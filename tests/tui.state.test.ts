@@ -35,11 +35,13 @@ describe('TUI event state', () => {
     expect(next.connection).toBe('connected');
   });
 
-  it('accumulates streamed output and tool activity until the run completes', () => {
+  it('keeps only the current model attempt and tool activity until the run completes', () => {
     const events: TuiEvent[] = [
       { type: 'run.started', runId: 'run-1', provider: 'deterministic', model: 'local-test' },
-      { type: 'model.delta', runId: 'run-1', text: 'hello ' },
+      { type: 'model.started', runId: 'run-1' },
+      { type: 'model.delta', runId: 'run-1', text: 'discarded draft' },
       { type: 'tool.started', runId: 'run-1', name: 'workspace.list' },
+      { type: 'model.started', runId: 'run-1' },
       { type: 'model.delta', runId: 'run-1', text: 'world' },
       { type: 'tool.completed', runId: 'run-1', name: 'workspace.list' },
     ];
@@ -47,7 +49,7 @@ describe('TUI event state', () => {
 
     expect(active.activeRunId).toBe('run-1');
     expect(active.provider).toEqual({ name: 'deterministic', model: 'local-test' });
-    expect(active.stream).toBe('hello world');
+    expect(active.stream).toBe('world');
     expect(active.tools).toEqual([{ name: 'workspace.list', status: 'completed' }]);
 
     const completed = reduceTuiEvent(active, { type: 'run.completed', runId: 'run-1' });

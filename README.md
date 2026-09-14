@@ -222,6 +222,9 @@ Matrix admission and delivery policy is daemon-owned, before model execution:
 - Every turn receives one stable permission-filtered tool catalog. A model call outside that catalog is rejected and never executed; repeated invalid calls fail fast instead of consuming the entire run timeout.
 - Normal conversation context defaults to `1,000,000` bytes and retrieved memory defaults to `64,000` bytes. Automatic recall falls back to lexical ranking when embeddings are unavailable. Live verification and memory mutations run isolated from prior transcript and memory injection.
 - Runs allow 48 tool calls by default. Reaching the budget stops further actions and forces a no-tools finalization turn from evidence already gathered instead of discarding the work as a hard failure.
+- Runs allow 48 ordinary model turns plus one no-tools finalization grace turn. Streamed output is batched, reset at each provider-attempt boundary, and snapshotted durably so reconnects preserve the complete current response without combining discarded drafts.
+- The central tool registry declares owner, cost class, auth mode, side effects, approval policy, and a per-run ceiling for every tool. Registry admission validates permission, input, weighted run cost, and per-tool usage before emitting `tool.started`; `computer.use`, generic MCP execution, and external-agent dispatch are execute-gated high-cost boundaries.
+- When MCP is configured through the registry, models receive stable generic `mcp.discover` and `mcp.execute` tools rather than every discovered remote schema. Discovery stays available without duplicating the executable authority or inflating each provider prompt.
 
 The current bridge does not decrypt encrypted-room events. Use an unencrypted bot room until a real Matrix crypto client is implemented; the bridge does not claim E2EE support.
 

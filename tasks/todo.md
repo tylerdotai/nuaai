@@ -62,3 +62,53 @@ Production routing now uses direct streaming Responses. The endpoint is fixed, r
 - [ ] Streaming does not move a reader who scrolled away from the bottom.
 - [ ] Desktop 1440×900 and phone 390×844 pass geometry, safe-area, console, keyboard, reduced-motion, and screenshot review.
 - [ ] Lint, typecheck, full tests, per-file coverage, builds, package smoke, exact-tree review, and GitHub CI are green before release.
+
+## Long-response streaming and finalization repair
+
+### Proven failures
+
+- [x] Reconstruct the live failed run from durable messages, runs, and events.
+- [x] Confirm that quoted future-intent examples falsely reject a substantive final answer.
+- [x] Confirm that provisional provider attempts are concatenated into one visible stream.
+- [x] Confirm that thousands of token-sized events exceed the bounded reconnect snapshot.
+
+### Implementation contract
+
+- [x] Reset visible provisional output at every `model.started` boundary while retaining one assistant response per user turn.
+- [x] Batch tiny model deltas and persist the current attempt as the authoritative reconnect snapshot.
+- [x] Accept substantive non-empty final responses even when the content quotes future-intent phrases.
+- [x] Allow one final no-tools grace turn after the real model-turn budget is consumed.
+- [x] Keep finite timeout, output-size, and action-count safety ceilings without presenting normal completion as a budget failure.
+
+### Verification contract
+
+- [x] RED tests reproduce false final rejection, attempt concatenation, reconnect truncation, token-event amplification, and missing grace finalization.
+- [x] Focused runtime, presentation, web-state, TUI-state, and browser tests pass.
+- [x] Complete `npm run gate` passes.
+- [ ] Live paired PWA streams and preserves a long multi-turn answer through reload without clipping, duplication, or a false failure.
+
+## Permissioned tool-governance follow-up
+
+### Keep
+
+- [x] One central `ToolRegistry`, JSON schemas, Zod validation, capability-filtered exposure, registry-owned execution, MCP mediation, and stable per-run tool catalogs.
+
+### Implement
+
+- [x] Add registry-owned metadata for owner, cost class, auth mode, side effects, approval policy, and per-run tool ceiling.
+- [x] Reclassify `computer.use` from read to execute because click/type actions can mutate external state.
+- [x] Expose governance metadata in the capability manifest and model-facing capability text.
+- [x] Enforce weighted run cost and per-tool ceilings before execution, with structured failure events and no silent fallback.
+- [x] Keep post-admission execution internal so callers cannot forge a budget/permission bypass.
+- [x] Produce an automated catalog audit proving every registered tool has complete governance metadata.
+- [x] Keep configured MCP servers behind generic registry discovery/execution instead of duplicating remote schemas into provider catalogs.
+
+### Reject for this repair
+
+- [x] Do not add Composio, ACI, AgentLock, or another dependency when NUAAI already owns the executable registry boundary.
+- [x] Do not mutate tool visibility with per-step top-k retrieval; keep one stable permission-filtered catalog for prompt caching and predictable access.
+
+### Verification
+
+- [x] RED/GREEN tests cover catalog completeness, read-only denial for computer control, weighted cost exhaustion, per-tool ceilings, and manifest disclosure.
+- [x] Full canonical gate passes on the revised exact tree before deployment.

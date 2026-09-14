@@ -216,6 +216,48 @@ describe('structured conversation presentation', () => {
     ]);
   });
 
+  it('uses the durable run snapshot when a long active stream exceeds replay history', async () => {
+    const { store } = await createStore();
+    const created = store.createSession('Long streaming', 220);
+    const run = store.createRun(
+      created.thread.id,
+      'Write a long report',
+      'codex',
+      'gpt-test',
+      'presentation-long-streaming',
+      221,
+    );
+    const snapshot = `Beginning ${'durable output '.repeat(1_500)}Final line.`;
+    store.updateRun(run.id, { status: 'running', output: snapshot }, 222);
+    const user = store.addMessage(
+      created.thread.id,
+      'user',
+      'Write a long report',
+      'codex',
+      'gpt-test',
+      223,
+    );
+    store.storeMessageArtifact(user.id, 'run_link', { runId: run.id }, 223);
+    const context = {
+      sessionId: created.session.id,
+      threadId: created.thread.id,
+      runId: run.id,
+    };
+    store.appendEvent(createEvent('run.started', {}, context));
+    for (let index = 0; index < 400; index += 1)
+      store.appendEvent(createEvent('model.delta', { text: String(index % 10) }, context));
+
+    const view = buildThreadPresentation(store, created.thread.id);
+    expect(view.messages).toEqual([
+      expect.objectContaining({ id: user.id, role: 'user' }),
+      expect.objectContaining({
+        id: `run:${run.id}:assistant`,
+        markdown: snapshot,
+        status: 'streaming',
+      }),
+    ]);
+  });
+
   it('paginates structured message views without losing the older-history cursor', async () => {
     const { store } = await createStore();
     const created = store.createSession('Presentation pages', 300);

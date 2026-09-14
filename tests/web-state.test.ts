@@ -5,8 +5,10 @@ import {
   SelectionLoadCoordinator,
   type WebEventRecord,
   activeRunForThread,
+  liveOutputSnapshot,
   projectRunEvents,
   reduceActiveRunsByThread,
+  reduceLiveOutputByRun,
   reduceQueuedRunsByThread,
   selectionIdentityMatches,
   selectionLoadCanCommit,
@@ -51,6 +53,53 @@ describe('web run event projection', () => {
     ]);
 
     expect(projection).toMatchObject({ runId: 'run-2', status: 'running', liveOutput: 'new' });
+  });
+
+  it('replaces a provisional draft when a newer model attempt starts', () => {
+    const projection = projectRunEvents([
+      event(1, 'run-1', 'model.started', { turn: 0 }),
+      event(2, 'run-1', 'model.delta', { turn: 0, text: 'discarded draft' }),
+      event(3, 'run-1', 'model.completed', { turn: 0 }),
+      event(4, 'run-1', 'model.started', { turn: 1 }),
+      event(5, 'run-1', 'model.delta', { turn: 1, text: 'final answer' }),
+    ]);
+
+    expect(projection).toMatchObject({
+      runId: 'run-1',
+      status: 'running',
+      liveOutput: 'final answer',
+    });
+  });
+
+  it('seeds reconnect output from the durable run snapshot and appends later deltas', () => {
+    const runState = {
+      version: 1 as const,
+      threadId: 'thread-1',
+      run: {
+        id: 'run-1',
+        threadId: 'thread-1',
+        status: 'running',
+        provider: 'codex',
+        model: 'gpt-test',
+        output: 'complete durable snapshot',
+        cancelRequested: false,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+      activeRunId: 'run-1',
+      queuedRunIds: [],
+      queuedRuns: [],
+      events: [],
+      lastEventId: 500,
+    };
+    const seeded = liveOutputSnapshot(runState);
+    expect(seeded).toEqual({ 'run-1': 'complete durable snapshot' });
+    expect(
+      reduceLiveOutputByRun(seeded, event(501, 'run-1', 'model.delta', { text: ' plus tail' })),
+    ).toEqual({ 'run-1': 'complete durable snapshot plus tail' });
+    expect(
+      reduceLiveOutputByRun(seeded, event(502, 'run-1', 'model.started', { turn: 2 })),
+    ).toEqual({ 'run-1': '' });
   });
 
   it('projects readable action states and retains failed outcomes', () => {

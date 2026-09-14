@@ -121,6 +121,32 @@ export function selectionIdentityMatches(
 
 export type ActiveRunsByThread = Record<string, string | null>;
 export type QueuedRunsByThread = Record<string, string[]>;
+export type LiveOutputByRun = Record<string, string>;
+
+export function liveOutputSnapshot(runState: ThreadRunState): LiveOutputByRun {
+  const run = runState.run;
+  return run && run.id === runState.activeRunId ? { [run.id]: run.output } : {};
+}
+
+export function reduceLiveOutputByRun(
+  state: LiveOutputByRun,
+  event: WebEventRecord,
+): LiveOutputByRun {
+  if (!event.runId) return state;
+  if (event.type === 'run.started' || event.type === 'model.started')
+    return { ...state, [event.runId]: '' };
+  if (event.type === 'model.delta')
+    return {
+      ...state,
+      [event.runId]: `${state[event.runId] ?? ''}${String(event.payload.text ?? '')}`,
+    };
+  if (terminalEvents.has(event.type)) {
+    if (!(event.runId in state)) return state;
+    const { [event.runId]: _removed, ...remaining } = state;
+    return remaining;
+  }
+  return state;
+}
 
 const queuedRunEvents = new Set(['run.created', 'run.queued']);
 
@@ -181,8 +207,11 @@ export function projectRunEvents(
   for (const event of events) {
     if (event.runId !== selectedRunId) continue;
     if (event.type === 'run.created' || event.type === 'run.queued') status = 'queued';
-    else if (event.type === 'run.started' || event.type === 'model.started') status = 'running';
-    else if (event.type === 'model.delta') {
+    else if (event.type === 'run.started') status = 'running';
+    else if (event.type === 'model.started') {
+      status = 'running';
+      liveOutput = '';
+    } else if (event.type === 'model.delta') {
       status = 'running';
       liveOutput += String(event.payload.text ?? '');
     } else if (event.type === 'tool.started') {

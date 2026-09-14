@@ -146,6 +146,16 @@ function failureForRun(
   };
 }
 
+function activeRunOutput(run: RunRow, events: Array<EventRecord & { id: number }>): string {
+  if (run.output) return run.output;
+  let output = '';
+  for (const event of events) {
+    if (event.type === 'model.started') output = '';
+    else if (event.type === 'model.delta') output += String(event.payload.text ?? '');
+  }
+  return output;
+}
+
 export function buildThreadPresentation(
   store: DatabaseStore,
   threadId: string,
@@ -222,10 +232,7 @@ export function buildThreadPresentation(
     const events = getEvents(latestRun.id);
     const markdown =
       latestRun.status === 'queued' || latestRun.status === 'running'
-        ? events
-            .filter((event) => event.type === 'model.delta')
-            .map((event) => String(event.payload.text ?? ''))
-            .join('')
+        ? activeRunOutput(latestRun, events)
         : latestRun.output;
     views.push({
       id: `run:${latestRun.id}:assistant`,

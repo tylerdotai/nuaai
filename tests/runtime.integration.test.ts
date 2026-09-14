@@ -123,6 +123,7 @@ describe('runtime configuration and security primitives', () => {
     });
     expect(defaults.limits.runTimeoutMs).toBeGreaterThan(defaults.provider.codex.timeoutMs);
     expect(defaults.limits.maxToolCalls).toBe(48);
+    expect(defaults.limits.maxTurns).toBeGreaterThanOrEqual(defaults.limits.maxToolCalls);
     const codexConfig = parseRuntimeConfig({ provider: { name: 'codex' } }, root);
     expect(codexConfig).toMatchObject({
       name: 'NUAAI',
@@ -2677,6 +2678,79 @@ describe('agent runtime orchestration', () => {
     expect(store.listEvents().map((event) => event.type)).toEqual(
       expect.arrayContaining(['capabilities.assembled', 'prompt.assembled']),
     );
+    expect(
+      store.listEvents().find((event) => event.type === 'capabilities.assembled')?.payload.tools,
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: 'workspace.write',
+          governance: expect.objectContaining({ sideEffects: 'workspace', approval: 'profile' }),
+        }),
+      ]),
+    );
+  });
+
+  it('keeps discovered MCP tools behind the registry discovery boundary', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests = new Map<string, ProviderRequest>();
+    const provider = (name: string, ownsToolLoop: boolean): ProviderAdapter => ({
+      ...makeAgentProvider(name, async function* (request) {
+        requests.set(name, request);
+        yield { type: 'done', text: 'registry catalog received' };
+      }),
+      ownsToolLoop,
+    });
+    const direct = provider('registry-direct', false);
+    const owned = provider('registry-owned', true);
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const mcp = {
+      schemas: () => [
+        {
+          name: 'mcp.remote.expensive',
+          description: 'An individually discovered MCP tool',
+          parameters: { type: 'object' },
+        },
+      ],
+      status: () => ({ servers: ['remote'], failures: {}, tools: [] }),
+      discover: async () => [{ name: 'mcp.remote.expensive' }],
+      executeComputer: async () => ({ ok: true }),
+      execute: async () => ({ ok: true }),
+    };
+    const tools = new ToolRegistry(root, undefined, {}, { mcp } as never);
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'registry-direct': direct, 'registry-owned': owned, ollama }),
+      tools,
+      mcp: mcp as never,
+    });
+
+    for (const providerName of ['registry-direct', 'registry-owned']) {
+      const created = runtime.createSession(providerName);
+      const run = runtime.startRun({
+        threadId: created.thread.id,
+        input: 'Tell me what tools are available.',
+        provider: providerName,
+        permissions: permissive,
+      });
+      await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({ status: 'completed' });
+    }
+
+    const directNames = requests.get('registry-direct')?.tools?.map((tool) => tool.name) ?? [];
+    expect(directNames).toEqual(expect.arrayContaining(['mcp.discover', 'mcp.execute']));
+    expect(directNames).not.toContain('mcp.remote.expensive');
+    const dynamicNames =
+      requests
+        .get('registry-owned')
+        ?.dynamicTools?.map((tool) => `${tool.namespace}.${tool.name}`) ?? [];
+    expect(dynamicNames).toEqual(
+      expect.arrayContaining(['nuaai.mcp_discover', 'nuaai.mcp_execute']),
+    );
+    expect(dynamicNames).not.toContain('nuaai.mcp_remote_expensive');
   });
 
   it('rejects an action claim when the model emits no tool call', async () => {
@@ -3348,6 +3422,319 @@ describe('agent runtime orchestration', () => {
     expect(requests[2]?.messages.at(-1)).toMatchObject({ role: 'user' });
     expect(requests[2]?.messages.filter((message) => message.role === 'system')).toHaveLength(1);
     expect(requests[2]?.messages[0]).toMatchObject({ role: 'system' });
+  });
+
+  it('accepts a substantive final answer that quotes unfinished-promise examples', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let requests = 0;
+    const report = `${'Verified evidence. '.repeat(80)}The guardrail discusses phrases such as “I’ll check…” and “Let me inspect…” without making either promise. Final conclusion: the requested analysis is complete.`;
+    const provider = makeAgentProvider('quoted-final', async function* () {
+      requests += 1;
+      if (requests === 1) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'workspace.list', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: report };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'quoted-final': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Quoted final response');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect the workspace and explain the completion guardrail',
+      provider: 'quoted-final',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: report,
+    });
+    expect(requests).toBe(2);
+  });
+
+  it('uses one no-tools grace turn after the ordinary model-turn budget', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('grace-final', async function* (request) {
+      requests.push(request);
+      if (request.tools?.length) {
+        yield {
+          type: 'tool_call',
+          id: `tool-${requests.length}`,
+          name: 'workspace.list',
+          arguments: {},
+        };
+        return;
+      }
+      yield { type: 'done', text: 'Final answer from completed tool evidence.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...defaults,
+        limits: { ...defaults.limits, maxTurns: 2 },
+      },
+      store,
+      providers: providerMap({ 'grace-final': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Grace finalization');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect the workspace thoroughly',
+      provider: 'grace-final',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Final answer from completed tool evidence.',
+    });
+    expect(requests).toHaveLength(3);
+    expect(requests[2]?.tools).toEqual([]);
+  });
+
+  it('enforces the registry cost budget before executing another tool', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let turns = 0;
+    let executions = 0;
+    const provider = makeAgentProvider('cost-budget', async function* (request) {
+      turns += 1;
+      if (request.tools?.length && turns <= 2) {
+        yield {
+          type: 'tool_call',
+          id: `cost-${turns}`,
+          name: turns === 1 ? 'probe.first' : 'probe.second',
+          arguments: {},
+        };
+        return;
+      }
+      yield { type: 'done', text: 'Finalized from the first verified probe.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const tools = new ToolRegistry(root);
+    for (const name of ['probe.first', 'probe.second'])
+      tools.register({
+        name,
+        description: 'Run one expensive probe',
+        permission: 'read',
+        governance: {
+          owner: 'probe',
+          costClass: 'high',
+          authMode: 'none',
+          sideEffects: 'none',
+          approval: 'none',
+          maxCallsPerRun: 8,
+        },
+        parameters: { type: 'object', properties: {} },
+        input: z.object({}),
+        execute: async () => ({ executions: ++executions }),
+      });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...defaults,
+        limits: { ...defaults.limits, maxToolCostUnits: 4 },
+      },
+      store,
+      providers: providerMap({ 'cost-budget': provider, ollama }),
+      tools,
+    });
+    const created = runtime.createSession('Cost budget');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect both probes',
+      provider: 'cost-budget',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Finalized from the first verified probe.',
+    });
+    expect(executions).toBe(1);
+    expect(
+      store
+        .listEvents()
+        .some(
+          (event) =>
+            event.runId === run.id &&
+            event.type === 'tool.failed' &&
+            event.payload.reason === 'tool_cost_budget_exhausted',
+        ),
+    ).toBe(true);
+  });
+
+  it('reports an unresolved tool failure instead of mislabeling grace exhaustion', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let requests = 0;
+    const provider = makeAgentProvider('grace-failure', async function* (request) {
+      requests += 1;
+      if (request.tools?.length && requests === 1) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'probe.fail', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'The action could not be completed.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const tools = new ToolRegistry(root);
+    tools.register({
+      name: 'probe.fail',
+      description: 'Fail one simulated action',
+      permission: 'read',
+      governance: {
+        owner: 'probe',
+        costClass: 'low',
+        authMode: 'none',
+        sideEffects: 'none',
+        approval: 'none',
+        maxCallsPerRun: 2,
+      },
+      parameters: { type: 'object', properties: {} },
+      input: z.object({}),
+      execute: async () => {
+        throw new Error('simulated action failure');
+      },
+    });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: { ...defaults, limits: { ...defaults.limits, maxTurns: 1 } },
+      store,
+      providers: providerMap({ 'grace-failure': provider, ollama }),
+      tools,
+    });
+    const created = runtime.createSession('Grace failure truth');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect the workspace',
+      provider: 'grace-failure',
+      permissions: permissive,
+    });
+
+    const completed = await runtime.waitForRun(run.id);
+    expect(completed).toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('tool failed: probe.fail: simulated action failure'),
+    });
+    expect(completed.output).not.toContain('tool-turn limit');
+  });
+
+  it('keeps provider message roles alternating when grace follows a recovery prompt', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requestRoles: string[][] = [];
+    const provider = makeAgentProvider('grace-roles', async function* (request) {
+      requestRoles.push(request.messages.map((message) => message.role));
+      if (requestRoles.length === 1) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'probe.fail', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'The action could not be completed.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const tools = new ToolRegistry(root);
+    tools.register({
+      name: 'probe.fail',
+      description: 'Fail one simulated action',
+      permission: 'read',
+      governance: {
+        owner: 'probe',
+        costClass: 'low',
+        authMode: 'none',
+        sideEffects: 'none',
+        approval: 'none',
+        maxCallsPerRun: 2,
+      },
+      parameters: { type: 'object', properties: {} },
+      input: z.object({}),
+      execute: async () => {
+        throw new Error('simulated action failure');
+      },
+    });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: { ...defaults, limits: { ...defaults.limits, maxTurns: 2 } },
+      store,
+      providers: providerMap({ 'grace-roles': provider, ollama }),
+      tools,
+    });
+    const created = runtime.createSession('Grace role alternation');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect the workspace',
+      provider: 'grace-roles',
+      permissions: permissive,
+    });
+
+    await runtime.waitForRun(run.id);
+    expect(requestRoles).toHaveLength(3);
+    expect(
+      requestRoles[2]?.some((role, index, roles) => role === 'user' && roles[index - 1] === 'user'),
+    ).toBe(false);
+  });
+
+  it('batches tiny provider deltas without losing the completed response', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const response = `${'streamed evidence '.repeat(240)}complete`;
+    const provider = makeAgentProvider('tiny-deltas', async function* () {
+      for (const character of response) yield { type: 'delta', text: character };
+      yield { type: 'done', text: '' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'tiny-deltas': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const deltas: string[] = [];
+    runtime.subscribe((event) => {
+      if (event.type === 'model.delta') deltas.push(String(event.payload.text ?? ''));
+    });
+    const created = runtime.createSession('Batched stream');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'write a long response',
+      provider: 'tiny-deltas',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: response,
+    });
+    expect(deltas.join('')).toBe(response);
+    expect(deltas.length).toBeLessThan(100);
   });
 
   it('keeps a non-empty final response when tool activity reaches the turn limit', async () => {

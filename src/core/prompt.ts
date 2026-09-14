@@ -24,7 +24,7 @@ function capabilityText(manifest: CapabilityManifest): string {
     ? manifest.tools
         .map(
           (tool) =>
-            `- ${tool.exposedAs ?? tool.name}: ${tool.description} (permission: ${tool.permission})`,
+            `- ${tool.exposedAs ?? tool.name}: ${tool.description} (permission: ${tool.permission}; owner: ${tool.governance.owner}; cost: ${tool.governance.costClass}; auth: ${tool.governance.authMode}; effects: ${tool.governance.sideEffects}; approval: ${tool.governance.approval}; per-run limit: ${tool.governance.maxCallsPerRun})`,
         )
         .join('\n')
     : '- none';

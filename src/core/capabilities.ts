@@ -1,6 +1,6 @@
 import type { ProviderAdapter, ProviderDynamicTool } from '../providers/types.js';
 import type { PermissionContext } from '../security/permissions.js';
-import type { ToolRegistry } from '../tools/registry.js';
+import type { ToolGovernance, ToolRegistry } from '../tools/registry.js';
 
 export type VerificationPolicy =
   | 'none'
@@ -14,6 +14,7 @@ export interface CapabilityTool {
   description: string;
   parameters: Record<string, unknown>;
   permission: 'read' | 'write' | 'execute';
+  governance: ToolGovernance;
   source: 'nuaai';
   exposedAs?: string;
 }
@@ -83,9 +84,18 @@ export function buildCapabilityManifest(input: CapabilityManifestInput): Capabil
   const registeredTools =
     typeof (input.tools as ToolRegistry & { list?: unknown }).list === 'function'
       ? input.tools.list()
-      : input.tools
-          .schemas(input.permissions)
-          .map((tool) => ({ ...tool, permission: 'read' as const }));
+      : input.tools.schemas(input.permissions).map((tool) => ({
+          ...tool,
+          permission: 'read' as const,
+          governance: {
+            owner: tool.name.split('.')[0] || 'runtime',
+            costClass: 'low' as const,
+            authMode: 'none' as const,
+            sideEffects: 'unknown' as const,
+            approval: 'none' as const,
+            maxCallsPerRun: 1,
+          },
+        }));
   const tools = registeredTools
     .filter((tool) => input.permissions.approved.has(tool.permission))
     .map((tool) => ({
@@ -93,6 +103,7 @@ export function buildCapabilityManifest(input: CapabilityManifestInput): Capabil
       description: tool.description,
       parameters: tool.parameters,
       permission: tool.permission,
+      governance: tool.governance,
       source: 'nuaai' as const,
       ...(input.provider.ownsToolLoop
         ? { exposedAs: `nuaai.${tool.name.replaceAll('.', '_')}` }

@@ -39,9 +39,15 @@
 }
 ```
 
-Runtime limits are available under `limits`: `maxTurns`, `maxToolCalls`, `maxOutputBytes`, `runTimeoutMs`, `providerTimeoutMs`, `toolTimeoutMs`, `maxContextBytes`, and `maxMemoryContextBytes`. Keep `runTimeoutMs` above the longest enabled provider timeout so the outer agent loop cannot abort a provider first.
+Runtime limits are available under `limits`: `maxTurns`, `maxToolCalls`, `maxToolCostUnits`, `maxOutputBytes`, `runTimeoutMs`, `providerTimeoutMs`, `toolTimeoutMs`, `maxContextBytes`, and `maxMemoryContextBytes`. Keep `runTimeoutMs` above the longest enabled provider timeout so the outer agent loop cannot abort a provider first.
 
-`maxToolCalls` defaults to `48`. When the budget is exhausted, NUAAI rejects additional calls coherently, removes the tool catalog for the next turn, and asks the model to finalize from completed evidence rather than failing the run immediately.
+`maxTurns` and `maxToolCalls` both default to `48`. A run may use the configured ordinary model turns and then receives one no-tools grace turn for finalization. When the tool-call budget is exhausted, NUAAI rejects additional calls coherently, removes the tool catalog, and asks the model to finalize from completed evidence rather than discarding the response as an immediate hard failure.
+
+`maxToolCostUnits` defaults to `96`. Registry cost classes reserve `1` unit for low-cost calls, `2` for medium, and `4` for high before execution. Every tool also declares a per-run call ceiling. A call that exceeds either ceiling is denied before `tool.started`, produces a structured `tool.failed` reason, removes tools from the next model turn, and requests finalization from completed evidence.
+
+Tool approval is profile-based: `none` requires no permission beyond the tool's read boundary, while `profile` requires an approved write or execute permission. Selecting `operator` pre-authorizes those typed boundaries for the run; NUAAI does not claim to provide an interactive per-call approval queue. Tool catalogs remain stable and permission-filtered for the run instead of changing through per-step top-k retrieval.
+
+Configured MCP servers remain behind registry-owned `mcp.discover` and `mcp.execute`. NUAAI does not duplicate every discovered MCP schema into the provider catalog when that generic boundary is present; this preserves one authority path, prompt stability, and the same permission/cost gate for remote calls.
 
 `permissions.web`, `permissions.matrix`, and `permissions.scheduler` accept `operator` or `read-only`. `operator` is the production default for authenticated/allowlisted clients and enables typed read, write, and execute tools inside configured boundaries. `read-only` remains available as an explicit deployment choice.
 

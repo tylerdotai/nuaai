@@ -6,6 +6,40 @@ import type { ProviderStreamEvent } from '../src/providers/types.js';
 afterEach(() => vi.useRealTimers());
 
 describe('deterministic browser fixtures', () => {
+  it('produces a provisional tool turn followed by a complete long stream', async () => {
+    vi.useFakeTimers();
+    const provider = new DeterministicProvider();
+    const request = {
+      model: 'local-test',
+      messages: [{ role: 'user' as const, content: 'browser long stream smoke' }],
+    };
+    const first: ProviderStreamEvent[] = [];
+    for await (const event of provider.stream(request)) first.push(event);
+    expect(first).toEqual(
+      expect.arrayContaining([
+        { type: 'delta', text: 'PROVISIONAL SHOULD DISAPPEAR' },
+        expect.objectContaining({ type: 'tool_call', name: 'workspace.list' }),
+      ]),
+    );
+
+    const second: ProviderStreamEvent[] = [];
+    const completed = (async () => {
+      for await (const event of provider.stream(request)) second.push(event);
+    })();
+    await vi.runAllTimersAsync();
+    await completed;
+    const streamed = second
+      .filter(
+        (event): event is Extract<ProviderStreamEvent, { type: 'delta' }> => event.type === 'delta',
+      )
+      .map((event) => event.text)
+      .join('');
+    expect(streamed).toContain('## Durable long response');
+    expect(streamed).toContain('Evidence line 599');
+    expect(streamed).toContain('FINAL_LONG_RESPONSE_SENTINEL');
+    expect(streamed).not.toContain('PROVISIONAL SHOULD DISAPPEAR');
+  });
+
   it('keeps the cancellation stream active until the caller aborts it', async () => {
     vi.useFakeTimers();
     const controller = new AbortController();

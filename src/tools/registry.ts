@@ -22,10 +22,43 @@ import {
 export interface ToolContext {
   root: string;
   permissions: PermissionContext;
+  budget?: ToolBudget;
   timeoutMs?: number;
   signal?: AbortSignal;
   threadId?: string;
   runId?: string;
+}
+export type ToolCostClass = 'low' | 'medium' | 'high';
+export type ToolAuthMode = 'none' | 'host' | 'configured';
+export type ToolSideEffects = 'none' | 'workspace' | 'durable' | 'external' | 'unknown';
+export type ToolApprovalPolicy = 'none' | 'profile';
+export type ToolBudgetFailureReason =
+  | 'tool_budget_exhausted'
+  | 'tool_cost_budget_exhausted'
+  | 'per_tool_budget_exhausted';
+export interface ToolGovernance {
+  owner: string;
+  costClass: ToolCostClass;
+  authMode: ToolAuthMode;
+  sideEffects: ToolSideEffects;
+  approval: ToolApprovalPolicy;
+  maxCallsPerRun: number;
+}
+export interface ToolBudget {
+  maxCalls: number;
+  maxCostUnits: number;
+  calls: number;
+  costUnits: number;
+  callsByTool: Map<string, number>;
+}
+export class ToolBudgetError extends Error {
+  constructor(
+    message: string,
+    readonly reason: ToolBudgetFailureReason,
+  ) {
+    super(message);
+    this.name = 'ToolBudgetError';
+  }
 }
 export interface ToolServices {
   store?: DatabaseStore;
@@ -39,6 +72,7 @@ export interface ToolDefinition {
   name: string;
   description: string;
   permission: 'read' | 'write' | 'execute';
+  governance: ToolGovernance;
   parameters: Record<string, unknown>;
   input: z.ZodType<unknown>;
   execute(input: unknown, context: ToolContext): Promise<unknown>;
@@ -46,6 +80,43 @@ export interface ToolDefinition {
 
 const empty = z.object({});
 const githubCommands = new Set(['gh']);
+const toolCostUnits: Record<ToolCostClass, number> = { low: 1, medium: 2, high: 4 };
+
+function governance(
+  owner: string,
+  costClass: ToolCostClass,
+  authMode: ToolAuthMode,
+  sideEffects: ToolSideEffects,
+  approval: ToolApprovalPolicy,
+  maxCallsPerRun: number,
+): ToolGovernance {
+  return { owner, costClass, authMode, sideEffects, approval, maxCallsPerRun };
+}
+
+export function createToolBudget(maxCalls: number, maxCostUnits: number): ToolBudget {
+  return { maxCalls, maxCostUnits, calls: 0, costUnits: 0, callsByTool: new Map() };
+}
+
+function reserveToolBudget(tool: ToolDefinition, budget: ToolBudget | undefined): void {
+  if (!budget) return;
+  const callsForTool = budget.callsByTool.get(tool.name) ?? 0;
+  if (callsForTool >= tool.governance.maxCallsPerRun)
+    throw new ToolBudgetError(
+      `Per-tool call budget exhausted for ${tool.name}`,
+      'per_tool_budget_exhausted',
+    );
+  if (budget.calls >= budget.maxCalls)
+    throw new ToolBudgetError('The run tool-call budget is exhausted', 'tool_budget_exhausted');
+  const costUnits = toolCostUnits[tool.governance.costClass];
+  if (budget.costUnits + costUnits > budget.maxCostUnits)
+    throw new ToolBudgetError(
+      'The run tool-cost budget is exhausted',
+      'tool_cost_budget_exhausted',
+    );
+  budget.calls += 1;
+  budget.costUnits += costUnits;
+  budget.callsByTool.set(tool.name, callsForTool + 1);
+}
 
 function assertNetwork(context: ToolContext): void {
   if (!context.permissions.capabilities.network) throw new Error('Network capability required');
@@ -61,6 +132,7 @@ function githubError(result: { stdout: string; stderr: string }): string {
 }
 
 export class ToolRegistry {
+  readonly supportsAdmissionCallback = true;
   private readonly tools = new Map<string, ToolDefinition>();
   constructor(
     root: string,
@@ -72,6 +144,7 @@ export class ToolRegistry {
       name: 'workspace.list',
       description: 'List non-protected files in the NUAAI workspace',
       permission: 'read',
+      governance: governance('workspace', 'low', 'none', 'none', 'none', 48),
       parameters: { type: 'object', properties: {} },
       input: empty,
       execute: async (_input, context) => listWorkspaceFiles(context.root),
@@ -80,6 +153,7 @@ export class ToolRegistry {
       name: 'workspace.read',
       description: 'Read a text file in the NUAAI workspace',
       permission: 'read',
+      governance: governance('workspace', 'low', 'none', 'none', 'none', 48),
       parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
       input: z.object({ path: z.string().min(1) }),
       execute: async (input, context) =>
@@ -90,6 +164,7 @@ export class ToolRegistry {
       description:
         'Inspect any non-protected workspace file type and return metadata plus a bounded text preview when the format is text-readable',
       permission: 'read',
+      governance: governance('workspace', 'low', 'none', 'none', 'none', 48),
       parameters: {
         type: 'object',
         properties: { path: { type: 'string' } },
@@ -103,6 +178,7 @@ export class ToolRegistry {
       name: 'workspace.write',
       description: 'Write a text file in the NUAAI workspace',
       permission: 'write',
+      governance: governance('workspace', 'medium', 'none', 'workspace', 'profile', 16),
       parameters: {
         type: 'object',
         properties: { path: { type: 'string' }, content: { type: 'string' } },
@@ -119,6 +195,7 @@ export class ToolRegistry {
       name: 'workspace.search',
       description: 'Search text in workspace files',
       permission: 'read',
+      governance: governance('workspace', 'low', 'none', 'none', 'none', 48),
       parameters: {
         type: 'object',
         properties: { query: { type: 'string' } },
@@ -133,6 +210,7 @@ export class ToolRegistry {
       description:
         'Run one explicitly allowlisted read-oriented command (cat, date, df, echo, free, head, printf, ps, pwd, stat, tail, uname, uptime, wc, which, or whoami). Put arguments in args. Protected runtime and credential files remain inaccessible, subprocess environments are minimal, and shell operators such as &&, ;, |, and redirects are rejected; issue separate tool calls instead of chaining commands.',
       permission: 'execute',
+      governance: governance('workspace', 'medium', 'host', 'none', 'profile', 24),
       parameters: {
         type: 'object',
         properties: {
@@ -155,6 +233,7 @@ export class ToolRegistry {
       description:
         'Check GitHub CLI authentication through the bounded gh command and return only sanitized account/status information',
       permission: 'execute',
+      governance: governance('github', 'medium', 'host', 'none', 'profile', 16),
       parameters: { type: 'object', properties: {} },
       input: empty,
       execute: async (_input, context) => {
@@ -178,6 +257,7 @@ export class ToolRegistry {
       description:
         'List repositories through gh with an enforced bounded limit; use mode count for an exact small count or rows for structured repository data',
       permission: 'execute',
+      governance: governance('github', 'medium', 'host', 'none', 'profile', 16),
       parameters: {
         type: 'object',
         properties: {
@@ -237,6 +317,7 @@ export class ToolRegistry {
         name: 'web.search',
         description: 'Search the web through local SearXNG with DuckDuckGo fallback',
         permission: 'read',
+        governance: governance('web', 'medium', 'configured', 'none', 'none', 24),
         parameters: {
           type: 'object',
           properties: {
@@ -260,6 +341,7 @@ export class ToolRegistry {
           name: 'web.fetch',
           description: 'Extract a web page through guarded Playwright browser automation',
           permission: 'read',
+          governance: governance('web', 'medium', 'configured', 'none', 'none', 24),
           parameters: {
             type: 'object',
             properties: { url: { type: 'string', format: 'uri' } },
@@ -277,6 +359,7 @@ export class ToolRegistry {
         name: 'browser.open',
         description: 'Open a web page with headless Playwright browser automation',
         permission: 'read',
+        governance: governance('browser', 'medium', 'configured', 'none', 'none', 24),
         parameters: {
           type: 'object',
           properties: { url: { type: 'string', format: 'uri' } },
@@ -295,6 +378,7 @@ export class ToolRegistry {
         description:
           'List recent run outcomes for the current conversation thread, including bounded inputs and failure outputs',
         permission: 'read',
+        governance: governance('runtime', 'low', 'none', 'none', 'none', 24),
         parameters: {
           type: 'object',
           properties: { limit: { type: 'integer', minimum: 1, maximum: 20 } },
@@ -323,6 +407,7 @@ export class ToolRegistry {
         description:
           'Persist a durable memory with optional Ollama embedding and redacted metadata',
         permission: 'write',
+        governance: governance('memory', 'medium', 'configured', 'durable', 'profile', 16),
         parameters: {
           type: 'object',
           properties: {
@@ -361,6 +446,7 @@ export class ToolRegistry {
         description:
           'Search durable memories semantically when Ollama embeddings are available, with lexical fallback',
         permission: 'read',
+        governance: governance('memory', 'medium', 'configured', 'none', 'none', 24),
         parameters: {
           type: 'object',
           properties: {
@@ -398,6 +484,7 @@ export class ToolRegistry {
         name: 'memory.forget',
         description: 'Permanently remove one durable memory record by id',
         permission: 'write',
+        governance: governance('memory', 'low', 'none', 'durable', 'profile', 16),
         parameters: {
           type: 'object',
           properties: { id: { type: 'string', minLength: 1 } },
@@ -416,6 +503,7 @@ export class ToolRegistry {
         name: 'schedule.create',
         description: 'Create a durable scheduled agent run',
         permission: 'write',
+        governance: governance('scheduler', 'high', 'none', 'durable', 'profile', 8),
         parameters: {
           type: 'object',
           properties: {
@@ -442,6 +530,7 @@ export class ToolRegistry {
         name: 'schedule.list',
         description: 'List durable schedules and their next run state',
         permission: 'read',
+        governance: governance('scheduler', 'low', 'none', 'none', 'none', 24),
         parameters: { type: 'object', properties: {} },
         input: empty,
         execute: async () => ({ schedules: scheduler.list() }),
@@ -450,6 +539,7 @@ export class ToolRegistry {
         name: 'schedule.update',
         description: 'Update a durable schedule',
         permission: 'write',
+        governance: governance('scheduler', 'medium', 'none', 'durable', 'profile', 16),
         parameters: {
           type: 'object',
           properties: { id: { type: 'string' } },
@@ -483,6 +573,10 @@ export class ToolRegistry {
           name,
           description,
           permission: 'write',
+          governance:
+            name === 'schedule.trigger'
+              ? governance('scheduler', 'high', 'none', 'external', 'profile', 8)
+              : governance('scheduler', 'medium', 'none', 'durable', 'profile', 16),
           parameters: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
           input: z.object({ id: z.string().min(1) }),
           execute: async (input) => {
@@ -497,6 +591,7 @@ export class ToolRegistry {
         description:
           'Start a durable background agent task and return immediately with its task id',
         permission: 'write',
+        governance: governance('scheduler', 'high', 'none', 'external', 'profile', 8),
         parameters: {
           type: 'object',
           properties: { agentInput: { type: 'string' }, name: { type: 'string' } },
@@ -515,6 +610,7 @@ export class ToolRegistry {
         name: 'task.list',
         description: 'List durable background and scheduled task states',
         permission: 'read',
+        governance: governance('scheduler', 'low', 'none', 'none', 'none', 24),
         parameters: { type: 'object', properties: {} },
         input: empty,
         execute: async () => ({ tasks: scheduler.listTasks() }),
@@ -523,6 +619,7 @@ export class ToolRegistry {
         name: 'task.cancel',
         description: 'Cancel a queued or running background task',
         permission: 'write',
+        governance: governance('scheduler', 'medium', 'none', 'durable', 'profile', 16),
         parameters: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
         input: z.object({ id: z.string().min(1) }),
         execute: async (input) => {
@@ -538,6 +635,7 @@ export class ToolRegistry {
         name: 'provider.list',
         description: 'Discover configured providers, their health, and available model catalogs',
         permission: 'read',
+        governance: governance('provider', 'low', 'configured', 'none', 'none', 24),
         parameters: { type: 'object', properties: {} },
         input: empty,
         execute: async () => providers.catalog(),
@@ -546,6 +644,7 @@ export class ToolRegistry {
         name: 'provider.status',
         description: 'Report the active provider/model and current provider health',
         permission: 'read',
+        governance: governance('provider', 'low', 'configured', 'none', 'none', 24),
         parameters: { type: 'object', properties: {} },
         input: empty,
         execute: async () => providers.catalog(),
@@ -554,6 +653,7 @@ export class ToolRegistry {
         name: 'provider.switch',
         description: 'Validate, persist, and activate a provider/model selection',
         permission: 'write',
+        governance: governance('provider', 'medium', 'configured', 'durable', 'profile', 8),
         parameters: {
           type: 'object',
           properties: { provider: { type: 'string' }, model: { type: 'string' } },
@@ -573,6 +673,7 @@ export class ToolRegistry {
         name: 'mcp.status',
         description: 'Report authenticated MCP server connections, failures, and discovered tools',
         permission: 'read',
+        governance: governance('mcp', 'low', 'configured', 'none', 'none', 24),
         parameters: { type: 'object', properties: {} },
         input: empty,
         execute: async () => mcp.status(),
@@ -581,6 +682,7 @@ export class ToolRegistry {
         name: 'mcp.discover',
         description: 'Discover MCP tools allowed by the current permission context',
         permission: 'read',
+        governance: governance('mcp', 'low', 'configured', 'none', 'none', 24),
         parameters: { type: 'object', properties: {} },
         input: empty,
         execute: async (_input, context) => mcp.discover(context.permissions),
@@ -590,6 +692,7 @@ export class ToolRegistry {
         description:
           'Report the configured permissioned computer-use MCP boundary without exposing credentials',
         permission: 'read',
+        governance: governance('computer', 'low', 'configured', 'none', 'none', 24),
         parameters: { type: 'object', properties: {} },
         input: empty,
         execute: async () => {
@@ -605,8 +708,9 @@ export class ToolRegistry {
       this.register({
         name: 'computer.use',
         description:
-          'Use the configured cua-driver desktop boundary. Capture/list actions require read; input actions require execute. Capture first and use fresh element references.',
-        permission: 'read',
+          'Use the configured cua-driver desktop boundary. All capture, list, click, scroll, key, and text-input actions require execute permission. Capture first and use fresh element references.',
+        permission: 'execute',
+        governance: governance('computer', 'high', 'configured', 'external', 'profile', 8),
         parameters: {
           type: 'object',
           properties: {
@@ -650,6 +754,7 @@ export class ToolRegistry {
         description:
           'Execute one discovered MCP tool through the authenticated permission boundary',
         permission: 'execute',
+        governance: governance('mcp', 'high', 'configured', 'unknown', 'profile', 8),
         parameters: {
           type: 'object',
           properties: { name: { type: 'string' }, arguments: { type: 'object' } },
@@ -672,6 +777,7 @@ export class ToolRegistry {
         description:
           'Inspect bounded local text, image, audio, video, PDF, DOCX, or XLSX media and extract safe artifacts',
         permission: 'read',
+        governance: governance('media', 'medium', 'none', 'none', 'none', 16),
         parameters: {
           type: 'object',
           properties: {
@@ -701,6 +807,7 @@ export class ToolRegistry {
         name: 'agent.list',
         description: 'List explicitly allowlisted external-agent adapters without exposing secrets',
         permission: 'read',
+        governance: governance('agent', 'low', 'configured', 'none', 'none', 24),
         parameters: { type: 'object', properties: {} },
         input: empty,
         execute: async () => ({ agents: agents.list() }),
@@ -709,6 +816,7 @@ export class ToolRegistry {
         name: 'agent.dispatch',
         description: 'Dispatch a bounded prompt to one configured external-agent adapter',
         permission: 'execute',
+        governance: governance('agent', 'high', 'configured', 'unknown', 'profile', 8),
         parameters: {
           type: 'object',
           properties: { agent: { type: 'string' }, prompt: { type: 'string' } },
@@ -726,6 +834,14 @@ export class ToolRegistry {
 
   register(tool: ToolDefinition): void {
     if (this.tools.has(tool.name)) throw new Error(`Tool already registered: ${tool.name}`);
+    if (!tool.governance.owner.trim()) throw new Error(`Tool owner is required: ${tool.name}`);
+    if (!Number.isInteger(tool.governance.maxCallsPerRun) || tool.governance.maxCallsPerRun <= 0)
+      throw new Error(`Tool maxCallsPerRun must be positive: ${tool.name}`);
+    if (
+      tool.governance.sideEffects !== 'none' &&
+      (tool.governance.approval !== 'profile' || tool.permission === 'read')
+    )
+      throw new Error(`Side-effecting tool requires profile approval: ${tool.name}`);
     this.tools.set(tool.name, tool);
   }
   list(): ToolDefinition[] {
@@ -744,12 +860,21 @@ export class ToolRegistry {
         parameters,
       }));
   }
-  async execute(name: string, input: unknown, context: ToolContext): Promise<unknown> {
+  async execute(
+    name: string,
+    input: unknown,
+    context: ToolContext,
+    onAuthorized?: () => void,
+  ): Promise<unknown> {
     const tool = this.tools.get(name);
     if (!tool) throw new Error(`Unknown tool: ${name}`);
     assertPermission(context.permissions, tool.permission);
     context.signal?.throwIfAborted();
-    const result = await tool.execute(tool.input.parse(input), context);
+    const parsed = tool.input.parse(input);
+    reserveToolBudget(tool, context.budget);
+    onAuthorized?.();
+    context.signal?.throwIfAborted();
+    const result = await tool.execute(parsed, context);
     context.signal?.throwIfAborted();
     return result;
   }

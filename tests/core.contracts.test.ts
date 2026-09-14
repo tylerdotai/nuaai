@@ -137,7 +137,17 @@ describe('runtime core contracts', () => {
     expect(manifest.ownsToolLoop).toBe(true);
     expect(manifest.tools).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ name: 'workspace.read', source: 'nuaai' }),
+        expect.objectContaining({
+          name: 'workspace.read',
+          source: 'nuaai',
+          governance: expect.objectContaining({
+            owner: 'workspace',
+            costClass: 'low',
+            authMode: 'none',
+            sideEffects: 'none',
+            approval: 'none',
+          }),
+        }),
       ]),
     );
     expect(manifest.dynamicTools).toEqual(['nuaai.web_search']);
@@ -171,6 +181,8 @@ describe('runtime core contracts', () => {
     ]);
     expect(prompt.systemPrompt).toContain('codex');
     expect(prompt.systemPrompt).toContain('provider-owned tool loop');
+    expect(prompt.systemPrompt).toContain('owner: workspace; cost: low');
+    expect(prompt.systemPrompt).toContain('per-run limit:');
     expect(prompt.systemPrompt).toContain('Use only verified tool results');
   });
 });

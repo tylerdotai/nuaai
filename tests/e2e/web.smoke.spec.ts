@@ -544,6 +544,66 @@ test('mobile safe-area space keeps chat and system UI outside device insets', as
   await expect(page.getByRole('tabpanel')).toContainText('Skills');
 });
 
+test('a long multi-turn response survives reload without draft concatenation or clipping', async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const browserErrors: string[] = [];
+  page.on('pageerror', (error) => browserErrors.push(error.message));
+  page.on('console', (message) => {
+    if (message.type() === 'error') browserErrors.push(message.text());
+  });
+  const e2eRoot = process.env.NUAAI_E2E_ROOT;
+  if (!e2eRoot) throw new Error('NUAAI_E2E_ROOT is required');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`/#token=${encodeURIComponent(createBrowserPairingToken(e2eRoot))}`);
+  await expect(page.locator('.connection')).toContainText('Connected', { timeout: 30_000 });
+  await page.getByRole('button', { name: /Commands/ }).click();
+  await page
+    .getByRole('dialog', { name: 'Commands' })
+    .getByRole('button', { name: /New conversation/ })
+    .click();
+  await expect(page.locator('.connection')).toContainText('New conversation ready', {
+    timeout: 30_000,
+  });
+
+  const composer = page.getByPlaceholder('Message NUAAI…');
+  await composer.fill('browser long stream smoke');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+  const assistant = page.locator('.message-assistant').last();
+  await expect(assistant).toContainText('Durable long response', { timeout: 30_000 });
+  await expect(assistant).toContainText('Evidence line 100', { timeout: 30_000 });
+  await expect(assistant).not.toContainText('PROVISIONAL SHOULD DISAPPEAR');
+
+  await page.reload();
+  await expect(page.locator('.connection')).toContainText('Connected', { timeout: 30_000 });
+  await expect(page.locator('.message-assistant').last()).toContainText('Evidence line 100', {
+    timeout: 30_000,
+  });
+  await expect(page.locator('.message-assistant').last()).not.toContainText(
+    'PROVISIONAL SHOULD DISAPPEAR',
+  );
+  await expect(page.locator('.message-assistant').last()).toContainText(
+    'FINAL_LONG_RESPONSE_SENTINEL',
+    { timeout: 60_000 },
+  );
+  await expect(page.getByText(/tool-turn limit was reached/i)).toHaveCount(0);
+  await expect(page.locator('.message-assistant')).toHaveCount(1);
+
+  await page.reload();
+  await expect(page.locator('.connection')).toContainText('Connected', { timeout: 30_000 });
+  const persisted = page.locator('.message-assistant').last();
+  await expect(persisted).toContainText('FINAL_LONG_RESPONSE_SENTINEL', { timeout: 30_000 });
+  const dimensions = await persisted.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+    overflow: getComputedStyle(element).overflow,
+  }));
+  expect(dimensions.clientHeight).toBe(dimensions.scrollHeight);
+  expect(dimensions.overflow).not.toBe('hidden');
+  expect(browserErrors).toEqual([]);
+});
+
 test('a stale terminal poll failure cannot surface in a newly selected thread', async ({
   page,
 }) => {

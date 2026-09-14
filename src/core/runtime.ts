@@ -13,7 +13,12 @@ import type {
 import { type PermissionContext, permissionContextForProfile } from '../security/permissions.js';
 import type { SkillLearner } from '../skills/learner.js';
 import type { SkillRegistry } from '../skills/registry.js';
-import type { ToolRegistry } from '../tools/registry.js';
+import {
+  type ToolBudget,
+  ToolBudgetError,
+  type ToolRegistry,
+  createToolBudget,
+} from '../tools/registry.js';
 import {
   buildCapabilityManifest,
   classifyVerificationPolicy,
@@ -45,6 +50,20 @@ export interface RunRequest {
 }
 export type RuntimeListener = (event: EventRecord & { id: number }) => void;
 
+const modelDeltaBatchBytes = 256;
+const modelDeltaBatchIntervalMs = 50;
+const finalizationInstruction =
+  'The ordinary model-turn budget is exhausted. Do not request more tools. Provide the final answer now using only evidence already returned by completed calls, and state any remaining limitation plainly.';
+
+function appendUserInstruction(messages: ProviderMessage[], instruction: string): void {
+  const last = messages.at(-1);
+  if (last?.role === 'user') {
+    messages[messages.length - 1] = { ...last, content: `${last.content}\n\n${instruction}` };
+    return;
+  }
+  messages.push({ role: 'user', content: instruction });
+}
+
 function selectContextMessages<T extends { role: string; content: string }>(
   messages: T[],
   maxBytes: number,
@@ -70,8 +89,12 @@ function isCapabilityRefusal(value: string): boolean {
 }
 
 function looksLikeFutureIntent(value: string): boolean {
-  return /\b(?:i['’]ll|i will|let me)\s+(?:run|check|inspect|verify|try|look|explore|do)\b/i.test(
-    value,
+  const trimmed = value.trim();
+  return (
+    Buffer.byteLength(trimmed, 'utf8') <= 320 &&
+    /^(?:okay[,.:;!\s-]*)?(?:i['’]ll|i will|let me)\s+(?:run|check|inspect|verify|try|look|explore|do)\b/i.test(
+      trimmed,
+    )
   );
 }
 
@@ -99,11 +122,13 @@ function selectCodexDynamicTools(
   root: string,
   timeoutMs: number,
   signal?: AbortSignal,
+  budget?: ToolBudget,
 ): ProviderDynamicTool[] {
   const toolDefinitions =
     typeof (tools as ToolRegistry & { list?: unknown }).list === 'function'
       ? tools.list()
       : tools.schemas(permissions).map((tool) => ({ ...tool, permission: 'read' as const }));
+  const registryToolNames = new Set(toolDefinitions.map((tool) => tool.name));
   const localTools = toolDefinitions
     .filter((tool) => permissions.approved.has(tool.permission))
     .map((tool) => ({
@@ -112,17 +137,19 @@ function selectCodexDynamicTools(
       description: tool.description,
       parameters: tool.parameters,
       execute: (input: Record<string, unknown>) =>
-        tools.execute(tool.name, input, { root, permissions, timeoutMs, signal }),
+        tools.execute(tool.name, input, { root, permissions, budget, timeoutMs, signal }),
     }));
-  const mcpTools = (mcp?.schemas(permissions) ?? []).map((tool) => ({
-    namespace: 'nuaai',
-    name: tool.name.replaceAll('.', '_'),
-    description: tool.description,
-    parameters: tool.parameters,
-    execute: (input: Record<string, unknown>) =>
-      mcp?.execute(tool.name, input, permissions, signal) ??
-      Promise.reject(new Error('MCP unavailable')),
-  }));
+  const mcpTools = registryToolNames.has('mcp.execute')
+    ? []
+    : (mcp?.schemas(permissions) ?? []).map((tool) => ({
+        namespace: 'nuaai',
+        name: tool.name.replaceAll('.', '_'),
+        description: tool.description,
+        parameters: tool.parameters,
+        execute: (input: Record<string, unknown>) =>
+          mcp?.execute(tool.name, input, permissions, signal) ??
+          Promise.reject(new Error('MCP unavailable')),
+      }));
   return [...localTools, ...mcpTools];
 }
 
@@ -653,7 +680,6 @@ export class AgentRuntime {
       );
       let output = '';
       let finalResponseAccepted = false;
-      let toolCalls = 0;
       let toolBudgetExhausted = false;
       let toolBudgetNoticeAdded = false;
       let toolActivity = false;
@@ -661,8 +687,13 @@ export class AgentRuntime {
       let finalizationRequested = false;
       let recoveryRequested = false;
       let rejectedCapabilityClaim = false;
+      let modelTurnBudgetExhausted = false;
       const unresolvedToolFailures: string[] = [];
       const repeatedInvalidCalls = new Map<string, number>();
+      const toolBudget = createToolBudget(
+        this.options.config.limits.maxToolCalls,
+        this.options.config.limits.maxToolCostUnits,
+      );
       const verificationPolicy = classifyVerificationPolicy(run.input);
       const requiresLiveVerification = verificationRequiresEvidence(verificationPolicy);
       const isolatedRequest = requiresLiveVerification || requestsMemoryMutation(run.input);
@@ -736,10 +767,13 @@ export class AgentRuntime {
           },
         );
       }
-      const availableTools = [
-        ...this.options.tools.schemas(permissions),
-        ...(this.options.mcp?.schemas(permissions) ?? []),
-      ];
+      const registeredTools = this.options.tools.schemas(permissions);
+      const registeredToolNames = new Set(registeredTools.map((tool) => tool.name));
+      const registryOwnsMcp =
+        typeof (this.options.tools as ToolRegistry & { list?: unknown }).list === 'function' &&
+        this.options.tools.list().some((tool) => tool.name === 'mcp.execute');
+      const exposedMcpTools = registryOwnsMcp ? [] : (this.options.mcp?.schemas(permissions) ?? []);
+      const availableTools = [...registeredTools, ...exposedMcpTools];
       const providerOwnsToolLoop = provider.ownsToolLoop === true;
       const providerTools = providerOwnsToolLoop
         ? []
@@ -752,6 +786,7 @@ export class AgentRuntime {
             this.options.root,
             this.options.config.limits.toolTimeoutMs,
             controller.signal,
+            toolBudget,
           )
         : [];
       const skillContext = isolatedRequest
@@ -800,6 +835,11 @@ export class AgentRuntime {
           model: manifest.model,
           ownsToolLoop: manifest.ownsToolLoop,
           toolCount: manifest.tools.length,
+          tools: manifest.tools.map((tool) => ({
+            name: tool.name,
+            permission: tool.permission,
+            governance: tool.governance,
+          })),
           dynamicTools: manifest.dynamicTools,
           verificationPolicy,
         },
@@ -836,7 +876,7 @@ export class AgentRuntime {
           ...(message === currentInputMessage && images?.length ? { images } : {}),
         })),
       ];
-      for (let turn = 0; turn < this.options.config.limits.maxTurns; turn += 1) {
+      for (let turn = 0; turn <= this.options.config.limits.maxTurns; turn += 1) {
         const current = this.options.store.getRun(run.id);
         if (!current || current.cancelRequested) {
           this.options.store.updateRun(run.id, { status: 'cancelled', output });
@@ -856,101 +896,127 @@ export class AgentRuntime {
           throw controller.signal.reason instanceof Error
             ? controller.signal.reason
             : new Error('Run aborted');
+        const finalizationGrace = turn === this.options.config.limits.maxTurns;
+        if (finalizationGrace) {
+          modelTurnBudgetExhausted = true;
+          if (!finalizationRequested) {
+            finalizationRequested = true;
+            appendUserInstruction(messages, finalizationInstruction);
+          }
+        }
         const turnOutput = {
           text: '',
           calls: [] as Array<{ id: string; name: string; arguments: Record<string, unknown> }>,
         };
+        let turnOutputBytes = 0;
+        let pendingDelta = '';
+        let pendingDeltaBytes = 0;
+        let lastDeltaFlush = Date.now();
+        const eventContext = {
+          sessionId: thread.sessionId,
+          threadId: thread.id,
+          runId: run.id,
+          correlationId: run.correlationId,
+        };
+        const flushModelDelta = (): void => {
+          if (!pendingDelta) return;
+          this.options.store.updateRun(run.id, { output: turnOutput.text });
+          this.emit('model.delta', { text: pendingDelta, turn }, eventContext);
+          pendingDelta = '';
+          pendingDeltaBytes = 0;
+          lastDeltaFlush = Date.now();
+        };
+        const appendModelText = (text: string): void => {
+          if (!text) return;
+          turnOutput.text += text;
+          turnOutputBytes += Buffer.byteLength(text, 'utf8');
+          if (turnOutputBytes > this.options.config.limits.maxOutputBytes)
+            throw new Error('Run output limit exceeded');
+          output = turnOutput.text;
+          pendingDelta += text;
+          pendingDeltaBytes += Buffer.byteLength(text, 'utf8');
+          if (
+            pendingDeltaBytes >= modelDeltaBatchBytes ||
+            Date.now() - lastDeltaFlush >= modelDeltaBatchIntervalMs
+          )
+            flushModelDelta();
+        };
+        output = '';
+        this.options.store.updateRun(run.id, { output });
+        const toolsDisabled = finalizationGrace || toolBudgetExhausted;
+        const turnProviderTools = toolsDisabled ? [] : providerTools;
+        const turnDynamicTools = toolsDisabled ? [] : providerDynamicTools;
         this.emit(
           'model.started',
-          { turn, provider: provider.name, model, tools: providerTools.map((tool) => tool.name) },
           {
-            sessionId: thread.sessionId,
-            threadId: thread.id,
-            runId: run.id,
-            correlationId: run.correlationId,
+            turn,
+            provider: provider.name,
+            model,
+            tools: turnProviderTools.map((tool) => tool.name),
           },
+          eventContext,
         );
-        const turnProviderTools = toolBudgetExhausted ? [] : providerTools;
-        for await (const event of provider.stream({
-          model,
-          messages,
-          tools: turnProviderTools,
-          dynamicTools: providerDynamicTools,
-          systemPrompt: prompt.systemPrompt,
-          reasoning: turnProviderTools.length > 0,
-          conversationId: thread.id,
-          signal: controller.signal,
-        })) {
-          if (event.type === 'delta') {
-            turnOutput.text += event.text;
-            output += event.text;
-            if (Buffer.byteLength(output) > this.options.config.limits.maxOutputBytes)
-              throw new Error('Run output limit exceeded');
-            this.emit(
-              'model.delta',
-              { text: event.text, turn },
-              {
-                sessionId: thread.sessionId,
-                threadId: thread.id,
-                runId: run.id,
-                correlationId: run.correlationId,
-              },
-            );
-          } else if (event.type === 'tool_started') {
-            toolActivity = true;
-            this.emit(
-              'tool.started',
-              {
-                id: event.id,
-                name: event.name,
-                arguments: event.arguments,
-                providerOwned: true,
-              },
-              {
-                sessionId: thread.sessionId,
-                threadId: thread.id,
-                runId: run.id,
-                correlationId: run.correlationId,
-              },
-            );
-          } else if (event.type === 'tool_completed') {
-            toolActivity = true;
-            const boundedResult = serializeBoundedToolResult(
-              event.result,
-              this.options.config.limits.maxToolResultBytes,
-            );
-            if (event.isError)
-              unresolvedToolFailures.push(`${event.name}: ${boundedResult.content}`);
-            this.addRunMessage(run, 'tool', boundedResult.content);
-            this.emit(
-              'tool.completed',
-              {
-                id: event.id,
-                name: event.name,
-                arguments: event.arguments,
-                result: boundedResult.value,
-                resultBytes: boundedResult.bytes,
-                resultTruncated: boundedResult.truncated,
-                isError: event.isError,
-                providerOwned: true,
-              },
-              {
-                sessionId: thread.sessionId,
-                threadId: thread.id,
-                runId: run.id,
-                correlationId: run.correlationId,
-              },
-            );
-          } else if (event.type === 'tool_call')
-            turnOutput.calls.push({
-              id: event.id,
-              name: event.name,
-              arguments: event.arguments,
-            });
-          else if (event.type === 'done' && !turnOutput.text && event.text) {
-            turnOutput.text = event.text;
-            output += event.text;
+        try {
+          for await (const event of provider.stream({
+            model,
+            messages,
+            tools: turnProviderTools,
+            dynamicTools: turnDynamicTools,
+            systemPrompt: prompt.systemPrompt,
+            reasoning: turnProviderTools.length > 0,
+            conversationId: thread.id,
+            signal: controller.signal,
+          })) {
+            if (event.type === 'delta') appendModelText(event.text);
+            else {
+              flushModelDelta();
+              if (event.type === 'tool_started') {
+                toolActivity = true;
+                this.emit(
+                  'tool.started',
+                  {
+                    id: event.id,
+                    name: event.name,
+                    arguments: event.arguments,
+                    providerOwned: true,
+                  },
+                  eventContext,
+                );
+              } else if (event.type === 'tool_completed') {
+                toolActivity = true;
+                const boundedResult = serializeBoundedToolResult(
+                  event.result,
+                  this.options.config.limits.maxToolResultBytes,
+                );
+                if (event.isError)
+                  unresolvedToolFailures.push(`${event.name}: ${boundedResult.content}`);
+                this.addRunMessage(run, 'tool', boundedResult.content);
+                this.emit(
+                  'tool.completed',
+                  {
+                    id: event.id,
+                    name: event.name,
+                    arguments: event.arguments,
+                    result: boundedResult.value,
+                    resultBytes: boundedResult.bytes,
+                    resultTruncated: boundedResult.truncated,
+                    isError: event.isError,
+                    providerOwned: true,
+                  },
+                  eventContext,
+                );
+              } else if (event.type === 'tool_call')
+                turnOutput.calls.push({
+                  id: event.id,
+                  name: event.name,
+                  arguments: event.arguments,
+                });
+              else if (event.type === 'done' && !turnOutput.text && event.text)
+                appendModelText(event.text);
+            }
           }
+        } finally {
+          flushModelDelta();
         }
         const currentAfterStream = this.options.store.getRun(run.id);
         if (currentAfterStream?.cancelRequested) {
@@ -1004,7 +1070,7 @@ export class AgentRuntime {
             break;
           }
           if (unresolvedToolFailures.length) {
-            if (!recoveryRequested) {
+            if (!recoveryRequested && !finalizationGrace) {
               recoveryRequested = true;
               messages.push({
                 role: 'user',
@@ -1058,6 +1124,13 @@ export class AgentRuntime {
           } else finalResponseAccepted = Boolean(output.trim()) && !looksLikeFutureIntent(output);
           break;
         }
+        if (finalizationGrace) {
+          finalResponseAccepted =
+            !unresolvedToolFailures.length &&
+            Boolean(turnOutput.text.trim()) &&
+            !looksLikeFutureIntent(turnOutput.text);
+          break;
+        }
         const normalizedCalls = turnOutput.calls.map((call) =>
           normalizeToolCall(call, providerTools),
         );
@@ -1079,33 +1152,16 @@ export class AgentRuntime {
         for (const [index, call] of turnOutput.calls.entries()) {
           const normalizedCall = normalizedCalls[index];
           toolActivity = true;
-          if (toolCalls >= this.options.config.limits.maxToolCalls) {
-            toolBudgetExhausted = true;
-            const message =
-              'The run tool-call budget is exhausted. No action was executed for this call.';
-            const toolContent = JSON.stringify({ error: message });
-            const toolMessage = this.addRunMessage(run, 'tool', toolContent);
-            this.options.store.storeMessageArtifact(toolMessage.id, 'tool_result', {
-              callId: call.id,
-              name: normalizedCall.name,
-              result: { error: message },
-            });
-            messages.push({
-              role: 'tool',
-              content: toolContent,
-              toolCallId: call.id,
-              toolName: normalizedCall.name,
-            });
+          const emitToolStarted = (): void =>
             this.emit(
-              'tool.failed',
+              'tool.started',
               {
                 id: call.id,
                 name: normalizedCall.name,
                 ...(normalizedCall.requestedName
                   ? { requestedName: normalizedCall.requestedName }
                   : {}),
-                error: message,
-                reason: 'tool_budget_exhausted',
+                arguments: normalizedCall.arguments,
               },
               {
                 sessionId: thread.sessionId,
@@ -1114,26 +1170,6 @@ export class AgentRuntime {
                 correlationId: run.correlationId,
               },
             );
-            continue;
-          }
-          toolCalls += 1;
-          this.emit(
-            'tool.started',
-            {
-              id: call.id,
-              name: normalizedCall.name,
-              ...(normalizedCall.requestedName
-                ? { requestedName: normalizedCall.requestedName }
-                : {}),
-              arguments: normalizedCall.arguments,
-            },
-            {
-              sessionId: thread.sessionId,
-              threadId: thread.id,
-              runId: run.id,
-              correlationId: run.correlationId,
-            },
-          );
           try {
             if (!providerTools.some((tool) => tool.name === normalizedCall.name)) {
               const signature = `${normalizedCall.name}:${JSON.stringify(normalizedCall.arguments)}`;
@@ -1190,21 +1226,48 @@ export class AgentRuntime {
               }
               continue;
             }
-            const result = normalizedCall.name.startsWith('mcp.')
-              ? await this.options.mcp?.execute(
-                  normalizedCall.name,
-                  normalizedCall.arguments,
-                  permissions,
-                  controller.signal,
-                )
-              : await this.options.tools.execute(normalizedCall.name, normalizedCall.arguments, {
-                  root: this.options.root,
-                  permissions,
-                  timeoutMs: this.options.config.limits.toolTimeoutMs,
-                  signal: controller.signal,
-                  threadId: thread.id,
-                  runId: run.id,
-                });
+            const toolContext = {
+              root: this.options.root,
+              permissions,
+              budget: toolBudget,
+              timeoutMs: this.options.config.limits.toolTimeoutMs,
+              signal: controller.signal,
+              threadId: thread.id,
+              runId: run.id,
+            };
+            const registryToolName = registeredToolNames.has(normalizedCall.name)
+              ? normalizedCall.name
+              : registeredToolNames.has('mcp.execute')
+                ? 'mcp.execute'
+                : undefined;
+            const registryInput =
+              registryToolName === 'mcp.execute' && normalizedCall.name !== 'mcp.execute'
+                ? { name: normalizedCall.name, arguments: normalizedCall.arguments }
+                : normalizedCall.arguments;
+            let result: unknown;
+            if (registryToolName && this.options.tools.supportsAdmissionCallback === true) {
+              result = await this.options.tools.execute(
+                registryToolName,
+                registryInput,
+                toolContext,
+                emitToolStarted,
+              );
+            } else if (registryToolName) {
+              emitToolStarted();
+              result = await this.options.tools.execute(
+                registryToolName,
+                registryInput,
+                toolContext,
+              );
+            } else {
+              emitToolStarted();
+              result = await this.options.mcp?.execute(
+                normalizedCall.name,
+                normalizedCall.arguments,
+                permissions,
+                controller.signal,
+              );
+            }
             if (
               normalizedCall.name === 'github.repo.list' &&
               normalizedCall.arguments.mode === 'count' &&
@@ -1270,8 +1333,10 @@ export class AgentRuntime {
             }
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            const budgetError = error instanceof ToolBudgetError ? error : undefined;
+            if (budgetError) toolBudgetExhausted = true;
             const toolContent = JSON.stringify({ error: message });
-            unresolvedToolFailures.push(`${normalizedCall.name}: ${message}`);
+            if (!budgetError) unresolvedToolFailures.push(`${normalizedCall.name}: ${message}`);
             const toolMessage = this.addRunMessage(run, 'tool', toolContent);
             this.options.store.storeMessageArtifact(toolMessage.id, 'tool_result', {
               callId: call.id,
@@ -1293,6 +1358,7 @@ export class AgentRuntime {
                   ? { requestedName: normalizedCall.requestedName }
                   : {}),
                 error: message,
+                ...(budgetError ? { reason: budgetError.reason } : {}),
               },
               {
                 sessionId: thread.sessionId,
@@ -1308,7 +1374,7 @@ export class AgentRuntime {
           messages.push({
             role: 'user',
             content:
-              'The tool-call budget is exhausted. Do not request more tools. Provide the final answer now using only evidence already returned by completed calls, and state any remaining limitation plainly.',
+              'The run tool-call budget or weighted cost budget is exhausted. Do not request more tools. Provide the final answer now using only evidence already returned by completed calls, and state any remaining limitation plainly.',
           });
         }
       }
@@ -1316,11 +1382,15 @@ export class AgentRuntime {
         const rejectedModelOutput = output.trim();
         output = rejectedCapabilityClaim
           ? output
-          : toolActivity
+          : modelTurnBudgetExhausted && toolActivity
             ? 'NUAAI could not verify completion: the tool-turn limit was reached before a final response.'
-            : rejectedModelOutput
-              ? `NUAAI rejected the model response because it did not complete a verified action: ${rejectedModelOutput}`
-              : 'NUAAI could not produce a non-empty final response.';
+            : rejectedModelOutput && looksLikeFutureIntent(rejectedModelOutput)
+              ? `NUAAI could not verify completion because the model returned only an unfinished action promise: ${rejectedModelOutput}`
+              : rejectedModelOutput
+                ? `NUAAI rejected the model response because it did not complete a verified action: ${rejectedModelOutput}`
+                : toolActivity
+                  ? 'NUAAI could not verify completion because the model produced no final response after tool execution.'
+                  : 'NUAAI could not produce a non-empty final response.';
         this.addRunMessage(run, 'assistant', output, provider.name, model);
         this.options.store.updateRun(run.id, { status: 'failed', output });
         this.emit(

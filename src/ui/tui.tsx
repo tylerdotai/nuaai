@@ -45,6 +45,7 @@ function toTuiEvent(value: {
       provider: typeof payload.provider === 'string' ? payload.provider : 'unknown',
       model: typeof payload.model === 'string' ? payload.model : 'unknown',
     };
+  if (value.type === 'model.started' && runId) return { type: 'model.started', runId };
   if (value.type === 'model.delta' && runId && typeof payload.text === 'string')
     return { type: 'model.delta', runId, text: payload.text };
   if (value.type === 'tool.started' && runId && typeof payload.name === 'string')

@@ -148,8 +148,9 @@ export const runtimeConfigSchema = z.object({
     .default({}),
   limits: z
     .object({
-      maxTurns: z.number().int().positive().max(100).default(12),
+      maxTurns: z.number().int().positive().max(100).default(48),
       maxToolCalls: z.number().int().positive().max(100).default(48),
+      maxToolCostUnits: z.number().int().positive().max(1_000).default(96),
       maxOutputBytes: z.number().int().positive().max(10_000_000).default(1_000_000),
       runTimeoutMs: z.number().int().positive().max(3_600_000).default(960_000),
       providerTimeoutMs: z.number().int().positive().max(600_000).default(180_000),
