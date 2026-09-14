@@ -9,6 +9,7 @@ import {
   webSocketCloseDisposition,
 } from './auth.js';
 import { AgentComposer } from './components/AgentComposer.js';
+import { ArtifactCards } from './components/ArtifactCards.js';
 import { MarkdownContent } from './components/MarkdownContent.js';
 import { RunStatusSummary } from './components/RunStatusSummary.js';
 import { type ComposerCommand, draftStorageKey, resolveComposerCommand } from './composer.js';
@@ -1540,6 +1541,7 @@ function App(): React.JSX.Element {
                             <time>{relativeTime(message.createdAt)}</time>
                           </div>
                           <MarkdownContent markdown={message.markdown} />
+                          <ArtifactCards message={message} resolveUrl={appPath} />
                           {message.role === 'assistant' && (
                             <RunStatusSummary
                               message={message}

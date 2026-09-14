@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { basename, extname } from 'node:path';
 
 import { z } from 'zod';
 
+import type { RunArtifactCandidate, RunArtifactKind } from '../artifacts/registry.js';
 import type { Scheduler } from '../core/scheduler.js';
 import type { ExternalAgentDispatcher } from '../integrations/agents.js';
 import type { McpManager } from '../integrations/mcp.js';
@@ -81,6 +83,81 @@ export interface ToolDefinition {
 const empty = z.object({});
 const githubCommands = new Set(['gh']);
 const toolCostUnits: Record<ToolCostClass, number> = { low: 1, medium: 2, high: 4 };
+const maxArtifactCandidatesPerToolCall = 32;
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function explicitArtifactCandidate(value: unknown): RunArtifactCandidate | undefined {
+  const candidate = recordValue(value);
+  if (
+    !candidate ||
+    typeof candidate.kind !== 'string' ||
+    typeof candidate.title !== 'string' ||
+    typeof candidate.mimeType !== 'string'
+  )
+    return undefined;
+  const metadata = recordValue(candidate.metadata);
+  return {
+    kind: candidate.kind as RunArtifactKind,
+    title: candidate.title,
+    mimeType: candidate.mimeType,
+    ...(typeof candidate.workspacePath === 'string'
+      ? { workspacePath: candidate.workspacePath }
+      : typeof candidate.path === 'string'
+        ? { workspacePath: candidate.path }
+        : {}),
+    ...(typeof candidate.content === 'string' ? { content: candidate.content } : {}),
+    ...(typeof candidate.externalUrl === 'string'
+      ? { externalUrl: candidate.externalUrl }
+      : typeof candidate.url === 'string'
+        ? { externalUrl: candidate.url }
+        : {}),
+    ...(metadata ? { metadata } : {}),
+  };
+}
+
+function mimeTypeForWorkspacePath(path: string): string {
+  const types: Record<string, string> = {
+    '.csv': 'text/csv',
+    '.diff': 'text/x-diff',
+    '.gif': 'image/gif',
+    '.html': 'text/html',
+    '.jpeg': 'image/jpeg',
+    '.jpg': 'image/jpeg',
+    '.json': 'application/json',
+    '.md': 'text/markdown',
+    '.mp3': 'audio/mpeg',
+    '.mp4': 'video/mp4',
+    '.patch': 'text/x-diff',
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.txt': 'text/plain',
+    '.wav': 'audio/wav',
+    '.webp': 'image/webp',
+    '.xml': 'application/xml',
+    '.yaml': 'application/yaml',
+    '.yml': 'application/yaml',
+    '.zip': 'application/zip',
+  };
+  return types[extname(path).toLowerCase()] ?? 'application/octet-stream';
+}
+
+function workspaceArtifactKind(path: string): RunArtifactKind {
+  const extension = extname(path).toLowerCase();
+  if (extension === '.diff' || extension === '.patch') return 'diff';
+  if (/\b(?:junit|test[-_. ]?report|test[-_. ]?results?)\b/i.test(basename(path)))
+    return 'test-report';
+  if (
+    /\bscreenshot\b/i.test(basename(path)) &&
+    ['.jpeg', '.jpg', '.png', '.webp'].includes(extension)
+  )
+    return 'screenshot';
+  return 'file';
+}
 
 function governance(
   owner: string,
@@ -860,6 +937,75 @@ export class ToolRegistry {
         parameters,
       }));
   }
+
+  artifactCandidates(name: string, input: unknown, result: unknown): RunArtifactCandidate[] {
+    const candidates: RunArtifactCandidate[] = [];
+    const resultRecord = recordValue(result);
+    const explicitValues = Array.isArray(resultRecord?.artifacts)
+      ? resultRecord.artifacts
+      : resultRecord?.artifact !== undefined
+        ? [resultRecord.artifact]
+        : [];
+    for (const value of explicitValues) {
+      const candidate = explicitArtifactCandidate(value);
+      if (candidate) candidates.push(candidate);
+    }
+
+    const inputRecord = recordValue(input);
+    if (name === 'workspace.write' && typeof inputRecord?.path === 'string') {
+      const path = inputRecord.path;
+      candidates.push({
+        kind: workspaceArtifactKind(path),
+        title: basename(path) || 'Workspace file',
+        mimeType: mimeTypeForWorkspacePath(path),
+        workspacePath: path,
+        metadata: { sourcePath: path },
+      });
+    }
+    if (name === 'web.search') {
+      const results = Array.isArray(result)
+        ? result
+        : Array.isArray(resultRecord?.results)
+          ? resultRecord.results
+          : [];
+      for (const value of results) {
+        const entry = recordValue(value);
+        if (!entry || typeof entry.url !== 'string') continue;
+        candidates.push({
+          kind: 'citation',
+          title: typeof entry.title === 'string' && entry.title.trim() ? entry.title : entry.url,
+          mimeType: 'text/uri-list',
+          externalUrl: entry.url,
+          ...(typeof entry.source === 'string' ? { metadata: { source: entry.source } } : {}),
+        });
+      }
+    }
+    if ((name === 'web.fetch' || name === 'browser.open') && typeof resultRecord?.url === 'string')
+      candidates.push({
+        kind: 'citation',
+        title:
+          typeof resultRecord.title === 'string' && resultRecord.title.trim()
+            ? resultRecord.title
+            : resultRecord.url,
+        mimeType: 'text/uri-list',
+        externalUrl: resultRecord.url,
+      });
+
+    const unique = new Map<string, RunArtifactCandidate>();
+    for (const candidate of candidates) {
+      const key = JSON.stringify([
+        candidate.kind,
+        candidate.title,
+        candidate.mimeType,
+        candidate.workspacePath,
+        candidate.externalUrl,
+      ]);
+      if (!unique.has(key)) unique.set(key, candidate);
+      if (unique.size >= maxArtifactCandidatesPerToolCall) break;
+    }
+    return [...unique.values()];
+  }
+
   async execute(
     name: string,
     input: unknown,

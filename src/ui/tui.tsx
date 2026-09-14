@@ -11,6 +11,7 @@ import {
   initialTuiState,
   nextSelection,
   reduceTuiEvent,
+  tuiArtifactLines,
   tuiMessagesFromPresentation,
 } from './tui-state.js';
 
@@ -95,7 +96,20 @@ async function loadConversationMessages(
   threadId: string,
 ): Promise<TuiConversationMessage[]> {
   const presentation = await request<{
-    messages: Array<{ role: string; markdown: string }>;
+    messages: Array<{
+      role: string;
+      markdown: string;
+      artifacts?: Array<{
+        type: string;
+        sourceKind?: string;
+        kind?: string;
+        title?: string;
+        downloadUrl?: string;
+        externalUrl?: string;
+        label?: string;
+      }>;
+      citations?: Array<{ id?: string; title: string; url: string }>;
+    }>;
   }>(baseUrl, token, `/api/threads/${threadId}/presentation`);
   return tuiMessagesFromPresentation(presentation.messages);
 }
@@ -297,7 +311,8 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
       if (value.type !== 'event' || !value.event) return;
       const tuiEvent = toTuiEvent(value.event);
       if (tuiEvent) dispatch(tuiEvent);
-      if (value.event.type === 'run.completed') void refresh();
+      if (['run.completed', 'run.failed', 'run.cancelled'].includes(value.event.type))
+        void refresh();
     };
     socket.onerror = () => {
       setStatus('WebSocket error');
@@ -487,9 +502,16 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
         <Box flexDirection="column">
           <Text color="magenta">Conversation · {thread?.title ?? 'No thread selected'}</Text>
           {messages.slice(-8).map((message, index) => (
-            <Text key={`${message.role}-${index}`}>
-              <Text bold>{message.role}:</Text> {message.content}
-            </Text>
+            <Box flexDirection="column" key={`${message.role}-${index}`}>
+              <Text>
+                <Text bold>{message.role}:</Text> {message.content}
+              </Text>
+              {tuiArtifactLines(message).map((line) => (
+                <Text color={line.startsWith('Citation:') ? 'blue' : 'cyan'} key={line}>
+                  {line}
+                </Text>
+              ))}
+            </Box>
           ))}
           {tuiState.tools.length > 0 && (
             <Box flexDirection="column" marginTop={1}>

@@ -848,6 +848,86 @@ kbd {
   font-size: 0.78rem;
 }
 
+.run-artifact-sections {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.run-artifacts h3,
+.run-citations h3 {
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  margin: 0 0 0.45rem;
+  text-transform: uppercase;
+}
+
+.artifact-grid {
+  display: grid;
+  gap: 0.55rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(230px, 100%), 1fr));
+}
+
+.artifact-card {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
+  padding: 0.7rem;
+}
+
+.artifact-card-heading,
+.artifact-actions {
+  align-items: center;
+  display: flex;
+  gap: 0.6rem;
+  justify-content: space-between;
+}
+
+.artifact-card-heading,
+.artifact-card small {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+}
+
+.artifact-kind {
+  color: var(--accent);
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.artifact-card strong {
+  overflow-wrap: anywhere;
+}
+
+.artifact-actions {
+  justify-content: flex-start;
+  margin-top: 0.2rem;
+}
+
+.artifact-actions a,
+.run-citations a {
+  color: var(--accent);
+  font-size: 0.75rem;
+  text-underline-offset: 0.18em;
+}
+
+.artifact-unsupported {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.run-citations ol {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
 .message-live-body {
   min-width: 0;
 }

@@ -55,6 +55,22 @@ export const runs = sqliteTable('runs', {
   correlationId: text('correlation_id').notNull(),
 });
 
+export const runArtifacts = sqliteTable('run_artifacts', {
+  id: text('id').primaryKey(),
+  runId: text('run_id').notNull(),
+  threadId: text('thread_id').notNull(),
+  kind: text('kind').notNull(),
+  title: text('title').notNull(),
+  mimeType: text('mime_type').notNull(),
+  byteSize: integer('byte_size').notNull(),
+  sha256: text('sha256').notNull(),
+  sourceTool: text('source_tool').notNull(),
+  metadata: text('metadata').notNull().default('{}'),
+  externalUrl: text('external_url'),
+  storagePath: text('storage_path'),
+  createdAt: integer('created_at').notNull(),
+});
+
 export const memories = sqliteTable('memory_records', {
   id: text('id').primaryKey(),
   content: text('content').notNull(),

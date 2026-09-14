@@ -52,11 +52,34 @@ export interface AttachmentView {
   size?: number;
 }
 
-export interface ArtifactView {
-  type: 'unsupported';
-  sourceKind: string;
-  label: string;
-}
+export type RunArtifactKind =
+  | 'file'
+  | 'diff'
+  | 'test-report'
+  | 'screenshot'
+  | 'citation'
+  | 'deployment-receipt';
+
+export type ArtifactView =
+  | {
+      type: 'artifact';
+      id: string;
+      runId: string;
+      kind: Exclude<RunArtifactKind, 'citation'>;
+      title: string;
+      mimeType: string;
+      byteSize: number;
+      sha256: string;
+      sourceTool: string;
+      createdAt: number;
+      downloadUrl?: string;
+      externalUrl?: string;
+    }
+  | {
+      type: 'unsupported';
+      sourceKind: string;
+      label: string;
+    };
 
 export interface MessageView {
   id: string;

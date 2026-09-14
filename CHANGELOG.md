@@ -4,6 +4,16 @@ All notable NUAAI changes are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- First-class durable run artifacts with stable run/thread ownership, supported file/diff/test-report/screenshot/citation/deployment-receipt contracts, bounded redacted provenance, immutable private storage, and verified SHA-256 checksums.
+- Runtime capture for explicit structured tool artifacts, successful `workspace.write` output, and web citations, with independent `artifact.created` / `artifact.failed` events so optional capture cannot turn a successful tool into a failure.
+- Authenticated artifact list, detail, and byte-range download routes with cross-run 404 isolation, safe attachment headers, mount-relative PWA links, assistant-run artifact cards, distinct citations, and concise TUI visibility.
+
+### Security
+
+- Artifact capture rejects traversal, absolute paths, symlinks, hard links, protected runtime/credential paths, unsupported kind/MIME pairs, oversized content/metadata, and non-HTTPS or credential-bearing URLs. Text checksums cover stored sanitized bytes and are labeled accordingly.
+
 ## [1.0.1] - 2026-09-14
 
 ### Fixed

@@ -91,6 +91,22 @@ export interface RunRow {
   correlationId: string;
 }
 
+export interface RunArtifactRow {
+  id: string;
+  runId: string;
+  threadId: string;
+  kind: string;
+  title: string;
+  mimeType: string;
+  byteSize: number;
+  sha256: string;
+  sourceTool: string;
+  metadata: Record<string, unknown>;
+  externalUrl: string | null;
+  storagePath: string | null;
+  createdAt: number;
+}
+
 export interface EventPage {
   events: Array<EventRecord & { id: number }>;
   nextCursor: number;
@@ -183,6 +199,22 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       updated_at INTEGER NOT NULL,
       correlation_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS run_artifacts (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('file', 'diff', 'test-report', 'screenshot', 'citation', 'deployment-receipt')),
+      title TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+      sha256 TEXT NOT NULL,
+      source_tool TEXT NOT NULL,
+      metadata TEXT NOT NULL DEFAULT '{}',
+      external_url TEXT,
+      storage_path TEXT,
+      created_at INTEGER NOT NULL,
+      CHECK (external_url IS NOT NULL OR storage_path IS NOT NULL)
+    );
     CREATE TABLE IF NOT EXISTS run_writers (
       thread_id TEXT PRIMARY KEY,
       run_id TEXT NOT NULL UNIQUE,
@@ -267,6 +299,8 @@ function createSchema(db: MemoryDatabase, vector = false): void {
     CREATE INDEX IF NOT EXISTS events_run_id_idx ON events(run_id, id);
     CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages(thread_id, created_at);
     CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs(thread_id, created_at);
+    CREATE INDEX IF NOT EXISTS run_artifacts_run_idx ON run_artifacts(run_id, created_at, id);
+    CREATE INDEX IF NOT EXISTS run_artifacts_thread_idx ON run_artifacts(thread_id, created_at, id);
     CREATE UNIQUE INDEX IF NOT EXISTS runs_correlation_id_idx ON runs(correlation_id);
     CREATE TABLE IF NOT EXISTS memory_vector_refs (
       memory_id TEXT PRIMARY KEY,
@@ -293,7 +327,7 @@ function createSchema(db: MemoryDatabase, vector = false): void {
   ];
   for (const [name, migration] of pluginMigrations)
     if (!pluginColumns.some((column) => column.name === name)) db.exec(migration);
-  db.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
+  db.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
   if (vector) {
     db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(embedding float[768]);');
   }
@@ -845,6 +879,84 @@ export class DatabaseStore {
       )
       .run(run.id, threadId, run.status, provider, model, input, '', 0, now, now, correlationId);
     return run;
+  }
+
+  createRunArtifact(artifact: RunArtifactRow): RunArtifactRow {
+    const run = this.getRun(artifact.runId);
+    if (!run) throw new Error(`Unknown run: ${artifact.runId}`);
+    if (run.threadId !== artifact.threadId)
+      throw new Error(`Run ${artifact.runId} does not belong to thread ${artifact.threadId}`);
+    this.database.raw
+      .prepare(
+        'INSERT INTO run_artifacts (id, run_id, thread_id, kind, title, mime_type, byte_size, sha256, source_tool, metadata, external_url, storage_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        artifact.id,
+        artifact.runId,
+        artifact.threadId,
+        artifact.kind,
+        artifact.title,
+        artifact.mimeType,
+        artifact.byteSize,
+        artifact.sha256,
+        artifact.sourceTool,
+        JSON.stringify(redactValue(artifact.metadata)),
+        artifact.externalUrl,
+        artifact.storagePath,
+        artifact.createdAt,
+      );
+    return this.getRunArtifact(artifact.id) as RunArtifactRow;
+  }
+
+  getRunArtifact(id: string): RunArtifactRow | undefined {
+    const row = this.database.raw
+      .prepare(
+        'SELECT id, run_id AS runId, thread_id AS threadId, kind, title, mime_type AS mimeType, byte_size AS byteSize, sha256, source_tool AS sourceTool, metadata, external_url AS externalUrl, storage_path AS storagePath, created_at AS createdAt FROM run_artifacts WHERE id = ?',
+      )
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.runArtifactFromRow(row) : undefined;
+  }
+
+  listRunArtifacts(runId: string): RunArtifactRow[] {
+    return (
+      this.database.raw
+        .prepare(
+          'SELECT id, run_id AS runId, thread_id AS threadId, kind, title, mime_type AS mimeType, byte_size AS byteSize, sha256, source_tool AS sourceTool, metadata, external_url AS externalUrl, storage_path AS storagePath, created_at AS createdAt FROM run_artifacts WHERE run_id = ? ORDER BY created_at ASC, rowid ASC',
+        )
+        .all(runId) as Array<Record<string, unknown>>
+    ).map((row) => this.runArtifactFromRow(row));
+  }
+
+  listThreadRunArtifacts(threadId: string): RunArtifactRow[] {
+    return (
+      this.database.raw
+        .prepare(
+          'SELECT id, run_id AS runId, thread_id AS threadId, kind, title, mime_type AS mimeType, byte_size AS byteSize, sha256, source_tool AS sourceTool, metadata, external_url AS externalUrl, storage_path AS storagePath, created_at AS createdAt FROM run_artifacts WHERE thread_id = ? ORDER BY created_at ASC, rowid ASC',
+        )
+        .all(threadId) as Array<Record<string, unknown>>
+    ).map((row) => this.runArtifactFromRow(row));
+  }
+
+  deleteRunArtifact(id: string): boolean {
+    return this.database.raw.prepare('DELETE FROM run_artifacts WHERE id = ?').run(id).changes > 0;
+  }
+
+  private runArtifactFromRow(row: Record<string, unknown>): RunArtifactRow {
+    return {
+      id: String(row.id),
+      runId: String(row.runId),
+      threadId: String(row.threadId),
+      kind: String(row.kind),
+      title: String(row.title),
+      mimeType: String(row.mimeType),
+      byteSize: Number(row.byteSize),
+      sha256: String(row.sha256),
+      sourceTool: String(row.sourceTool),
+      metadata: JSON.parse(String(row.metadata)) as Record<string, unknown>,
+      externalUrl: row.externalUrl === null ? null : String(row.externalUrl),
+      storagePath: row.storagePath === null ? null : String(row.storagePath),
+      createdAt: Number(row.createdAt),
+    };
   }
 
   getRun(id: string): RunRow | undefined {

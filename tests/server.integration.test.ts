@@ -71,6 +71,7 @@ function services(events: Array<Record<string, unknown>> = []): GatewayServices 
       listMessages: () => [],
       listMessagePage: () => ({ messages: [], nextCursor: 0, hasMore: false }),
       listThreadArtifacts: () => [],
+      listRunArtifacts: () => [],
       getRun: () => undefined,
       getLatestRun: () => undefined,
       listActiveRunsForThread: () => [],
