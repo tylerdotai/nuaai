@@ -17,7 +17,7 @@ All notable NUAAI changes are recorded here.
 
 ### Changed
 
-- Local and OpenAI-compatible runs now default to a 262,144-token context budget with an 8,192-token response reserve, matching high-memory local servers instead of compacting at 131,072 tokens.
+- Local and OpenAI-compatible runs now default to a 262,144-token context budget with an 8,192-token response reserve and a 600-second provider timeout, matching high-memory local servers instead of compacting or timing out on long prefills.
 
 ### Fixed
 

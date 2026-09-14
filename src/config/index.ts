@@ -153,7 +153,7 @@ export const runtimeConfigSchema = z.object({
       maxToolCostUnits: z.number().int().positive().max(1_000).default(96),
       maxOutputBytes: z.number().int().positive().max(10_000_000).default(1_000_000),
       runTimeoutMs: z.number().int().positive().max(3_600_000).default(960_000),
-      providerTimeoutMs: z.number().int().positive().max(600_000).default(180_000),
+      providerTimeoutMs: z.number().int().positive().max(600_000).default(600_000),
       toolTimeoutMs: z.number().int().positive().max(120_000).default(30_000),
       approvalTtlMs: z.number().int().min(1_000).max(3_600_000).default(900_000),
       maxContextTokens: z.number().int().positive().max(1_000_000).default(262_144),

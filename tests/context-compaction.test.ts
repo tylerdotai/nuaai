@@ -361,9 +361,11 @@ describe('runtime context contract', () => {
     const { root, store } = await makeStore();
     const requests: ProviderRequest[] = [];
     const adapter = provider(requests);
+    const config = defaultRuntimeConfig(root);
+    expect(config.limits.providerTimeoutMs).toBe(600_000);
     const runtime = new AgentRuntime({
       root,
-      config: defaultRuntimeConfig(root),
+      config,
       store,
       providers: providers(adapter),
       tools: new ToolRegistry(root),
