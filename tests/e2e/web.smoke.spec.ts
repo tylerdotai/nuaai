@@ -453,6 +453,42 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   expect(browserErrors).toEqual([]);
 });
 
+test('HTTP polling surfaces paused approvals when WebSocket approval events are lost', async ({
+  page,
+}) => {
+  test.setTimeout(60_000);
+  const e2eRoot = process.env.NUAAI_E2E_ROOT;
+  if (!e2eRoot) throw new Error('NUAAI_E2E_ROOT is required');
+  await page.routeWebSocket(/\/ws(?:\?|$)/, (socket) => {
+    const server = socket.connectToServer();
+    socket.onMessage((message) => server.send(message));
+    server.onMessage((message) => {
+      const text = String(message);
+      if (text.includes('approvals.invalidated') || text.includes('approval.requested')) return;
+      socket.send(message);
+    });
+  });
+  await page.goto(`/#token=${encodeURIComponent(createBrowserPairingToken(e2eRoot))}`);
+  await expect(page.locator('.connection')).toContainText('Connected', { timeout: 30_000 });
+  await expect(page.locator('.composer textarea')).toBeVisible({ timeout: 30_000 });
+
+  const composer = page.locator('.composer textarea');
+  await composer.fill('browser write smoke');
+  await page.getByRole('button', { name: 'Send message', exact: true }).click();
+
+  const approvalInbox = page.getByRole('region', { name: 'Action approvals' });
+  await expect(approvalInbox).toBeVisible({ timeout: 10_000 });
+  const writeApproval = approvalInbox
+    .locator('.approval-card')
+    .filter({ hasText: 'workspace.write' });
+  await expect(writeApproval).toContainText('work-sample-output.txt');
+  await writeApproval.getByRole('button', { name: 'Approve once' }).click();
+  await expect(page.locator('.message-assistant').last()).toContainText(
+    'NUAAI deterministic test response',
+    { timeout: 30_000 },
+  );
+});
+
 test('a failed optional provider switch keeps the active runtime healthy', async ({ page }) => {
   const e2eRoot = process.env.NUAAI_E2E_ROOT;
   if (!e2eRoot) throw new Error('NUAAI_E2E_ROOT is required');

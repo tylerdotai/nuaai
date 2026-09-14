@@ -237,6 +237,12 @@ export function nextSelection(
   return ids[nextIndex] ?? null;
 }
 
+export const tuiApprovalFallbackIntervalMs = 15_000;
+
+export function tuiReconnectDelayMs(attempt: number): number {
+  return Math.min(1_000 * 2 ** Math.max(0, attempt - 1), 10_000);
+}
+
 export const initialTuiState: TuiState = {
   connection: 'connecting',
   error: null,

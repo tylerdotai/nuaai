@@ -410,8 +410,64 @@ export class AgentRuntime {
   constructor(private readonly options: RuntimeOptions) {
     this.options.store.releaseAllRunWriters();
     this.recoverActiveRuns();
-    for (const approval of this.options.store.listApprovalRequests('pending'))
-      this.scheduleApprovalExpiry(approval);
+    this.recoverApprovalRuns();
+  }
+
+  private failRecoveredRun(run: RunRow, output: string, approvalId?: string): void {
+    this.addRunMessage(run, 'assistant', output, run.provider, run.model);
+    this.options.store.updateRun(run.id, { status: 'failed', output });
+    this.emit(
+      'run.failed',
+      { error: output, reason: 'approval_recovery', ...(approvalId ? { approvalId } : {}) },
+      { threadId: run.threadId, runId: run.id, correlationId: run.correlationId },
+    );
+  }
+
+  private recoverApprovalRuns(): void {
+    const newestApprovalByRun = new Map<string, ApprovalRequestRow>();
+    for (const approval of this.options.store.listApprovalRequests())
+      if (!newestApprovalByRun.has(approval.runId))
+        newestApprovalByRun.set(approval.runId, approval);
+
+    for (const run of this.options.store.listActiveRuns()) {
+      if (run.status !== 'paused') continue;
+      const approval = newestApprovalByRun.get(run.id);
+      if (!approval) {
+        this.failRecoveredRun(
+          run,
+          'NUAAI found a paused run without an approval request after daemon restart. Resume manually.',
+        );
+        continue;
+      }
+      if (approval.status === 'pending') {
+        if (approval.expiresAt <= Date.now()) this.expireApproval(approval.id);
+        else this.scheduleApprovalExpiry(approval);
+        continue;
+      }
+      if (approval.status === 'approved') {
+        if (approval.expiresAt <= Date.now()) this.expireApproval(approval.id);
+        else {
+          this.scheduleApprovalExpiry(approval);
+          this.resumeApprovedRun(approval);
+        }
+        continue;
+      }
+      if (approval.status === 'executed') {
+        this.failRecoveredRun(
+          run,
+          `Action execution was claimed before daemon restart and will not be repeated: ${approval.toolName}`,
+          approval.id,
+        );
+        continue;
+      }
+      const reason =
+        approval.status === 'denied'
+          ? `Action denied before daemon restart: ${approval.toolName}`
+          : approval.status === 'expired'
+            ? `Action approval expired before daemon restart: ${approval.toolName}`
+            : `Action approval failed before daemon restart: ${approval.toolName}`;
+      this.terminateApprovalRun(approval, reason);
+    }
   }
 
   private recoverActiveRuns(): void {

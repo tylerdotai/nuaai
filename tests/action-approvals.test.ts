@@ -321,6 +321,84 @@ describe('runtime approval boundary', () => {
     ).toHaveLength(1);
   });
 
+  it.each(['approved', 'denied', 'executed'] as const)(
+    'reconciles a %s approval persisted before restart without stranding the run',
+    async (decision) => {
+      const root = await makeRoot();
+      const store = makeStore(root);
+      const provider = runtimeProvider(`restart-${decision}`);
+      const created = store.createSession(`Restart ${decision}`);
+      const run = store.createRun(
+        created.thread.id,
+        'Write after a persisted decision',
+        provider.name,
+        provider.model,
+        `restart-${decision}`,
+      );
+      store.addMessage(created.thread.id, 'user', run.input, provider.name, provider.model);
+      store.updateRun(run.id, { status: 'paused' });
+      const canonicalArguments = canonicalizeApprovalArguments({
+        content: 'approved content',
+        path: 'approved.txt',
+      });
+      const payloadHash = approvalPayloadHash(run.id, 'workspace.write', canonicalArguments);
+      const approval = store.createApprovalRequest({
+        id: `approval-${decision}`,
+        runId: run.id,
+        threadId: created.thread.id,
+        sessionId: created.session.id,
+        toolCallId: 'write-call',
+        toolName: 'workspace.write',
+        canonicalArguments,
+        payloadHash,
+        requiredPermission: 'write',
+        permissionSource: 'web',
+        risk: 'medium · workspace',
+        target: 'approved.txt',
+        providerOwned: false,
+        expiresAt: Date.now() + 60_000,
+      });
+      store.decideApprovalRequest(approval.id, decision === 'denied' ? 'denied' : 'approved');
+      if (decision === 'executed')
+        store.claimApprovalExecution(approval.id, {
+          runId: run.id,
+          toolName: 'workspace.write',
+          canonicalArguments,
+        });
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+
+      const reopened = makeStore(root);
+      const config = defaultRuntimeConfig(root);
+      const restarted = new AgentRuntime({
+        root,
+        config,
+        store: reopened,
+        providers: providerMap(provider),
+        tools: new ToolRegistry(root),
+        artifacts: new RunArtifactRegistry(root, reopened),
+        resolvePermissions: () => permissions(),
+      });
+
+      if (decision === 'approved') {
+        await expect(restarted.waitForRun(run.id)).resolves.toMatchObject({
+          status: 'completed',
+          output: 'Approved write completed.',
+        });
+        await expect(readFile(join(root, 'approved.txt'), 'utf8')).resolves.toBe(
+          'approved content',
+        );
+        expect(reopened.getApprovalRequest(approval.id)?.status).toBe('executed');
+        expect(reopened.listRunArtifacts(run.id)).toHaveLength(1);
+      } else {
+        await expect(restarted.waitForRun(run.id)).resolves.toMatchObject({ status: 'failed' });
+        await expect(access(join(root, 'approved.txt'))).rejects.toThrow();
+        expect(reopened.getApprovalRequest(approval.id)?.status).toBe(decision);
+      }
+      await restarted.shutdown();
+    },
+  );
+
   it('interrupts a paused approval on shutdown and resumes the same run once after reopen', async () => {
     const root = await makeRoot();
     const store = makeStore(root);

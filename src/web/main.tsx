@@ -756,6 +756,7 @@ function App(): React.JSX.Element {
     const generation = pollGeneration.current + 1;
     pollGeneration.current = generation;
     const controller = new AbortController();
+    let nextPausedApprovalRefreshAt = 0;
     const ownsPoll = (): boolean =>
       pollGeneration.current === generation &&
       selectedSessionRef.current === sessionId &&
@@ -765,7 +766,16 @@ function App(): React.JSX.Element {
         signal: controller.signal,
       })
         .then((run) => {
-          if (!ownsPoll() || !terminalRunStates.has(run.status)) return;
+          if (!ownsPoll()) return;
+          if (run.status === 'paused') {
+            const now = Date.now();
+            if (now >= nextPausedApprovalRefreshAt) {
+              nextPausedApprovalRefreshAt = now + 15_000;
+              void loadSystem().catch(reportBackgroundFailure);
+            }
+            return;
+          }
+          if (!terminalRunStates.has(run.status)) return;
           setActiveRunsByThread((current) =>
             current[threadId] === runId ? { ...current, [threadId]: null } : current,
           );

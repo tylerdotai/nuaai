@@ -5,11 +5,18 @@ import {
   initialTuiState,
   nextSelection,
   reduceTuiEvent,
+  tuiApprovalFallbackIntervalMs,
   tuiArtifactLines,
   tuiMessagesFromPresentation,
+  tuiReconnectDelayMs,
 } from '../src/ui/tui-state.js';
 
 describe('TUI event state', () => {
+  it('bounds reconnect backoff and keeps a low-frequency approval fallback', () => {
+    expect([1, 2, 3, 4, 9].map(tuiReconnectDelayMs)).toEqual([1_000, 2_000, 4_000, 8_000, 10_000]);
+    expect(tuiApprovalFallbackIntervalMs).toBe(15_000);
+  });
+
   it('hydrates only user-visible messages from structured presentation', () => {
     expect(
       tuiMessagesFromPresentation([

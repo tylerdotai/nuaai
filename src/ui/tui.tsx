@@ -3,6 +3,7 @@ import { Box, Text, useApp, useInput } from 'ink';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { WebSocket } from 'ws';
 
+import { webSocketCloseDisposition } from '../web/auth.js';
 import { parseScheduleCommand } from './tui-schedule.js';
 import {
   type TuiConversationMessage,
@@ -11,8 +12,10 @@ import {
   initialTuiState,
   nextSelection,
   reduceTuiEvent,
+  tuiApprovalFallbackIntervalMs,
   tuiArtifactLines,
   tuiMessagesFromPresentation,
+  tuiReconnectDelayMs,
 } from './tui-state.js';
 
 interface TuiProps {
@@ -314,17 +317,13 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
     null;
 
   useEffect(() => {
-    void refresh();
-    const socket = new WebSocket(
-      `${baseUrl.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}`,
-    );
-    socket.onopen = () => {
-      setStatus('Connected');
-      dispatch({ type: 'connection.changed', status: 'connected' });
-      void refresh();
-      socket.send(JSON.stringify({ type: 'subscribe', after: Number.MAX_SAFE_INTEGER, limit: 1 }));
-    };
-    socket.onmessage = (event) => {
+    let stopped = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let approvalFallbackTimer: ReturnType<typeof setInterval> | null = null;
+    let retry = 0;
+
+    const handleMessage: NonNullable<WebSocket['onmessage']> = (event) => {
       const value = JSON.parse(String(event.data)) as {
         type: string;
         event?: {
@@ -347,11 +346,63 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
       )
         void refresh();
     };
-    socket.onerror = () => {
-      setStatus('WebSocket error');
-      dispatch({ type: 'connection.changed', status: 'disconnected', error: 'WebSocket error' });
+
+    const connect = (): void => {
+      if (stopped) return;
+      const current = new WebSocket(
+        `${baseUrl.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}`,
+      );
+      socket = current;
+      current.onopen = () => {
+        if (stopped || socket !== current) return;
+        retry = 0;
+        setStatus('Connected');
+        dispatch({ type: 'connection.changed', status: 'connected' });
+        void refresh().finally(() => {
+          if (stopped || socket !== current || current.readyState !== WebSocket.OPEN) return;
+          current.send(
+            JSON.stringify({ type: 'subscribe', after: Number.MAX_SAFE_INTEGER, limit: 1 }),
+          );
+        });
+      };
+      current.onmessage = handleMessage;
+      current.onerror = () => current.close();
+      current.onclose = (event) => {
+        if (stopped || socket !== current) return;
+        const disposition = webSocketCloseDisposition(event.code, event.reason.toString());
+        const message = disposition.message ?? 'WebSocket disconnected';
+        setStatus(disposition.reconnect ? 'Reconnecting…' : 'Disconnected');
+        dispatch({ type: 'connection.changed', status: 'disconnected', error: message });
+        if (!disposition.reconnect) {
+          stopped = true;
+          setError(message);
+          if (approvalFallbackTimer) clearInterval(approvalFallbackTimer);
+          return;
+        }
+        retry += 1;
+        reconnectTimer = setTimeout(connect, tuiReconnectDelayMs(retry));
+      };
     };
-    return () => socket.close();
+
+    void refresh();
+    connect();
+    approvalFallbackTimer = setInterval(() => {
+      if (stopped || socket?.readyState === WebSocket.OPEN) return;
+      void loadCatalog(baseUrl, token)
+        .then((catalog) => {
+          if (!stopped && socket?.readyState !== WebSocket.OPEN) dispatch(catalog);
+        })
+        .catch((cause: unknown) => {
+          if (!stopped) setError(cause instanceof Error ? cause.message : String(cause));
+        });
+    }, tuiApprovalFallbackIntervalMs);
+
+    return () => {
+      stopped = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (approvalFallbackTimer) clearInterval(approvalFallbackTimer);
+      socket?.close();
+    };
   }, [baseUrl, refresh, token]);
   useInput(
     (character, key) => {
