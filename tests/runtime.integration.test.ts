@@ -273,6 +273,15 @@ describe('runtime configuration and security primitives', () => {
 
   it('redacts bearer tokens, API keys, nested values, and permissions', () => {
     expect(redactText('Bearer abc.def and sk-12345678')).toBe('Bearer [REDACTED] and [REDACTED]');
+    const assignmentText = redactText(
+      'password=hunter2 api_key: "private-key" https://example.com/?token=query-secret&ok=1',
+    );
+    expect(assignmentText).not.toContain('hunter2');
+    expect(assignmentText).not.toContain('private-key');
+    expect(assignmentText).not.toContain('query-secret');
+    expect(assignmentText).toContain('password=[REDACTED]');
+    expect(assignmentText).toContain('api_key: [REDACTED]');
+    expect(assignmentText).toContain('?token=[REDACTED]&ok=1');
     expect(
       redactValue({ token: 'secret', nested: [{ password: 'hidden' }, 'Bearer abc'] }),
     ).toEqual({ token: '[REDACTED]', nested: [{ password: '[REDACTED]' }, 'Bearer [REDACTED]'] });
