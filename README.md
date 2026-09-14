@@ -74,6 +74,7 @@ Authenticated operator clients run the complete perception → decision → acti
 - Node.js 22 or newer.
 - npm.
 - Ollama or an OpenAI-compatible local endpoint for the default local provider.
+- FFmpeg and ffprobe for audio/video inspection; zip and unzip for DOCX/XLSX inspection.
 - Docker Engine and Docker Compose for any selected Matrix, local-search, or browser-fallback services.
 - Tailscale for phone access from outside the host's local network.
 - Codex CLI logged in with ChatGPT (`codex login status`) only if the Codex provider is enabled. NUAAI delegates near-expiry credential refresh to Codex's account RPC and never copies OAuth tokens into project configuration or the runtime database.
