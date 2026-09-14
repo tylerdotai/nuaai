@@ -103,10 +103,10 @@ The onboarding flow asks which providers and integrations to enable, keeps telem
 
 ### Install a release artifact
 
-Download `nuaai-1.0.0.tgz` from the GitHub Release, then install and onboard it:
+Download `nuaai-1.0.1.tgz` from the GitHub Release, then install and onboard it:
 
 ```bash
-npm install --global ./nuaai-1.0.0.tgz
+npm install --global ./nuaai-1.0.1.tgz
 nuaai onboard
 ```
 
@@ -402,6 +402,8 @@ git diff --check
 The gate runs Biome, strict TypeScript, 80% per-file coverage across the instrumented runtime/core library scope, fresh Node/web builds, browser E2E, an installed-tarball daemon smoke, version consistency, and a dependency audit that blocks moderate-or-higher advisories. Process entrypoints, React/Ink presentation code, schema declarations, and provider transport shims are verified through integration, build, E2E, and artifact tests rather than included in the percentage claim. The current remaining low advisory is confined to tsup's Windows-only development-server esbuild dependency; NUAAI does not ship or run that server.
 
 The repository includes unit, integration, runtime, and browser tests. Live service smoke tests require Docker and are intentionally separate from deterministic unit tests.
+
+The [`v1.0.1` production dogfood report](docs/dogfood/v1.0.1-report.md) records 20/20 final real-provider cases, 20/20 completed actions, cancellation/resume, and PWA reload/reconnect evidence. The protocol preserves the initial blocked report and every replacement run instead of hiding calibration or model-compliance misses.
 
 ## Roadmap
 
