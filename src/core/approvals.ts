@@ -333,7 +333,7 @@ function previewValue(value: unknown, maximum: number): string | undefined {
         ? String(safe)
         : Array.isArray(safe) &&
             safe.every((entry) => ['string', 'number', 'boolean'].includes(typeof entry))
-          ? `[${safe.map((entry) => String(entry)).join(', ')}]`
+          ? `(${safe.map((entry) => String(entry)).join(', ')})`
           : undefined;
   if (serialized === undefined) return undefined;
   return serialized.length <= maximum
