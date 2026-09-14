@@ -4,6 +4,8 @@ All notable NUAAI changes are recorded here.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-14
+
 ### Fixed
 
 - Long provider responses now retain only the current model attempt, batch token-sized deltas, persist an authoritative reconnect snapshot, and survive bounded event replay without clipping or concatenating discarded drafts.
@@ -14,7 +16,15 @@ All notable NUAAI changes are recorded here.
 - Browser replay now uses a session-wide watermark, buffers and orders paginated catch-up, rejects duplicate events, and refuses stale background snapshots that would overwrite newer live output.
 - Browser completion text is canonical for the current attempt, TUI refreshes use the structured conversation projection, and bounded polite promise-only replies receive the existing finalization correction.
 - Long output no longer evicts early tool lifecycle records from browser presentation or run-state, preserving truthful action history alongside bounded recent deltas.
-- Provider-owned loops now receive the same one-shot promise-only finalization correction, and same-thread send/retry snapshots cannot replace live state unless their watermark is current.
+- Provider-owned loops now receive the same promise-only finalization truth checks, and same-thread send/retry snapshots cannot replace live state unless their watermark is current.
+
+### Verification
+
+- Vitest: 328 tests across 34 files passed.
+- Playwright: 8 built-web browser flows passed, including long multi-attempt streaming and reload.
+- Package smoke: clean tarball install, CLI initialization, daemon health, and shutdown passed.
+- Live production stress: one 48,110-character final response survived five model attempts, 19 paired actions, 2,499 streamed delta events, browser process loss, re-pairing, and completed-state reload without clipping, duplication, or a false tool-turn failure.
+- Independent exact-hash runtime and browser reviewers passed with zero remaining findings.
 
 ## [1.0.0] - 2026-09-14
 

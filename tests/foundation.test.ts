@@ -31,7 +31,7 @@ describe('NUAAI foundation', () => {
     expect(harnessConfig.tagline).toBe('not ur avg ai');
     expect(workspaceDirectory('/tmp/project')).toBe('/tmp/project/.nuaai');
     expect(readPackageMetadata().name).toBe('nuaai');
-    expect(getVersion()).toBe('1.0.0');
+    expect(getVersion()).toBe('1.0.1');
   });
 
   it('runs observe, plan, and act in order', async () => {
