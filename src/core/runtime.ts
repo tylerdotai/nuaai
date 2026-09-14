@@ -9,6 +9,7 @@ import { canonicalProviderMessages } from '../providers/request.js';
 import type {
   ProviderAdapter,
   ProviderDynamicTool,
+  ProviderDynamicToolCallMetadata,
   ProviderImage,
   ProviderMessage,
 } from '../providers/types.js';
@@ -135,6 +136,10 @@ export function requestRequiresVerifiedTool(input: string): boolean {
 
 type ProviderToolSchema = ReturnType<ToolRegistry['schemas']>[number];
 
+interface RuntimeProviderDynamicTool extends ProviderDynamicTool {
+  runtimeToolName: string;
+}
+
 export function selectProviderTools(
   input: string,
   tools: ProviderToolSchema[],
@@ -154,8 +159,12 @@ function selectCodexDynamicTools(
   timeoutMs: number,
   signal?: AbortSignal,
   budget?: ToolBudget,
-  executeTool?: (name: string, input: Record<string, unknown>) => Promise<unknown>,
-): ProviderDynamicTool[] {
+  executeTool?: (
+    name: string,
+    input: Record<string, unknown>,
+    metadata?: ProviderDynamicToolCallMetadata,
+  ) => Promise<unknown>,
+): RuntimeProviderDynamicTool[] {
   const toolDefinitions =
     typeof (tools as ToolRegistry & { list?: unknown }).list === 'function'
       ? tools.list()
@@ -164,18 +173,20 @@ function selectCodexDynamicTools(
   const localTools = toolDefinitions
     .filter((tool) => permissions.approved.has(tool.permission))
     .map((tool) => ({
+      runtimeToolName: tool.name,
       namespace: 'nuaai',
       name: tool.name.replaceAll('.', '_'),
       description: tool.description,
       parameters: tool.parameters,
-      execute: (input: Record<string, unknown>) =>
+      execute: (input: Record<string, unknown>, metadata?: ProviderDynamicToolCallMetadata) =>
         executeTool
-          ? executeTool(tool.name, input)
+          ? executeTool(tool.name, input, metadata)
           : tools.execute(tool.name, input, { root, permissions, budget, timeoutMs, signal }),
     }));
   const mcpTools = registryToolNames.has('mcp.execute')
     ? []
     : (mcp?.schemas(permissions) ?? []).map((tool) => ({
+        runtimeToolName: tool.name,
         namespace: 'nuaai',
         name: tool.name.replaceAll('.', '_'),
         description: tool.description,
@@ -208,6 +219,80 @@ function normalizeNumericArguments(
     }
   }
   return normalized;
+}
+
+function providerToolPayloadHash(input: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(`nuaai-provider-tool-payload-v1\0${canonicalizeApprovalArguments(input)}`)
+    .digest('hex');
+}
+
+function canonicalAttestationValue(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (Number.isNaN(value)) return { type: 'number', value: 'NaN' };
+    if (value === Number.POSITIVE_INFINITY) return { type: 'number', value: 'Infinity' };
+    if (value === Number.NEGATIVE_INFINITY) return { type: 'number', value: '-Infinity' };
+    if (Object.is(value, -0)) return { type: 'number', value: '-0' };
+    return value;
+  }
+  if (typeof value === 'undefined') return { type: 'undefined' };
+  if (typeof value === 'bigint') return { type: 'bigint', value: String(value) };
+  if (value instanceof Error) return { type: 'error', name: value.name, message: value.message };
+  if (value instanceof Date) return { type: 'date', value: value.toISOString() };
+  if (value instanceof Uint8Array)
+    return { type: 'bytes', value: Buffer.from(value).toString('base64') };
+  if (Array.isArray(value)) return value.map((entry) => canonicalAttestationValue(entry, seen));
+  if (value && typeof value === 'object') {
+    if (seen.has(value)) throw new Error('Provider tool attestation value is circular');
+    seen.add(value);
+    const canonical = Object.fromEntries(
+      Object.keys(value as Record<string, unknown>)
+        .sort()
+        .map((key) => [
+          key,
+          canonicalAttestationValue((value as Record<string, unknown>)[key], seen),
+        ]),
+    );
+    seen.delete(value);
+    return canonical;
+  }
+  return { type: typeof value, value: String(value) };
+}
+
+function providerToolResultHash(value: unknown): string {
+  return createHash('sha256')
+    .update(`nuaai-provider-tool-result-v1\0${JSON.stringify(canonicalAttestationValue(value))}`)
+    .digest('hex');
+}
+
+function providerToolFailureHashes(error: unknown): Set<string> {
+  const message = error instanceof Error ? error.message : String(error);
+  return new Set([
+    providerToolResultHash(error),
+    providerToolResultHash(message),
+    providerToolResultHash({ error: message }),
+    providerToolResultHash({ message }),
+  ]);
+}
+
+interface ProviderToolStartAnnouncement {
+  callId: string;
+  qualifiedName: string;
+  payloadHash: string;
+}
+
+interface ProviderToolAttestation {
+  callId: string;
+  qualifiedName: string;
+  runtimeToolName: string;
+  payloadHash: string;
+  input: Record<string, unknown>;
+  status: 'running' | 'succeeded' | 'failed';
+  result?: unknown;
+  resultHashes: Set<string>;
+  startSeen: boolean;
+  acknowledged: boolean;
 }
 
 function serializeBoundedToolResult(
@@ -555,7 +640,7 @@ export class AgentRuntime {
           requiredPermission: admission.definition.permission,
           permissionSource,
           risk: `${admission.definition.governance.costClass} · ${admission.definition.governance.sideEffects}`,
-          target: approvalTarget(parsedArguments),
+          target: approvalTarget(toolName, parsedArguments),
           providerOwned,
           expiresAt: now + ttl,
         },
@@ -1294,7 +1379,27 @@ export class AgentRuntime {
       const providerTools = providerOwnsToolLoop
         ? []
         : selectProviderTools(run.input, availableTools);
-      const providerDynamicTools = providerOwnsToolLoop
+      const providerToolStarts = new Map<string, ProviderToolStartAnnouncement>();
+      const providerToolAttestations = new Map<string, ProviderToolAttestation>();
+      const reportProviderToolViolation = (
+        callId: string,
+        qualifiedName: string,
+        message: string,
+        reason: 'unadvertised_provider_event' | 'unattested_provider_event',
+      ): void => {
+        unresolvedToolFailures.push(`${qualifiedName}: ${message}`);
+        this.emit(
+          'tool.failed',
+          { id: callId, name: qualifiedName, providerOwned: true, reason, error: message },
+          {
+            sessionId: thread.sessionId,
+            threadId: thread.id,
+            runId: run.id,
+            correlationId: run.correlationId,
+          },
+        );
+      };
+      const rawProviderDynamicTools = providerOwnsToolLoop
         ? selectCodexDynamicTools(
             this.options.tools,
             this.options.mcp,
@@ -1303,12 +1408,18 @@ export class AgentRuntime {
             this.options.config.limits.toolTimeoutMs,
             controller.signal,
             toolBudget,
-            (toolName, input) =>
-              this.executeToolWithApproval(
+            (toolName, input, metadata) => {
+              if (!metadata)
+                return Promise.reject(
+                  new Error(
+                    'Provider-owned dynamic tool execution requires call attestation metadata',
+                  ),
+                );
+              return this.executeToolWithApproval(
                 run,
                 thread.sessionId,
                 permissionSource,
-                `provider-${randomUUID()}`,
+                metadata.callId,
                 toolName,
                 input,
                 permissions,
@@ -1318,9 +1429,112 @@ export class AgentRuntime {
                   timeoutMs: this.options.config.limits.toolTimeoutMs,
                   signal: controller.signal,
                 },
-              ),
+              );
+            },
           )
         : [];
+      const providerDynamicTools: ProviderDynamicTool[] = rawProviderDynamicTools.map(
+        ({ runtimeToolName, ...tool }) => {
+          const qualifiedName = `${tool.namespace}.${tool.name}`;
+          return {
+            ...tool,
+            execute: async (
+              input: Record<string, unknown>,
+              metadata?: ProviderDynamicToolCallMetadata,
+            ): Promise<unknown> => {
+              const callId = metadata?.callId?.trim() ?? '';
+              if (!callId || metadata?.qualifiedName !== qualifiedName) {
+                const message = `Provider-owned dynamic tool ${qualifiedName} requires its exact call ID and qualified name`;
+                reportProviderToolViolation(
+                  callId || '(missing)',
+                  qualifiedName,
+                  message,
+                  'unattested_provider_event',
+                );
+                throw new Error(message);
+              }
+              const payloadHash = providerToolPayloadHash(input);
+              const announcement = providerToolStarts.get(callId);
+              if (
+                announcement &&
+                (announcement.qualifiedName !== qualifiedName ||
+                  announcement.payloadHash !== payloadHash)
+              ) {
+                const message = `Provider-owned tool ${callId} arguments do not match its announced call`;
+                providerToolStarts.delete(callId);
+                reportProviderToolViolation(
+                  callId,
+                  qualifiedName,
+                  message,
+                  'unattested_provider_event',
+                );
+                throw new Error(message);
+              }
+              if (providerToolAttestations.has(callId)) {
+                const message = `Provider-owned tool call ID ${callId} was reused`;
+                reportProviderToolViolation(
+                  callId,
+                  qualifiedName,
+                  message,
+                  'unattested_provider_event',
+                );
+                throw new Error(message);
+              }
+              const attestation: ProviderToolAttestation = {
+                callId,
+                qualifiedName,
+                runtimeToolName,
+                payloadHash,
+                input,
+                status: 'running',
+                resultHashes: new Set(),
+                startSeen: Boolean(announcement),
+                acknowledged: false,
+              };
+              providerToolStarts.delete(callId);
+              providerToolAttestations.set(callId, attestation);
+              this.emit(
+                'tool.started',
+                {
+                  id: callId,
+                  name: qualifiedName,
+                  providerOwned: true,
+                  attestation: { version: 1, payloadHash, status: 'running' },
+                },
+                {
+                  sessionId: thread.sessionId,
+                  threadId: thread.id,
+                  runId: run.id,
+                  correlationId: run.correlationId,
+                },
+              );
+              try {
+                const result = await tool.execute(input, metadata);
+                attestation.status = 'succeeded';
+                attestation.result = result;
+                attestation.resultHashes.add(providerToolResultHash(result));
+                await this.captureToolArtifacts(
+                  run,
+                  thread,
+                  runtimeToolName,
+                  input,
+                  result,
+                  callId,
+                );
+                return result;
+              } catch (error) {
+                attestation.status = 'failed';
+                attestation.result = error instanceof Error ? error.message : String(error);
+                attestation.resultHashes = providerToolFailureHashes(error);
+                throw error;
+              }
+            },
+          };
+        },
+      );
+      const providerDynamicToolsByName = new Map(
+        providerDynamicTools.map((tool) => [`${tool.namespace}.${tool.name}`, tool]),
+      );
       const skillContext = isolatedRequest
         ? 'Isolated verification mode: use only the canonical registered tool that matches the request. Do not substitute workspace.command when a dedicated tool is listed above.'
         : (this.options.skills?.promptContext(
@@ -1625,46 +1839,142 @@ export class AgentRuntime {
             else {
               flushModelDelta();
               if (event.type === 'tool_started') {
-                toolActivity = true;
-                this.emit(
-                  'tool.started',
-                  {
-                    id: event.id,
-                    name: event.name,
-                    arguments: event.arguments,
-                    providerOwned: true,
-                  },
-                  eventContext,
-                );
-              } else if (event.type === 'tool_completed') {
-                toolActivity = true;
-                if (!event.isError)
-                  await this.captureToolArtifacts(
-                    run,
-                    thread,
-                    event.name,
-                    event.arguments,
-                    event.result,
+                if (!providerDynamicToolsByName.has(event.name)) {
+                  reportProviderToolViolation(
                     event.id,
+                    event.name,
+                    `unadvertised provider-owned tool ${event.name}`,
+                    'unadvertised_provider_event',
                   );
+                  continue;
+                }
+                let payloadHash: string;
+                try {
+                  payloadHash = providerToolPayloadHash(event.arguments);
+                } catch (error) {
+                  reportProviderToolViolation(
+                    event.id,
+                    event.name,
+                    `Provider-owned tool ${event.id} has unhashable arguments: ${error instanceof Error ? error.message : String(error)}`,
+                    'unattested_provider_event',
+                  );
+                  continue;
+                }
+                const existingAttestation = providerToolAttestations.get(event.id);
+                if (existingAttestation) {
+                  if (
+                    existingAttestation.qualifiedName === event.name &&
+                    existingAttestation.payloadHash === payloadHash &&
+                    !existingAttestation.startSeen
+                  )
+                    existingAttestation.startSeen = true;
+                  else
+                    reportProviderToolViolation(
+                      event.id,
+                      event.name,
+                      `Provider-owned tool start ${event.id} does not match its callback attestation`,
+                      'unattested_provider_event',
+                    );
+                  continue;
+                }
+                if (providerToolStarts.has(event.id)) {
+                  reportProviderToolViolation(
+                    event.id,
+                    event.name,
+                    `Provider-owned tool start ${event.id} was duplicated`,
+                    'unattested_provider_event',
+                  );
+                  continue;
+                }
+                providerToolStarts.set(event.id, {
+                  callId: event.id,
+                  qualifiedName: event.name,
+                  payloadHash,
+                });
+              } else if (event.type === 'tool_completed') {
+                if (!providerDynamicToolsByName.has(event.name)) {
+                  reportProviderToolViolation(
+                    event.id,
+                    event.name,
+                    `unadvertised provider-owned tool ${event.name}`,
+                    'unadvertised_provider_event',
+                  );
+                  continue;
+                }
+                const attestation = providerToolAttestations.get(event.id);
+                if (!attestation) {
+                  providerToolStarts.delete(event.id);
+                  reportProviderToolViolation(
+                    event.id,
+                    event.name,
+                    `Provider-owned tool completion ${event.id} is unattested because its execute callback did not run`,
+                    'unattested_provider_event',
+                  );
+                  continue;
+                }
+                let payloadHash: string;
+                let completedResultHash: string;
+                try {
+                  payloadHash = providerToolPayloadHash(event.arguments);
+                  completedResultHash = providerToolResultHash(event.result);
+                } catch (error) {
+                  reportProviderToolViolation(
+                    event.id,
+                    event.name,
+                    `Provider-owned tool completion ${event.id} could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+                    'unattested_provider_event',
+                  );
+                  continue;
+                }
+                const reportedStatus = event.isError ? 'failed' : 'succeeded';
+                if (
+                  attestation.acknowledged ||
+                  !attestation.startSeen ||
+                  attestation.status === 'running' ||
+                  attestation.qualifiedName !== event.name ||
+                  attestation.payloadHash !== payloadHash ||
+                  attestation.status !== reportedStatus ||
+                  !attestation.resultHashes.has(completedResultHash)
+                ) {
+                  reportProviderToolViolation(
+                    event.id,
+                    event.name,
+                    `Provider-owned tool completion ${event.id} does not match its callback attestation`,
+                    'unattested_provider_event',
+                  );
+                  continue;
+                }
+                attestation.acknowledged = true;
+                toolActivity = true;
                 const boundedResult = serializeBoundedToolResult(
-                  event.result,
+                  attestation.result,
                   this.options.config.limits.maxToolResultBytes,
                 );
-                if (event.isError)
+                if (attestation.status === 'failed')
                   unresolvedToolFailures.push(`${event.name}: ${boundedResult.content}`);
-                this.addRunMessage(run, 'tool', boundedResult.content);
+                const toolMessage = this.addRunMessage(run, 'tool', boundedResult.content);
+                this.options.store.storeMessageArtifact(toolMessage.id, 'tool_result', {
+                  callId: event.id,
+                  name: attestation.runtimeToolName,
+                  result: boundedResult.value,
+                  resultTruncated: boundedResult.truncated,
+                });
                 this.emit(
                   'tool.completed',
                   {
                     id: event.id,
                     name: event.name,
-                    arguments: event.arguments,
                     result: boundedResult.value,
                     resultBytes: boundedResult.bytes,
                     resultTruncated: boundedResult.truncated,
                     isError: event.isError,
                     providerOwned: true,
+                    attestation: {
+                      version: 1,
+                      payloadHash: attestation.payloadHash,
+                      resultHash: providerToolResultHash(attestation.result),
+                      status: attestation.status,
+                    },
                   },
                   eventContext,
                 );
@@ -1680,6 +1990,27 @@ export class AgentRuntime {
           }
         } catch (cause) {
           providerStreamError = cause;
+        }
+        if (!providerStreamError && providerOwnsToolLoop) {
+          for (const [callId, announcement] of providerToolStarts) {
+            reportProviderToolViolation(
+              callId,
+              announcement.qualifiedName,
+              `Provider-owned tool start ${callId} is unattested because its execute callback did not run`,
+              'unattested_provider_event',
+            );
+            providerToolStarts.delete(callId);
+          }
+          for (const attestation of providerToolAttestations.values()) {
+            if (attestation.acknowledged) continue;
+            reportProviderToolViolation(
+              attestation.callId,
+              attestation.qualifiedName,
+              `Provider-owned tool ${attestation.callId} callback result was not matched by a completion event`,
+              'unattested_provider_event',
+            );
+            attestation.acknowledged = true;
+          }
         }
         if (deltaFlushError) throw deltaFlushError;
         flushModelDelta();

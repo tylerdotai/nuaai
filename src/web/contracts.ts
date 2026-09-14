@@ -90,6 +90,17 @@ export interface ApprovalRequest {
   payloadHash: string;
   target: string;
   risk: string;
+  preview: {
+    version: 1;
+    kind: string;
+    summary: string;
+    fields: Array<{ label: string; value: string; format?: 'code' }>;
+    context: {
+      source: 'web' | 'matrix' | 'scheduler' | 'direct' | 'other';
+      client: string;
+      sessionId?: string;
+    };
+  };
   providerOwned: boolean;
   createdAt: number;
   expiresAt: number;

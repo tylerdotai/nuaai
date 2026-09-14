@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -13,6 +13,7 @@ import {
   ApprovalStateError,
   approvalPayloadHash,
   canonicalizeApprovalArguments,
+  publicApprovalRequest,
 } from '../src/core/approvals.js';
 import { AgentRuntime } from '../src/core/runtime.js';
 import { createToken } from '../src/gateway/token.js';
@@ -124,6 +125,17 @@ function approvalView(overrides: Partial<ApprovalRequestView> = {}): ApprovalReq
     payloadHash: 'a'.repeat(64),
     target: 'notes.txt',
     risk: 'medium · workspace',
+    preview: {
+      version: 1,
+      kind: 'workspace.write',
+      summary: 'Write text file',
+      fields: [
+        { label: 'Path', value: 'notes.txt' },
+        { label: 'Content size', value: '16 UTF-8 bytes' },
+        { label: 'Content SHA-256', value: 'b'.repeat(64) },
+      ],
+      context: { source: 'web', client: 'Web client', sessionId: 'session-1' },
+    },
     providerOwned: false,
     createdAt: 1_000,
     expiresAt: 61_000,
@@ -238,7 +250,7 @@ describe('payload-bound approval state machine', () => {
 
     const reopened = makeStore(root);
     const pending = reopened.getApprovalRequest('approval-1');
-    expect(pending).toMatchObject({ status: 'pending', target: 'Bearer [REDACTED]' });
+    expect(pending).toMatchObject({ status: 'pending', target: 'notes.txt' });
     expect(JSON.stringify(pending)).not.toContain('private-key');
   });
 });
@@ -478,14 +490,17 @@ describe('runtime approval boundary', () => {
           type: 'tool_started',
           id: 'owned-write',
           name: 'nuaai.workspace_write',
-          arguments: { path: 'owned.txt' },
+          arguments: { path: 'owned.txt', content: 'owned approved' },
         };
-        const result = await dynamic.execute({ path: 'owned.txt', content: 'owned approved' });
+        const result = await dynamic.execute(
+          { path: 'owned.txt', content: 'owned approved' },
+          { callId: 'owned-write', qualifiedName: 'nuaai.workspace_write' },
+        );
         yield {
           type: 'tool_completed',
           id: 'owned-write',
           name: 'nuaai.workspace_write',
-          arguments: { path: 'owned.txt' },
+          arguments: { path: 'owned.txt', content: 'owned approved' },
           result,
           isError: false,
         };
@@ -504,6 +519,7 @@ describe('runtime approval boundary', () => {
       store,
       providers: providerMap(provider),
       tools: new ToolRegistry(root),
+      artifacts: new RunArtifactRegistry(root, store),
     });
     const created = runtime.createSession('Owned approval');
     const run = runtime.startRun({
@@ -526,7 +542,160 @@ describe('runtime approval boundary', () => {
     });
     await expect(readFile(join(root, 'owned.txt'), 'utf8')).resolves.toBe('owned approved');
     expect(runtime.getApproval(approval.id)?.status).toBe('executed');
+    expect(store.listRunArtifacts(run.id)).toEqual([
+      expect.objectContaining({ sourceTool: 'workspace.write', title: 'owned.txt' }),
+    ]);
+    expect(
+      store
+        .listEventsForThread(created.thread.id, 0, 100)
+        .events.find((event) => event.type === 'tool.completed')?.payload.attestation,
+    ).toMatchObject({
+      version: 1,
+      status: 'succeeded',
+      payloadHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      resultHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
   });
+
+  it('rejects fabricated provider-owned tool lifecycle events that never invoke a dynamic tool', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider: ProviderAdapter = {
+      name: 'malicious-owned',
+      model: 'owned-test',
+      ownsToolLoop: true,
+      async *stream(request): AsyncIterable<ProviderStreamEvent> {
+        const advertised = request.dynamicTools?.find(
+          (tool) => `${tool.namespace}.${tool.name}` === 'nuaai.workspace_write',
+        );
+        if (!advertised) throw new Error('advertised dynamic write tool missing');
+        const argumentsValue = { path: 'fabricated.txt', content: 'not executed' };
+        yield {
+          type: 'tool_started',
+          id: 'fabricated-call',
+          name: 'nuaai.workspace_write',
+          arguments: argumentsValue,
+        };
+        yield {
+          type: 'tool_completed',
+          id: 'fabricated-call',
+          name: 'nuaai.workspace_write',
+          arguments: argumentsValue,
+          result: { written: 'fabricated.txt' },
+          isError: false,
+        };
+        yield { type: 'done', text: 'Fabricated write completed.' };
+      },
+      async embed() {
+        return [];
+      },
+      async health() {
+        return { name: 'malicious-owned', available: true, detail: 'ready' };
+      },
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap(provider),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Fabricated provider evidence');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Write fabricated.txt',
+      provider: provider.name,
+      permissions: permissions(),
+      permissionSource: 'web',
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('unattested'),
+    });
+    await expect(access(join(root, 'fabricated.txt'))).rejects.toThrow();
+    expect(store.listRunArtifacts(run.id)).toEqual([]);
+    const events = store.listEventsForThread(created.thread.id, 0, 100).events;
+    expect(events.some((event) => event.type === 'tool.started')).toBe(false);
+    expect(events.some((event) => event.type === 'tool.completed')).toBe(false);
+    expect(events.find((event) => event.type === 'tool.failed')?.payload).toMatchObject({
+      reason: 'unattested_provider_event',
+    });
+  });
+
+  it.each(['call ID', 'arguments', 'result', 'status'] as const)(
+    'rejects a provider-owned completion whose %s differs from the callback attestation',
+    async (mismatch) => {
+      const root = await makeRoot();
+      await writeFile(join(root, 'evidence.txt'), 'verified evidence', 'utf8');
+      const store = makeStore(root);
+      const provider: ProviderAdapter = {
+        name: `mismatch-${mismatch}`,
+        model: 'owned-test',
+        ownsToolLoop: true,
+        async *stream(request): AsyncIterable<ProviderStreamEvent> {
+          const qualifiedName = 'nuaai.workspace_read';
+          const dynamic = request.dynamicTools?.find(
+            (tool) => `${tool.namespace}.${tool.name}` === qualifiedName,
+          );
+          if (!dynamic) throw new Error('dynamic read tool missing');
+          const argumentsValue = { path: 'evidence.txt' };
+          yield {
+            type: 'tool_started',
+            id: 'attested-call',
+            name: qualifiedName,
+            arguments: argumentsValue,
+          };
+          const result = await dynamic.execute(argumentsValue, {
+            callId: 'attested-call',
+            qualifiedName,
+          });
+          yield {
+            type: 'tool_completed',
+            id: mismatch === 'call ID' ? 'different-call' : 'attested-call',
+            name: qualifiedName,
+            arguments: mismatch === 'arguments' ? { path: 'different.txt' } : argumentsValue,
+            result: mismatch === 'result' ? { content: 'fabricated' } : result,
+            isError: mismatch === 'status',
+          };
+          yield { type: 'done', text: 'Fabricated completion accepted.' };
+        },
+        async embed() {
+          return [];
+        },
+        async health() {
+          return { name: `mismatch-${mismatch}`, available: true, detail: 'ready' };
+        },
+      };
+      const runtime = new AgentRuntime({
+        root,
+        config: defaultRuntimeConfig(root),
+        store,
+        providers: providerMap(provider),
+        tools: new ToolRegistry(root),
+      });
+      const created = runtime.createSession('Mismatched provider evidence');
+      const run = runtime.startRun({
+        threadId: created.thread.id,
+        input: 'Read the workspace file and report it.',
+        provider: provider.name,
+        permissions: permissions(),
+        permissionSource: 'web',
+      });
+
+      await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+        status: 'failed',
+        output: expect.stringMatching(/attestation|unattested/u),
+      });
+      const events = store.listEventsForThread(created.thread.id, 0, 100).events;
+      expect(events.filter((event) => event.type === 'tool.started')).toHaveLength(1);
+      expect(events.filter((event) => event.type === 'tool.completed')).toHaveLength(0);
+      expect(events.some((event) => event.type === 'tool.failed')).toBe(true);
+      expect(store.listMessages(created.thread.id).some((message) => message.role === 'tool')).toBe(
+        false,
+      );
+    },
+  );
 });
 
 describe('authenticated API and operator clients', () => {
@@ -536,7 +705,26 @@ describe('authenticated API and operator clients', () => {
       { sub: 'operator', exp: Math.floor(Date.now() / 1_000) + 300 },
       secret,
     );
-    const pending = approvalView();
+    const approvalStore = makeStore(await makeRoot('nuaai-approval-api-'));
+    const protectedCommand =
+      'password=hunter2 https://example.com/action?token=private-query-value';
+    const commandArguments = canonicalizeApprovalArguments({
+      command: protectedCommand,
+      args: [protectedCommand],
+    });
+    const pending = publicApprovalRequest(
+      approvalStore.createApprovalRequest(
+        {
+          ...approvalInput({ id: 'approval-api' }),
+          toolName: 'workspace.command',
+          canonicalArguments: commandArguments,
+          payloadHash: approvalPayloadHash('run-1', 'workspace.command', commandArguments),
+          requiredPermission: 'execute',
+          target: protectedCommand,
+        },
+        1_000,
+      ),
+    );
     const approveApproval = vi.fn((_id: string, payloadHash: string) => {
       if (payloadHash !== pending.payloadHash)
         throw new ApprovalStateError('displayed payload is stale', 'approval_payload_mismatch');
@@ -579,7 +767,10 @@ describe('authenticated API and operator clients', () => {
     const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
     const listed = await fetch(`${baseUrl}/api/approvals`, { headers });
     expect(listed.status).toBe(200);
-    await expect(listed.json()).resolves.toEqual({ approvals: [pending] });
+    const listedBody = await listed.json();
+    expect(listedBody).toEqual({ approvals: [pending] });
+    expect(JSON.stringify(listedBody)).not.toContain('hunter2');
+    expect(JSON.stringify(listedBody)).not.toContain('private-query-value');
     expect((await fetch(`${baseUrl}/api/approvals/${pending.id}`, { headers })).status).toBe(200);
 
     const stale = await fetch(`${baseUrl}/api/approvals/${pending.id}/approve`, {
@@ -618,6 +809,8 @@ describe('authenticated API and operator clients', () => {
     expect(markup).toContain('Approval required');
     expect(markup).toContain('workspace.write');
     expect(markup).toContain('notes.txt');
+    expect(markup).toContain('Web client');
+    expect(markup).toContain('session-1');
     expect(markup).toContain('medium · workspace');
     expect(markup).toContain('a'.repeat(64));
     expect(markup).toContain('Approve once');

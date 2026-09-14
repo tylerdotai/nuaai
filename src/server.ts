@@ -749,15 +749,18 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
     server: httpServer,
     maxPayload: maxWebSocketMessageBytes,
   });
-  const clients = new Map<WebSocket, string | undefined>();
+  const clients = new Map<WebSocket, string | undefined | null>();
   const unsubscribe = services.runtime.subscribe((event) => {
     const payload = JSON.stringify({ type: 'event', event });
-    for (const [client, sessionId] of clients)
-      if (
-        client.readyState === client.OPEN &&
-        (!sessionId || !event.sessionId || sessionId === event.sessionId)
-      )
-        client.send(payload);
+    const approvalInvalidation = event.type.startsWith('approval.')
+      ? JSON.stringify({ type: 'approvals.invalidated' })
+      : undefined;
+    for (const [client, sessionId] of clients) {
+      if (client.readyState !== client.OPEN) continue;
+      if (approvalInvalidation) client.send(approvalInvalidation);
+      if (sessionId === null) continue;
+      if (!sessionId || !event.sessionId || sessionId === event.sessionId) client.send(payload);
+    }
   });
   wsServer.on('connection', (socket, request) => {
     const url = new URL(request.url ?? '/ws', `http://${request.headers.host ?? 'localhost'}`);
@@ -777,7 +780,7 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       socket.close(1008, authenticationFailure(token ?? null, services.authSecret, checkedAt).code);
       return;
     }
-    clients.set(socket, undefined);
+    clients.set(socket, null);
     socket.send(JSON.stringify({ type: 'ready', version: getVersion() }));
     socket.on('message', (raw) => {
       try {

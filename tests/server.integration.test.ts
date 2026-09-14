@@ -390,6 +390,53 @@ describe('authenticated daemon client routes', () => {
     ]);
   });
 
+  it('globally invalidates approval inboxes without leaking another session event', async () => {
+    const gateway = services();
+    let publish: ((event: Record<string, unknown>) => void) | undefined;
+    gateway.runtime.subscribe = ((listener: (event: Record<string, unknown>) => void) => {
+      publish = listener;
+      return () => undefined;
+    }) as never;
+    const handle = await startServer(gateway);
+    handles.push(handle);
+    const baseUrl = `http://127.0.0.1:${handle.port}`;
+    const received = await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+      const messages: Array<Record<string, unknown>> = [];
+      const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/nuaai/ws?token=${token}`);
+      const timer = setTimeout(() => {
+        socket.close();
+        reject(new Error('Timed out waiting for approval invalidation'));
+      }, 500);
+      socket.on('message', (value) => {
+        const message = JSON.parse(String(value)) as Record<string, unknown>;
+        if (message.type === 'ready') {
+          socket.send(JSON.stringify({ type: 'subscribe', sessionId: 'session-a', after: 0 }));
+          return;
+        }
+        if (message.type === 'replay.complete') {
+          publish?.({
+            id: 3,
+            type: 'approval.requested',
+            sessionId: 'session-b',
+            payload: { target: 'private-target', payloadHash: 'a'.repeat(64) },
+          });
+          return;
+        }
+        messages.push(message);
+        if (message.type === 'approvals.invalidated') {
+          clearTimeout(timer);
+          socket.close();
+          resolve(messages);
+        }
+      });
+      socket.once('error', reject);
+    });
+
+    expect(received).toEqual([{ type: 'approvals.invalidated' }]);
+    expect(JSON.stringify(received)).not.toContain('private-target');
+    expect(JSON.stringify(received)).not.toContain('session-b');
+  });
+
   it('paginates HTTP replay after applying the requested session scope', async () => {
     const gateway = services();
     const selected = {

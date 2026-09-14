@@ -161,6 +161,13 @@ export interface TuiApproval {
   payloadHash: string;
   target: string;
   risk: string;
+  preview: {
+    version: 1;
+    kind: string;
+    summary: string;
+    fields: Array<{ label: string; value: string; format?: 'code' }>;
+    context: { source: string; client: string; sessionId?: string };
+  };
   providerOwned: boolean;
   createdAt: number;
   expiresAt: number;

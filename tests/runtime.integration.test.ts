@@ -2388,7 +2388,7 @@ describe('agent runtime orchestration', () => {
     unsubscribe();
   });
 
-  it('projects provider-owned tool events without re-executing them in NUAAI', async () => {
+  it('rejects unadvertised provider-owned tool events without treating them as evidence', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
     let registryExecutions = 0;
@@ -2434,8 +2434,8 @@ describe('agent runtime orchestration', () => {
       permissions: permissive,
     });
     await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
-      status: 'completed',
-      output: 'Codex completed the command.',
+      status: 'failed',
+      output: expect.stringContaining('unadvertised'),
     });
     expect(registryExecutions).toBe(0);
     expect(
@@ -2443,7 +2443,12 @@ describe('agent runtime orchestration', () => {
         .listEvents()
         .filter((event) => event.runId === run.id)
         .map((event) => event.type),
-    ).toEqual(expect.arrayContaining(['tool.started', 'tool.completed', 'run.completed']));
+    ).toEqual(expect.arrayContaining(['tool.failed', 'run.failed']));
+    expect(
+      store
+        .listEvents()
+        .filter((event) => event.runId === run.id && event.type === 'tool.completed'),
+    ).toHaveLength(0);
   });
 
   it('requests finalization when a provider-owned loop returns a polite promise only', async () => {

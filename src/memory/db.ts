@@ -13,7 +13,9 @@ import {
   type ApprovalRequestRow,
   ApprovalStateError,
   approvalPayloadHash,
+  approvalTarget,
   boundedApprovalPreview,
+  buildApprovalPreview,
   resultHash,
 } from '../core/approvals.js';
 import { type ContextMessage, estimateMessageTokens, estimateTokens } from '../core/context.js';
@@ -428,6 +430,28 @@ function createSchema(db: MemoryDatabase, vector = false): void {
   ];
   for (const [name, migration] of summaryMigrations)
     if (!summaryColumns.some((column) => column.name === name)) db.exec(migration);
+  const legacyApprovalPreview = JSON.stringify({
+    version: 1,
+    kind: 'legacy',
+    summary: 'Legacy approval preview unavailable',
+    fields: [],
+    context: { source: 'other', client: 'Authenticated runtime client' },
+  });
+  db.prepare(
+    `UPDATE approval_requests
+     SET arguments_preview = ?
+     WHERE CASE
+       WHEN json_valid(arguments_preview) = 0 THEN 1
+       ELSE
+         COALESCE(json_extract(arguments_preview, '$.version'), 0) != 1 OR
+         COALESCE(json_type(arguments_preview, '$.kind'), '') != 'text' OR
+         COALESCE(json_type(arguments_preview, '$.summary'), '') != 'text' OR
+         COALESCE(json_type(arguments_preview, '$.fields'), '') != 'array' OR
+         COALESCE(json_type(arguments_preview, '$.context'), '') != 'object' OR
+         COALESCE(json_type(arguments_preview, '$.context.source'), '') != 'text' OR
+         COALESCE(json_type(arguments_preview, '$.context.client'), '') != 'text'
+       END`,
+  ).run(legacyApprovalPreview);
   db.prepare(
     "UPDATE schema_meta SET value = '7' WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 7",
   ).run();
@@ -1457,6 +1481,11 @@ export class DatabaseStore {
         'Approval payload hash does not match its binding',
         'approval_payload_mismatch',
       );
+    const argumentsValue = JSON.parse(input.canonicalArguments) as Record<string, unknown>;
+    const preview = buildApprovalPreview(input.toolName, argumentsValue, {
+      permissionSource: input.permissionSource,
+      sessionId: input.sessionId,
+    });
     this.database.raw
       .prepare(
         `INSERT INTO approval_requests
@@ -1472,12 +1501,12 @@ export class DatabaseStore {
         input.sessionId ?? null,
         input.toolCallId,
         input.toolName,
-        boundedApprovalPreview(JSON.parse(input.canonicalArguments) as unknown, 500),
+        JSON.stringify(preview),
         input.payloadHash,
         input.requiredPermission,
         input.permissionSource,
         boundedApprovalPreview(input.risk, 120),
-        boundedApprovalPreview(input.target, 160),
+        approvalTarget(input.toolName, argumentsValue),
         input.providerOwned ? 1 : 0,
         now,
         input.expiresAt,
