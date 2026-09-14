@@ -124,4 +124,15 @@ Production routing now uses direct streaming Responses. The endpoint is fixed, r
 - [x] Treat `model.completed.text` as canonical for the current live attempt.
 - [x] Preserve bounded non-delta lifecycle events so long output cannot erase early action history.
 - [x] Apply promise-only finalization truth to provider-owned loops and grant stale-snapshot replacement only to paths that reset event subscription.
-- [ ] Run the complete gate, obtain fresh independent review, push, redeploy, and repeat production pairing/readback.
+- [x] Run the complete gate, obtain fresh independent review, push, redeploy, and repeat production pairing/readback.
+
+## v1-next daily-use platform
+
+- [x] Release, tag, publish artifacts, and deploy `v1.0.1`; npm registry publication remains credential-blocked.
+- [x] Execute the production dogfood protocol: 20/20 final cases, 20/20 actions, cancellation/resume, and reload/reconnect controls.
+- [ ] Persist payload-bound per-action approval requests; ship approve-once/deny/expiry UI and execution readback.
+- [ ] Replace crude byte compaction with provider-neutral token budgets, durable provenance, pinned constraints, and atomic tool-call/result groups.
+- [ ] Persist and present typed run artifacts with authenticated safe downloads, checksums, citations, PWA cards, and TUI visibility.
+- [ ] Integrate feature lanes, reconcile migrations/contracts, and run focused cross-feature tests.
+- [ ] Run the complete canonical gate and two independent exact-tree reviews.
+- [ ] Merge through GitHub CI, release the integrated version, deploy only with zero active runs, and verify the paired production PWA.
