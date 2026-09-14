@@ -79,6 +79,10 @@ export interface ToolDefinition {
   input: z.ZodType<unknown>;
   execute(input: unknown, context: ToolContext): Promise<unknown>;
 }
+export interface ToolAdmission {
+  definition: ToolDefinition;
+  input: unknown;
+}
 
 const empty = z.object({});
 const githubCommands = new Set(['gh']);
@@ -1006,17 +1010,20 @@ export class ToolRegistry {
     return [...unique.values()];
   }
 
+  previewAdmission(name: string, input: unknown, context: ToolContext): ToolAdmission {
+    const tool = this.tools.get(name);
+    if (!tool) throw new Error(`Unknown tool: ${name}`);
+    assertPermission(context.permissions, tool.permission);
+    context.signal?.throwIfAborted();
+    return { definition: tool, input: tool.input.parse(input) };
+  }
   async execute(
     name: string,
     input: unknown,
     context: ToolContext,
     onAuthorized?: () => void,
   ): Promise<unknown> {
-    const tool = this.tools.get(name);
-    if (!tool) throw new Error(`Unknown tool: ${name}`);
-    assertPermission(context.permissions, tool.permission);
-    context.signal?.throwIfAborted();
-    const parsed = tool.input.parse(input);
+    const { definition: tool, input: parsed } = this.previewAdmission(name, input, context);
     reserveToolBudget(tool, context.budget);
     onAuthorized?.();
     context.signal?.throwIfAborted();

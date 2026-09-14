@@ -15,6 +15,7 @@ import { RunStatusSummary } from './components/RunStatusSummary.js';
 import { type ComposerCommand, draftStorageKey, resolveComposerCommand } from './composer.js';
 import type {
   ActiveProvider,
+  ApprovalRequest,
   CommandId,
   ConnectionState,
   MemoryRecord,
@@ -69,6 +70,7 @@ import {
   selectionSnapshotCanCommit,
 } from './state.js';
 import {
+  ApprovalInbox,
   AutomationsView,
   CommandPalette,
   ErrorToast,
@@ -113,6 +115,8 @@ function App(): React.JSX.Element {
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [plugins, setPlugins] = useState<PluginRecord[]>([]);
   const [pluginHealth, setPluginHealth] = useState<PluginHealth[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  const [decidingApprovalIds, setDecidingApprovalIds] = useState<Set<string>>(new Set());
   const [view, setView] = useState<ViewId>('conversation');
   const [connection, setConnection] = useState<ConnectionState>('connecting');
   const [input, setInput] = useState('');
@@ -155,6 +159,7 @@ function App(): React.JSX.Element {
   const forceFollowRef = useRef(true);
   const draftHydrationRef = useRef<{ threadId: string; value: string } | null>(null);
   const paletteFirstActionRef = useRef<HTMLButtonElement>(null);
+  const decidingApprovalIdsRef = useRef(new Set<string>());
   const activeRunId = activeRunForThread(activeRunsByThread, selectedThreadId);
   const authenticationError = isAuthenticationErrorMessage(error);
 
@@ -332,19 +337,27 @@ function App(): React.JSX.Element {
   }, [commandPaletteOpen]);
 
   const loadSystem = useCallback(async (signal?: AbortSignal): Promise<void> => {
-    const [providerResult, scheduleResult, taskResult, memoryResult, skillResult, pluginResult] =
-      await Promise.all([
-        request<{
-          active: ActiveProvider;
-          providers: ProviderHealth[];
-          webPermissionProfile?: PermissionProfile;
-        }>('/api/providers', { signal }),
-        request<{ schedules: Schedule[] }>('/api/schedules', { signal }),
-        request<{ tasks: Task[] }>('/api/tasks', { signal }),
-        request<{ memories: MemoryRecord[] }>('/api/memory', { signal }),
-        request<{ skills: SkillRecord[] }>('/api/skills', { signal }),
-        request<{ plugins: PluginRecord[]; health: PluginHealth[] }>('/api/plugins', { signal }),
-      ]);
+    const [
+      providerResult,
+      scheduleResult,
+      taskResult,
+      memoryResult,
+      skillResult,
+      pluginResult,
+      approvalResult,
+    ] = await Promise.all([
+      request<{
+        active: ActiveProvider;
+        providers: ProviderHealth[];
+        webPermissionProfile?: PermissionProfile;
+      }>('/api/providers', { signal }),
+      request<{ schedules: Schedule[] }>('/api/schedules', { signal }),
+      request<{ tasks: Task[] }>('/api/tasks', { signal }),
+      request<{ memories: MemoryRecord[] }>('/api/memory', { signal }),
+      request<{ skills: SkillRecord[] }>('/api/skills', { signal }),
+      request<{ plugins: PluginRecord[]; health: PluginHealth[] }>('/api/plugins', { signal }),
+      request<{ approvals: ApprovalRequest[] }>('/api/approvals?status=pending', { signal }),
+    ]);
     setWebPermissionProfile(providerResult.webPermissionProfile ?? 'read-only');
     setProviders(providerResult.providers);
     setActiveProvider(providerResult.active);
@@ -354,6 +367,7 @@ function App(): React.JSX.Element {
     setSkills(skillResult.skills);
     setPlugins(pluginResult.plugins);
     setPluginHealth(pluginResult.health);
+    setApprovals(approvalResult.approvals);
   }, []);
 
   const loadThread = useCallback(
@@ -639,6 +653,8 @@ function App(): React.JSX.Element {
           if (nextEvent.id !== undefined) replayCursor.observe(nextEvent.id);
           lastEventId.current = Math.max(lastEventId.current, nextEvent.id ?? 0);
           scheduleEvent(nextEvent);
+          if (nextEvent.type.startsWith('approval.'))
+            void loadSystem().catch(reportBackgroundFailure);
           if (
             terminalRunStates.has(nextEvent.type.replace('run.', '')) &&
             nextEvent.threadId === selectedThreadRef.current
@@ -1281,6 +1297,43 @@ function App(): React.JSX.Element {
     }
   };
 
+  const decideApproval = async (
+    id: string,
+    payloadHash: string,
+    decision: 'approve' | 'deny',
+  ): Promise<void> => {
+    if (decidingApprovalIdsRef.current.has(id)) return;
+    decidingApprovalIdsRef.current.add(id);
+    setDecidingApprovalIds(new Set(decidingApprovalIdsRef.current));
+    setError(null);
+    try {
+      await request(`/api/approvals/${encodeURIComponent(id)}/${decision}`, {
+        method: 'POST',
+        body: JSON.stringify({ payloadHash }),
+      });
+      setApprovals((current) => current.filter((approval) => approval.id !== id));
+      await loadSystem();
+      setNotice(decision === 'approve' ? 'Action approved once' : 'Action denied');
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      try {
+        await loadSystem();
+      } catch (refreshCause) {
+        setError(
+          `${message}. Approval refresh failed: ${refreshCause instanceof Error ? refreshCause.message : String(refreshCause)}`,
+        );
+        return;
+      } finally {
+        decidingApprovalIdsRef.current.delete(id);
+        setDecidingApprovalIds(new Set(decidingApprovalIdsRef.current));
+      }
+      setError(message);
+      return;
+    }
+    decidingApprovalIdsRef.current.delete(id);
+    setDecidingApprovalIds(new Set(decidingApprovalIdsRef.current));
+  };
+
   const executeCommand = async (id: CommandId): Promise<void> => {
     setCommandPaletteOpen(false);
     if (id === 'new-session') await createSession();
@@ -1422,6 +1475,12 @@ function App(): React.JSX.Element {
         )}
 
         <main className="workspace">
+          <ApprovalInbox
+            approvals={approvals}
+            decidingIds={decidingApprovalIds}
+            onApprove={(id, payloadHash) => void decideApproval(id, payloadHash, 'approve')}
+            onDeny={(id, payloadHash) => void decideApproval(id, payloadHash, 'deny')}
+          />
           {view === 'conversation' && (
             <section
               id="view-conversation"

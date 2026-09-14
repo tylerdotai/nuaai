@@ -21,6 +21,18 @@ import {
   createToolBudget,
 } from '../tools/registry.js';
 import {
+  ApprovalDeniedError,
+  ApprovalExpiredError,
+  type ApprovalRequestRow,
+  type ApprovalRequestView,
+  ApprovalStateError,
+  type ApprovalStatus,
+  approvalPayloadHash,
+  approvalTarget,
+  canonicalizeApprovalArguments,
+  publicApprovalRequest,
+} from './approvals.js';
+import {
   buildCapabilityManifest,
   classifyVerificationPolicy,
   verificationRequiresEvidence,
@@ -45,6 +57,7 @@ export interface RuntimeOptions {
   skills?: SkillRegistry;
   skillLearner?: SkillLearner;
   artifacts?: RunArtifactRegistry;
+  resolvePermissions?: (source: string) => PermissionContext;
 }
 export interface RunRequest {
   threadId: string;
@@ -54,6 +67,7 @@ export interface RunRequest {
   model?: string;
   idempotencyKey?: string;
   permissions?: PermissionContext;
+  permissionSource?: string;
 }
 export type RuntimeListener = (event: EventRecord & { id: number }) => void;
 
@@ -139,6 +153,7 @@ function selectCodexDynamicTools(
   timeoutMs: number,
   signal?: AbortSignal,
   budget?: ToolBudget,
+  executeTool?: (name: string, input: Record<string, unknown>) => Promise<unknown>,
 ): ProviderDynamicTool[] {
   const toolDefinitions =
     typeof (tools as ToolRegistry & { list?: unknown }).list === 'function'
@@ -153,7 +168,9 @@ function selectCodexDynamicTools(
       description: tool.description,
       parameters: tool.parameters,
       execute: (input: Record<string, unknown>) =>
-        tools.execute(tool.name, input, { root, permissions, budget, timeoutMs, signal }),
+        executeTool
+          ? executeTool(tool.name, input)
+          : tools.execute(tool.name, input, { root, permissions, budget, timeoutMs, signal }),
     }));
   const mcpTools = registryToolNames.has('mcp.execute')
     ? []
@@ -270,20 +287,50 @@ function requestsMemoryMutation(input: string): boolean {
   );
 }
 
+interface RunAuthority {
+  source: string;
+  permissions: PermissionContext;
+}
+
+interface ApprovalWaiter {
+  promise: Promise<void>;
+  resolve(): void;
+  reject(error: Error): void;
+}
+
+class ApprovalWaitInterruptedError extends Error {
+  constructor(runId: string) {
+    super(`Approval wait interrupted for run ${runId}`);
+    this.name = 'ApprovalWaitInterruptedError';
+  }
+}
+
+interface ApprovedToolExecution {
+  approval: ApprovalRequestRow;
+  canonicalArguments: string;
+  permissions: PermissionContext;
+}
+
 export class AgentRuntime {
   private readonly listeners = new Set<RuntimeListener>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly runQueue = new SessionRunQueue();
   private readonly writerOwnerId = randomUUID();
+  private readonly runAuthorities = new Map<string, RunAuthority>();
+  private readonly approvalWaiters = new Map<string, ApprovalWaiter>();
+  private readonly approvalExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private stopping = false;
 
   constructor(private readonly options: RuntimeOptions) {
     this.options.store.releaseAllRunWriters();
     this.recoverActiveRuns();
+    for (const approval of this.options.store.listApprovalRequests('pending'))
+      this.scheduleApprovalExpiry(approval);
   }
 
   private recoverActiveRuns(): void {
     for (const run of this.options.store.listActiveRuns()) {
+      if (run.status === 'paused') continue;
       const output = 'NUAAI run interrupted by daemon restart. Resume manually to continue.';
       this.options.store.updateRun(run.id, { status: 'failed', output });
       this.emit(
@@ -291,6 +338,346 @@ export class AgentRuntime {
         { error: output, reason: 'daemon_restart' },
         { threadId: run.threadId, runId: run.id, correlationId: run.correlationId },
       );
+    }
+  }
+
+  listApprovals(status?: ApprovalStatus): ApprovalRequestView[] {
+    return this.options.store
+      .listApprovalRequests(status)
+      .map((approval) => publicApprovalRequest(approval));
+  }
+
+  getApproval(id: string): ApprovalRequestView | undefined {
+    const approval = this.options.store.getApprovalRequest(id);
+    return approval ? publicApprovalRequest(approval) : undefined;
+  }
+
+  approveApproval(id: string, payloadHash: string): ApprovalRequestView {
+    const approval = this.options.store.decideApprovalRequest(
+      id,
+      'approved',
+      Date.now(),
+      payloadHash,
+    );
+    this.emitApprovalEvent('approval.approved', approval);
+    const waiter = this.approvalWaiters.get(id);
+    if (waiter) waiter.resolve();
+    else this.resumeApprovedRun(approval);
+    return publicApprovalRequest(approval);
+  }
+
+  denyApproval(id: string, payloadHash: string): ApprovalRequestView {
+    const approval = this.options.store.decideApprovalRequest(
+      id,
+      'denied',
+      Date.now(),
+      payloadHash,
+    );
+    this.clearApprovalExpiry(id);
+    this.emitApprovalEvent('approval.denied', approval);
+    this.terminateApprovalRun(approval, `Action denied: ${approval.toolName}`);
+    this.approvalWaiters.get(id)?.reject(new ApprovalDeniedError(id));
+    return publicApprovalRequest(approval);
+  }
+
+  private currentPermissions(runId: string, source: string): PermissionContext {
+    const resolved = this.options.resolvePermissions?.(source);
+    if (resolved) return resolved;
+    const authority = this.runAuthorities.get(runId);
+    if (authority?.source === source) return authority.permissions;
+    return permissionContextForProfile('read-only');
+  }
+
+  private emitApprovalEvent(
+    type:
+      | 'approval.requested'
+      | 'approval.approved'
+      | 'approval.denied'
+      | 'approval.expired'
+      | 'approval.executed'
+      | 'approval.failed',
+    approval: ApprovalRequestRow,
+  ): void {
+    this.emit(
+      type,
+      { ...publicApprovalRequest(approval) },
+      {
+        ...(approval.sessionId ? { sessionId: approval.sessionId } : {}),
+        threadId: approval.threadId,
+        runId: approval.runId,
+      },
+    );
+  }
+
+  private scheduleApprovalExpiry(approval: ApprovalRequestRow): void {
+    this.clearApprovalExpiry(approval.id);
+    const delay = Math.max(0, approval.expiresAt - Date.now());
+    const timer = setTimeout(() => this.expireApproval(approval.id), delay);
+    timer.unref();
+    this.approvalExpiryTimers.set(approval.id, timer);
+  }
+
+  private clearApprovalExpiry(id: string): void {
+    const timer = this.approvalExpiryTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this.approvalExpiryTimers.delete(id);
+  }
+
+  private expireApproval(id: string): void {
+    this.clearApprovalExpiry(id);
+    const approval = this.options.store.expireApprovalRequest(id);
+    if (!approval || approval.status !== 'expired') return;
+    this.emitApprovalEvent('approval.expired', approval);
+    this.terminateApprovalRun(approval, `Action approval expired: ${approval.toolName}`);
+    this.approvalWaiters.get(id)?.reject(new ApprovalExpiredError(id));
+  }
+
+  private terminateApprovalRun(approval: ApprovalRequestRow, output: string): void {
+    const run = this.options.store.getRun(approval.runId);
+    if (!run || ['completed', 'failed', 'cancelled'].includes(run.status)) return;
+    this.addRunMessage(run, 'assistant', output, run.provider, run.model);
+    this.options.store.updateRun(run.id, { status: 'failed', output });
+    this.emit(
+      'run.failed',
+      { error: output, approvalId: approval.id },
+      {
+        ...(approval.sessionId ? { sessionId: approval.sessionId } : {}),
+        threadId: approval.threadId,
+        runId: approval.runId,
+        correlationId: run.correlationId,
+      },
+    );
+    this.controllers.get(run.id)?.abort(new Error(output));
+  }
+
+  private resumeApprovedRun(approval: ApprovalRequestRow): void {
+    const run = this.options.store.getRun(approval.runId);
+    if (!run || run.status !== 'paused') return;
+    const permissions = this.currentPermissions(run.id, approval.permissionSource);
+    this.runAuthorities.set(run.id, { source: approval.permissionSource, permissions });
+    const provider = this.options.providers.get(run.provider);
+    this.enqueueRun(run, provider, permissions, approval.permissionSource, undefined, true);
+  }
+
+  private approvalWaiter(id: string): ApprovalWaiter {
+    let resolveWaiter!: () => void;
+    let rejectWaiter!: (error: Error) => void;
+    const promise = new Promise<void>((resolve, reject) => {
+      resolveWaiter = resolve;
+      rejectWaiter = reject;
+    });
+    const waiter: ApprovalWaiter = {
+      promise,
+      resolve: resolveWaiter,
+      reject: rejectWaiter,
+    };
+    this.approvalWaiters.set(id, waiter);
+    return waiter;
+  }
+
+  private pendingApprovalsForRun(runId: string): ApprovalRequestRow[] {
+    return this.options.store
+      .listApprovalRequests('pending')
+      .filter((approval) => approval.runId === runId);
+  }
+
+  private interruptApprovalWait(runId: string): void {
+    const error = new ApprovalWaitInterruptedError(runId);
+    for (const approval of this.pendingApprovalsForRun(runId))
+      this.approvalWaiters.get(approval.id)?.reject(error);
+  }
+
+  private denyPendingApprovalsForCancelledRun(runId: string): void {
+    for (const approval of this.pendingApprovalsForRun(runId)) {
+      try {
+        const denied = this.options.store.decideApprovalRequest(
+          approval.id,
+          'denied',
+          Date.now(),
+          approval.payloadHash,
+        );
+        this.clearApprovalExpiry(approval.id);
+        this.emitApprovalEvent('approval.denied', denied);
+      } catch (error) {
+        if (!(error instanceof ApprovalStateError)) throw error;
+      }
+      this.approvalWaiters.get(approval.id)?.reject(new ApprovalDeniedError(approval.id));
+    }
+  }
+
+  private async awaitActionApproval(
+    run: RunRow,
+    sessionId: string,
+    permissionSource: string,
+    toolCallId: string,
+    toolName: string,
+    input: unknown,
+    permissions: PermissionContext,
+    providerOwned: boolean,
+    context: { budget?: ToolBudget; timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<ApprovedToolExecution | undefined> {
+    const admission = this.options.tools.previewAdmission(toolName, input, {
+      root: this.options.root,
+      permissions,
+      ...context,
+      threadId: run.threadId,
+      runId: run.id,
+    });
+    if (admission.definition.governance.approval !== 'profile') return undefined;
+    if (!admission.input || typeof admission.input !== 'object' || Array.isArray(admission.input))
+      throw new Error(`Approval arguments must be an object: ${toolName}`);
+    const parsedArguments = admission.input as Record<string, unknown>;
+    const canonicalArguments = canonicalizeApprovalArguments(parsedArguments);
+    const payloadHash = approvalPayloadHash(run.id, toolName, canonicalArguments);
+    let approval = this.options.store
+      .listApprovalRequests('approved')
+      .find(
+        (candidate) =>
+          candidate.runId === run.id &&
+          candidate.toolName === toolName &&
+          candidate.payloadHash === payloadHash,
+      );
+    if (!approval) {
+      const now = Date.now();
+      const configuredTtl = (this.options.config.limits as { approvalTtlMs?: number })
+        .approvalTtlMs;
+      const ttl = Math.min(3_600_000, Math.max(1_000, configuredTtl ?? 900_000));
+      approval = this.options.store.createApprovalRequest(
+        {
+          runId: run.id,
+          threadId: run.threadId,
+          sessionId,
+          toolCallId,
+          toolName,
+          canonicalArguments,
+          payloadHash,
+          requiredPermission: admission.definition.permission,
+          permissionSource,
+          risk: `${admission.definition.governance.costClass} · ${admission.definition.governance.sideEffects}`,
+          target: approvalTarget(parsedArguments),
+          providerOwned,
+          expiresAt: now + ttl,
+        },
+        now,
+      );
+      const waiter = this.approvalWaiter(approval.id);
+      this.options.store.updateRun(run.id, { status: 'paused' });
+      this.emitApprovalEvent('approval.requested', approval);
+      this.emit(
+        'run.paused',
+        { reason: 'approval_required', approvalId: approval.id },
+        { sessionId, threadId: run.threadId, runId: run.id, correlationId: run.correlationId },
+      );
+      this.scheduleApprovalExpiry(approval);
+      try {
+        await waiter.promise;
+      } finally {
+        this.approvalWaiters.delete(approval.id);
+      }
+      approval = this.options.store.getApprovalRequest(approval.id) as ApprovalRequestRow;
+    }
+    if (approval.status !== 'approved')
+      throw new ApprovalStateError(
+        `Approval request ${approval.id} is not approved`,
+        approval.status === 'expired' ? 'approval_expired' : 'approval_not_pending',
+      );
+    const currentPermissions = this.currentPermissions(run.id, permissionSource);
+    try {
+      const currentAdmission = this.options.tools.previewAdmission(toolName, input, {
+        root: this.options.root,
+        permissions: currentPermissions,
+        ...context,
+        threadId: run.threadId,
+        runId: run.id,
+      });
+      if (
+        !currentAdmission.input ||
+        typeof currentAdmission.input !== 'object' ||
+        Array.isArray(currentAdmission.input) ||
+        canonicalizeApprovalArguments(currentAdmission.input as Record<string, unknown>) !==
+          canonicalArguments
+      )
+        throw new ApprovalStateError(
+          `Approval request ${approval.id} payload changed before execution`,
+          'approval_payload_mismatch',
+        );
+    } catch (error) {
+      const failed = this.options.store.failApprovalExecution(approval.id, error);
+      this.clearApprovalExpiry(approval.id);
+      this.emitApprovalEvent('approval.failed', failed);
+      throw error;
+    }
+    this.options.store.updateRun(run.id, { status: 'running' });
+    this.emit(
+      'run.resumed',
+      { approvalId: approval.id, reason: 'approval_granted' },
+      { sessionId, threadId: run.threadId, runId: run.id, correlationId: run.correlationId },
+    );
+    return { approval, canonicalArguments, permissions: currentPermissions };
+  }
+
+  private async executeToolWithApproval(
+    run: RunRow,
+    sessionId: string,
+    permissionSource: string,
+    toolCallId: string,
+    toolName: string,
+    input: unknown,
+    permissions: PermissionContext,
+    providerOwned: boolean,
+    context: { budget?: ToolBudget; timeoutMs?: number; signal?: AbortSignal },
+    onAuthorized?: () => void,
+  ): Promise<unknown> {
+    let approved: ApprovedToolExecution | undefined;
+    try {
+      approved = await this.awaitActionApproval(
+        run,
+        sessionId,
+        permissionSource,
+        toolCallId,
+        toolName,
+        input,
+        permissions,
+        providerOwned,
+        context,
+      );
+      const result = await this.options.tools.execute(
+        toolName,
+        input,
+        {
+          root: this.options.root,
+          permissions: approved?.permissions ?? permissions,
+          ...context,
+          threadId: run.threadId,
+          runId: run.id,
+        },
+        () => {
+          if (approved) {
+            this.options.store.claimApprovalExecution(approved.approval.id, {
+              runId: run.id,
+              toolName,
+              canonicalArguments: approved.canonicalArguments,
+            });
+            this.clearApprovalExpiry(approved.approval.id);
+          }
+          onAuthorized?.();
+        },
+      );
+      if (approved) {
+        const completed = this.options.store.completeApprovalExecution(
+          approved.approval.id,
+          result,
+        );
+        this.emitApprovalEvent('approval.executed', completed);
+      }
+      return result;
+    } catch (error) {
+      if (approved) {
+        const failed = this.options.store.failApprovalExecution(approved.approval.id, error);
+        this.clearApprovalExpiry(approved.approval.id);
+        this.emitApprovalEvent('approval.failed', failed);
+      }
+      throw error;
     }
   }
 
@@ -600,12 +987,10 @@ export class AgentRuntime {
       { provider: provider.name, model, activeRun: this.runQueue.activeRun(thread.id) },
       { sessionId: thread.sessionId, threadId: thread.id, runId: run.id, correlationId },
     );
-    this.enqueueRun(
-      run,
-      provider,
-      request.permissions ?? permissionContextForProfile('read-only'),
-      request.images,
-    );
+    const permissions = request.permissions ?? permissionContextForProfile('read-only');
+    const permissionSource = request.permissionSource ?? 'direct';
+    this.runAuthorities.set(run.id, { source: permissionSource, permissions });
+    this.enqueueRun(run, provider, permissions, permissionSource, request.images);
     return run;
   }
 
@@ -613,10 +998,12 @@ export class AgentRuntime {
     run: RunRow,
     provider: ProviderAdapter,
     permissions: PermissionContext,
+    permissionSource: string,
     images?: ProviderImage[],
+    resuming = false,
   ): void {
     void this.runQueue.enqueue(run.threadId, run.id, () =>
-      this.executeRun(run, provider, permissions, images),
+      this.executeRun(run, provider, permissions, permissionSource, images, resuming),
     );
   }
 
@@ -630,9 +1017,10 @@ export class AgentRuntime {
       {},
       { threadId: run.threadId, runId, correlationId: run.correlationId },
     );
-    if (run.status === 'queued') {
+    if (run.status === 'queued' || run.status === 'paused') {
       const output = 'NUAAI run cancelled before execution.';
       this.options.store.updateRun(runId, { status: 'cancelled', output });
+      if (run.status === 'paused') this.denyPendingApprovalsForCancelledRun(runId);
       this.emit(
         'run.cancelled',
         { output, reason: 'cancelled_before_execution' },
@@ -646,11 +1034,14 @@ export class AgentRuntime {
       this.stopping = true;
       for (const run of this.options.store.listActiveRuns()) {
         if (run.status === 'queued') this.cancelRun(run.id);
+        else if (run.status === 'paused') this.interruptApprovalWait(run.id);
         else {
           this.options.store.requestRunCancel(run.id);
           this.controllers.get(run.id)?.abort(new Error('Daemon stopping'));
         }
       }
+      for (const timer of this.approvalExpiryTimers.values()) clearTimeout(timer);
+      this.approvalExpiryTimers.clear();
     }
     await this.runQueue.drain();
   }
@@ -751,7 +1142,9 @@ export class AgentRuntime {
     run: RunRow,
     provider: ProviderAdapter,
     permissions: PermissionContext,
+    permissionSource: string,
     images?: ProviderImage[],
+    resuming = false,
   ): Promise<void> {
     const queued = this.options.store.getRun(run.id);
     if (!queued || ['completed', 'failed', 'cancelled'].includes(queued.status)) return;
@@ -769,17 +1162,25 @@ export class AgentRuntime {
       writerClaimed = this.options.store.claimRunWriter(thread.id, run.id, this.writerOwnerId);
       if (!writerClaimed) throw new Error('Run could not claim the active transcript writer');
       const model = run.model;
-      const inputMessage = this.addRunMessage(run, 'user', run.input, provider.name, model);
-      this.emit(
-        'run.started',
-        { provider: provider.name, model },
-        {
-          sessionId: thread.sessionId,
-          threadId: thread.id,
-          runId: run.id,
-          correlationId: run.correlationId,
-        },
-      );
+      const existingInputMessage = resuming
+        ? this.options.store
+            .listMessages(thread.id, 100_000)
+            .filter((message) => message.role === 'user' && message.content === run.input)
+            .at(-1)
+        : undefined;
+      const inputMessage =
+        existingInputMessage ?? this.addRunMessage(run, 'user', run.input, provider.name, model);
+      if (!resuming)
+        this.emit(
+          'run.started',
+          { provider: provider.name, model },
+          {
+            sessionId: thread.sessionId,
+            threadId: thread.id,
+            runId: run.id,
+            correlationId: run.correlationId,
+          },
+        );
       let output = '';
       let generatedOutputBytes = 0;
       let finalResponseAccepted = false;
@@ -901,6 +1302,22 @@ export class AgentRuntime {
             this.options.config.limits.toolTimeoutMs,
             controller.signal,
             toolBudget,
+            (toolName, input) =>
+              this.executeToolWithApproval(
+                run,
+                thread.sessionId,
+                permissionSource,
+                `provider-${randomUUID()}`,
+                toolName,
+                input,
+                permissions,
+                true,
+                {
+                  budget: toolBudget,
+                  timeoutMs: this.options.config.limits.toolTimeoutMs,
+                  signal: controller.signal,
+                },
+              ),
           )
         : [];
       const skillContext = isolatedRequest
@@ -1487,10 +1904,20 @@ export class AgentRuntime {
                 : normalizedCall.arguments;
             let result: unknown;
             if (registryToolName && this.options.tools.supportsAdmissionCallback === true) {
-              result = await this.options.tools.execute(
+              result = await this.executeToolWithApproval(
+                run,
+                thread.sessionId,
+                permissionSource,
+                call.id,
                 registryToolName,
                 registryInput,
-                toolContext,
+                permissions,
+                false,
+                {
+                  budget: toolBudget,
+                  timeoutMs: this.options.config.limits.toolTimeoutMs,
+                  signal: controller.signal,
+                },
                 emitToolStarted,
               );
             } else if (registryToolName) {
@@ -1581,6 +2008,13 @@ export class AgentRuntime {
               return;
             }
           } catch (error) {
+            if (
+              error instanceof ApprovalWaitInterruptedError ||
+              error instanceof ApprovalDeniedError ||
+              error instanceof ApprovalExpiredError ||
+              ['failed', 'cancelled'].includes(this.options.store.getRun(run.id)?.status ?? '')
+            )
+              return;
             const message = error instanceof Error ? error.message : String(error);
             const budgetError = error instanceof ToolBudgetError ? error : undefined;
             if (budgetError) toolBudgetExhausted = true;
@@ -1717,6 +2151,8 @@ export class AgentRuntime {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const current = this.options.store.getRun(run.id);
+      if (error instanceof ApprovalWaitInterruptedError && current?.status === 'paused') return;
+      if (current && ['completed', 'failed', 'cancelled'].includes(current.status)) return;
       const status = current?.cancelRequested ? 'cancelled' : 'failed';
       const failureOutput =
         status === 'cancelled'

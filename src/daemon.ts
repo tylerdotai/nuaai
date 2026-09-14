@@ -194,6 +194,7 @@ async function startOwnedDaemon(
         threadId: created.thread.id,
         input: schedule.agentInput,
         permissions: permissionContextForProfile(effectiveConfig.permissions.scheduler),
+        permissionSource: 'scheduler',
       });
       scheduledRuns.set(taskId, run.id);
       try {
@@ -227,6 +228,14 @@ async function startOwnedDaemon(
     skills,
     skillLearner,
     artifacts,
+    resolvePermissions: (source) =>
+      permissionContextForProfile(
+        source === 'matrix'
+          ? effectiveConfig.permissions.matrix
+          : source === 'scheduler'
+            ? effectiveConfig.permissions.scheduler
+            : effectiveConfig.permissions.web,
+      ),
   });
   let gateway: GatewayHandle;
   try {
@@ -580,6 +589,7 @@ async function startOwnedDaemon(
             input: [message.body, ...(attachmentContext ?? []), ...transcriptions].join('\n'),
             idempotencyKey: `matrix:${message.eventId}`,
             permissions: permissionContextForProfile(effectiveConfig.permissions.matrix),
+            permissionSource: 'matrix',
             ...(images.length ? { images } : {}),
           });
           runId = run.id;

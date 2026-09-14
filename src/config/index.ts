@@ -155,6 +155,7 @@ export const runtimeConfigSchema = z.object({
       runTimeoutMs: z.number().int().positive().max(3_600_000).default(960_000),
       providerTimeoutMs: z.number().int().positive().max(600_000).default(180_000),
       toolTimeoutMs: z.number().int().positive().max(120_000).default(30_000),
+      approvalTtlMs: z.number().int().min(1_000).max(3_600_000).default(900_000),
       maxContextTokens: z.number().int().positive().max(1_000_000).default(131_072),
       contextResponseReserveTokens: z.number().int().nonnegative().max(262_144).default(8_192),
       maxContextSummaryTokens: z.number().int().positive().max(65_536).default(4_096),

@@ -11,10 +11,13 @@ All notable NUAAI changes are recorded here.
 - First-class durable run artifacts with stable run/thread ownership, supported file/diff/test-report/screenshot/citation/deployment-receipt contracts, bounded redacted provenance, immutable private storage, and verified SHA-256 checksums.
 - Runtime capture for explicit structured tool artifacts, successful `workspace.write` output, and web citations, with independent `artifact.created` / `artifact.failed` events so optional capture cannot turn a successful tool into a failure.
 - Authenticated artifact list, detail, and byte-range download routes with cross-run 404 isolation, safe attachment headers, mount-relative PWA links, assistant-run artifact cards, distinct citations, and concise TUI visibility.
+- Payload-bound per-action approvals now pause profile-governed tools before side effects, persist a durable one-time SQLite state machine, revalidate current permission and tool authority, and resume the same run only for the exact SHA-256-bound payload.
+- Authenticated approval list/detail/approve/deny APIs, approval lifecycle events, a functional PWA approval inbox, and TUI pending-action visibility.
 
 ### Security
 
 - Artifact capture rejects traversal, absolute paths, symlinks, hard links, protected runtime/credential paths, unsupported kind/MIME pairs, oversized content/metadata, and non-HTTPS or credential-bearing URLs. Text checksums cover stored sanitized bytes and are labeled accordingly.
+- Approval records and client events expose only the payload hash plus bounded redacted target/result previews; raw canonical arguments are never stored in the approval table. Decisions must include the hash shown to the operator, and stale hashes, replay, expiry, denial, and concurrent decisions fail closed.
 
 ## [1.0.1] - 2026-09-14
 

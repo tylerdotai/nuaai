@@ -152,6 +152,20 @@ export interface TuiRetryState {
   maxAttempts: number;
 }
 
+export interface TuiApproval {
+  id: string;
+  runId: string;
+  threadId: string;
+  toolName: string;
+  status: string;
+  payloadHash: string;
+  target: string;
+  risk: string;
+  providerOwned: boolean;
+  createdAt: number;
+  expiresAt: number;
+}
+
 export interface TuiState {
   connection: TuiConnection;
   error: string | null;
@@ -173,6 +187,7 @@ export interface TuiState {
   tools: TuiToolActivity[];
   lastRunStatus: 'completed' | 'failed' | 'cancelled' | null;
   retry: TuiRetryState | null;
+  approvals: TuiApproval[];
 }
 
 export type TuiEvent =
@@ -187,6 +202,7 @@ export type TuiEvent =
       plugins: TuiPlugin[];
       providers: TuiProviderHealth[];
       secretNames: string[];
+      approvals?: TuiApproval[];
     }
   | { type: 'view.changed'; view: TuiView }
   | { type: 'session.selected'; sessionId: string }
@@ -235,6 +251,7 @@ export const initialTuiState: TuiState = {
   tools: [],
   lastRunStatus: null,
   retry: null,
+  approvals: [],
 };
 
 export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
@@ -266,6 +283,7 @@ export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
         plugins: event.plugins,
         providers: event.providers,
         secretNames: event.secretNames,
+        approvals: event.approvals ?? state.approvals,
       };
     case 'view.changed':
       return { ...state, view: event.view };

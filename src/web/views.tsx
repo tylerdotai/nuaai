@@ -2,6 +2,7 @@ import type { RefObject } from 'react';
 
 import type {
   ActiveProvider,
+  ApprovalRequest,
   CommandId,
   ConnectionState,
   MemoryRecord,
@@ -60,6 +61,79 @@ export function NavigationTabs({
         </button>
       ))}
     </nav>
+  );
+}
+
+export function ApprovalInbox({
+  approvals,
+  decidingIds = new Set<string>(),
+  onApprove,
+  onDeny,
+}: {
+  approvals: ApprovalRequest[];
+  decidingIds?: ReadonlySet<string>;
+  onApprove(id: string, payloadHash: string): void;
+  onDeny(id: string, payloadHash: string): void;
+}): React.JSX.Element | null {
+  if (!approvals.length) return null;
+  return (
+    <section className="approval-inbox" aria-label="Action approvals">
+      <div className="approval-inbox-heading">
+        <div>
+          <span className="section-label">Approval required</span>
+          <h2>Review action</h2>
+        </div>
+        <span className="count-chip">{approvals.length} pending</span>
+      </div>
+      {approvals.map((approval) => (
+        <article className="approval-card" key={approval.id} data-status={approval.status}>
+          <dl>
+            <div>
+              <dt>Tool</dt>
+              <dd>{approval.toolName}</dd>
+            </div>
+            <div>
+              <dt>Target</dt>
+              <dd>{approval.target}</dd>
+            </div>
+            <div>
+              <dt>Risk</dt>
+              <dd>{approval.risk}</dd>
+            </div>
+            <div>
+              <dt>Payload hash</dt>
+              <dd className="approval-hash">{approval.payloadHash}</dd>
+            </div>
+            <div>
+              <dt>Expires</dt>
+              <dd>
+                <time dateTime={new Date(approval.expiresAt).toISOString()}>
+                  {new Date(approval.expiresAt).toISOString()}
+                </time>
+              </dd>
+            </div>
+          </dl>
+          <div className="card-actions">
+            <button
+              type="button"
+              className="primary-button"
+              disabled={decidingIds.has(approval.id)}
+              onClick={() => onApprove(approval.id, approval.payloadHash)}
+            >
+              {decidingIds.has(approval.id) ? 'Applying…' : 'Approve once'}
+            </button>
+            <button
+              type="button"
+              className="danger-text"
+              disabled={decidingIds.has(approval.id)}
+              onClick={() => onDeny(approval.id, approval.payloadHash)}
+            >
+              Deny
+            </button>
+          </div>
+        </article>
+      ))}
+    </section>
   );
 }
 

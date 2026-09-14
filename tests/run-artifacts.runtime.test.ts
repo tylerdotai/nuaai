@@ -52,6 +52,19 @@ function providerRegistry(adapter: ProviderAdapter) {
   } as never;
 }
 
+async function approvePending(runtime: AgentRuntime, runId: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const approval = runtime.listApprovals('pending').find((entry) => entry.runId === runId);
+    if (approval) {
+      runtime.approveApproval(approval.id, approval.payloadHash);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for approval for run ${runId}`);
+}
+
 async function runtimeFixture(
   adapter: ProviderAdapter,
   configureTools?: (tools: ToolRegistry) => void,
@@ -182,6 +195,7 @@ describe('runtime artifact capture', () => {
       permissions: operator,
     });
 
+    await approvePending(runtime, run.id);
     await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({ status: 'completed' });
     const artifacts = store.listRunArtifacts(run.id);
     expect(artifacts).toEqual([
@@ -258,6 +272,7 @@ describe('runtime artifact capture', () => {
       permissions: operator,
     });
 
+    await approvePending(runtime, run.id);
     const completed = await runtime.waitForRun(run.id);
     expect(completed.status).toBe('completed');
     expect(completed.output).toBe('Artifact work completed.');

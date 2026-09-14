@@ -81,6 +81,28 @@ export type ArtifactView =
       label: string;
     };
 
+export interface ApprovalRequest {
+  id: string;
+  runId: string;
+  threadId: string;
+  toolName: string;
+  status: 'pending' | 'approved' | 'denied' | 'expired' | 'executed' | 'failed';
+  payloadHash: string;
+  target: string;
+  risk: string;
+  providerOwned: boolean;
+  createdAt: number;
+  expiresAt: number;
+  decidedAt?: number;
+  execution?: {
+    startedAt?: number;
+    completedAt?: number;
+    resultHash?: string;
+    resultPreview?: string;
+    error?: string;
+  };
+}
+
 export interface MessageView {
   id: string;
   runId?: string;
