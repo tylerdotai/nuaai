@@ -2,7 +2,7 @@
 
 All notable NUAAI changes are recorded here.
 
-## [1.0.0] - 2026-09-13
+## [1.0.0] - 2026-09-14
 
 ### Added
 
@@ -61,10 +61,10 @@ All notable NUAAI changes are recorded here.
 
 ### Verification
 
-- Vitest: 239 tests passed in the canonical Node 22 release gate.
-- Scoped per-file V8 coverage aggregate results: statements 94.23%, branches 85.92%, functions 95.54%, lines 96.95%.
+- Vitest: 302 tests across 34 files passed in the canonical Node 22 release gate.
+- Scoped per-file V8 coverage aggregate results: statements 94.50%, branches 86.04%, functions 96.01%, lines 97.15%.
 - Node and web production builds: passed.
-- Playwright built-web E2E: 3 flows passed: the full desktop/mobile workflow, inactive-provider failure scoping, and mobile safe-area geometry.
+- Playwright built-web E2E: 7 flows passed, covering the full desktop/mobile workflow, inactive-provider failure scoping, mobile safe-area geometry, stale terminal-poll ownership, accepted-run refresh failure, and invalid/transient pairing cleanup.
 - Clean tarball install, installed CLI initialization, daemon health, graceful shutdown, port cleanup, and lock cleanup: passed.
 - Package graph: valid.
 - Dependency audit: 0 moderate, high, or critical advisories; one accepted dev-only low advisory in tsup's Windows development-server dependency.
