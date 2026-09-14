@@ -59,6 +59,7 @@ export interface GatewayServices {
   host: string;
   authSecret: string;
   browserCookiePath?: string;
+  webRoot?: string;
   now?: () => number;
   runPermissionProfile?: PermissionProfile;
   runPermissions?: PermissionContext;
@@ -120,6 +121,7 @@ function contentType(path: string): string {
 export function createApp(services: GatewayServices): Hono {
   const app = new Hono();
   const configuredCookiePath = normalizeCookiePath(services.browserCookiePath);
+  const webRoot = services.webRoot ?? fileURLToPath(new URL('../dist/web', import.meta.url));
   const now = services.now ?? Date.now;
   const runPermissionProfile = services.runPermissionProfile ?? 'read-only';
   const runPermissions =
@@ -484,7 +486,6 @@ export function createApp(services: GatewayServices): Hono {
   });
 
   app.get('/*', async (context) => {
-    const webRoot = fileURLToPath(new URL('../dist/web', import.meta.url));
     const requested = context.req.path === '/' ? 'index.html' : context.req.path.replace(/^\//, '');
     const path = resolve(webRoot, requested);
     const safe = path === webRoot || path.startsWith(`${webRoot}/`);

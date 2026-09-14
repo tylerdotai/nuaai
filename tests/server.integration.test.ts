@@ -50,6 +50,7 @@ function services(events: Array<Record<string, unknown>> = []): GatewayServices 
     host: '127.0.0.1',
     authSecret: secret,
     browserCookiePath: '/nuaai',
+    webRoot: process.cwd(),
     runtime: runtime as never,
     store: {
       listEvents: () => events,
