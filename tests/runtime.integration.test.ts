@@ -296,6 +296,10 @@ describe('runtime configuration and security primitives', () => {
       nested: { api_key: '[REDACTED]' },
       safe: 'kept',
     });
+    const deeplyNestedJson = `${'['.repeat(5_000)}{"api_key":"deep-secret"}${']'.repeat(5_000)}`;
+    const deeplyRedacted = redactText(deeplyNestedJson);
+    expect(JSON.parse(deeplyRedacted)).toBe('[REDACTED]');
+    expect(deeplyRedacted).not.toContain('deep-secret');
     const environmentText = redactText('OPENAI_API_KEY=prefix/SECRET+suffix== SAFE=value');
     expect(environmentText).toBe('OPENAI_API_KEY=[REDACTED] SAFE=value');
     expect(

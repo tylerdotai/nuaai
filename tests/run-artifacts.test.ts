@@ -200,6 +200,24 @@ describe('durable run artifact persistence', () => {
     expect(stored.toString('utf8')).not.toContain('nested-secret');
   });
 
+  it('fails closed on deeply nested structured artifact content', async () => {
+    const { run, thread, registry } = await fixture();
+    const deeplyNestedJson = `${'['.repeat(5_000)}{"api_key":"deep-secret"}${']'.repeat(5_000)}`;
+    const artifact = await registry.capture({
+      runId: run.id,
+      threadId: thread.id,
+      kind: 'file',
+      title: 'deep.json',
+      mimeType: 'application/json',
+      sourceTool: 'workspace.write',
+      content: deeplyNestedJson,
+    });
+
+    const stored = await registry.readStored(artifact);
+    expect(JSON.parse(stored.toString('utf8'))).toBe('[REDACTED]');
+    expect(stored.toString('utf8')).not.toContain('deep-secret');
+  });
+
   it('rejects traversal, absolute, symlink, hard-link, and protected runtime sources', async () => {
     const { root, run, thread, registry } = await fixture();
     const outside = await mkdtemp(join(tmpdir(), 'nuaai-artifact-outside-'));
