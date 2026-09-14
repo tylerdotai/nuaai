@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+import type { RunArtifactCandidate, RunArtifactRegistry } from '../artifacts/registry.js';
 import type { RuntimeConfig } from '../config/index.js';
 import type { McpManager } from '../integrations/mcp.js';
 import type { DatabaseStore, MessageRow, RunRow, SessionRow, ThreadRow } from '../memory/db.js';
@@ -43,6 +44,7 @@ export interface RuntimeOptions {
   mcp?: McpManager;
   skills?: SkillRegistry;
   skillLearner?: SkillLearner;
+  artifacts?: RunArtifactRegistry;
 }
 export interface RunRequest {
   threadId: string;
@@ -316,6 +318,78 @@ export class AgentRuntime {
   ): void {
     const event = this.options.store.appendEvent(createEvent(type, payload, context));
     for (const listener of this.listeners) listener(event);
+  }
+
+  private async captureToolArtifacts(
+    run: RunRow,
+    thread: ThreadRow,
+    sourceTool: string,
+    input: unknown,
+    result: unknown,
+    callId: string,
+  ): Promise<void> {
+    if (!this.options.artifacts) return;
+    const eventContext = {
+      sessionId: thread.sessionId,
+      threadId: thread.id,
+      runId: run.id,
+      correlationId: run.correlationId,
+    };
+    let candidates: RunArtifactCandidate[];
+    try {
+      candidates = this.options.tools.artifactCandidates(sourceTool, input, result);
+    } catch (error) {
+      this.emit(
+        'artifact.failed',
+        {
+          sourceTool,
+          callId,
+          error: error instanceof Error ? error.message : String(error),
+          reason: 'candidate_extraction',
+        },
+        eventContext,
+      );
+      return;
+    }
+    for (const candidate of candidates) {
+      try {
+        const artifact = await this.options.artifacts.capture({
+          ...candidate,
+          runId: run.id,
+          threadId: thread.id,
+          sourceTool,
+          metadata: { ...(candidate.metadata ?? {}), callId },
+        });
+        this.emit(
+          'artifact.created',
+          {
+            artifactId: artifact.id,
+            sourceTool,
+            callId,
+            kind: artifact.kind,
+            title: artifact.title,
+            mimeType: artifact.mimeType,
+            byteSize: artifact.byteSize,
+            sha256: artifact.sha256,
+            ...(artifact.externalUrl ? { externalUrl: artifact.externalUrl } : {}),
+          },
+          eventContext,
+        );
+      } catch (error) {
+        this.emit(
+          'artifact.failed',
+          {
+            sourceTool,
+            callId,
+            kind: candidate.kind,
+            title: candidate.title,
+            error: error instanceof Error ? error.message : String(error),
+            reason: 'capture',
+          },
+          eventContext,
+        );
+      }
+    }
   }
 
   createSession(
@@ -1129,6 +1203,15 @@ export class AgentRuntime {
                 );
               } else if (event.type === 'tool_completed') {
                 toolActivity = true;
+                if (!event.isError)
+                  await this.captureToolArtifacts(
+                    run,
+                    thread,
+                    event.name,
+                    event.arguments,
+                    event.result,
+                    event.id,
+                  );
                 const boundedResult = serializeBoundedToolResult(
                   event.result,
                   this.options.config.limits.maxToolResultBytes,
@@ -1435,6 +1518,14 @@ export class AgentRuntime {
               typeof result.count === 'number'
             )
               verifiedRepositoryCount = result.count;
+            await this.captureToolArtifacts(
+              run,
+              thread,
+              normalizedCall.name,
+              normalizedCall.arguments,
+              result,
+              call.id,
+            );
             const boundedResult = serializeBoundedToolResult(
               result,
               this.options.config.limits.maxToolResultBytes,

@@ -5,6 +5,7 @@ import {
   initialTuiState,
   nextSelection,
   reduceTuiEvent,
+  tuiArtifactLines,
   tuiMessagesFromPresentation,
 } from '../src/ui/tui-state.js';
 
@@ -20,6 +21,90 @@ describe('TUI event state', () => {
     ).toEqual([
       { role: 'user', content: 'Prompt' },
       { role: 'assistant', content: 'Final answer' },
+    ]);
+  });
+
+  it('hydrates durable artifact and citation visibility without exposing unsupported kinds', () => {
+    expect(
+      tuiMessagesFromPresentation([
+        {
+          role: 'assistant',
+          markdown: 'Done',
+          artifacts: [
+            {
+              type: 'artifact',
+              kind: 'file',
+              title: 'report.txt',
+              downloadUrl: 'api/runs/run-1/artifacts/artifact-1/download',
+            },
+            {
+              type: 'unsupported',
+              sourceKind: 'future-kind',
+              label: 'This run artifact is not supported in this NUAAI version.',
+            },
+          ],
+          citations: [{ id: 'cite-1', title: 'Source', url: 'https://example.com/source' }],
+        },
+      ]),
+    ).toEqual([
+      {
+        role: 'assistant',
+        content: 'Done',
+        artifacts: [
+          {
+            type: 'artifact',
+            kind: 'file',
+            title: 'report.txt',
+            downloadUrl: 'api/runs/run-1/artifacts/artifact-1/download',
+          },
+          {
+            type: 'unsupported',
+            title: 'This run artifact is not supported in this NUAAI version.',
+          },
+        ],
+        citations: [{ title: 'Source', url: 'https://example.com/source' }],
+      },
+    ]);
+    expect(
+      JSON.stringify(
+        tuiMessagesFromPresentation([
+          {
+            role: 'assistant',
+            markdown: 'Done',
+            artifacts: [
+              {
+                type: 'unsupported',
+                sourceKind: 'future-kind',
+                label: 'This run artifact is not supported in this NUAAI version.',
+              },
+            ],
+            citations: [],
+          },
+        ]),
+      ),
+    ).not.toContain('future-kind');
+  });
+
+  it('formats artifact and citation lines for the visible conversation panel', () => {
+    expect(
+      tuiArtifactLines({
+        role: 'assistant',
+        content: 'Done',
+        artifacts: [
+          {
+            type: 'artifact',
+            kind: 'file',
+            title: 'report.txt',
+            downloadUrl: 'api/runs/run-1/artifacts/artifact-1/download',
+          },
+          { type: 'unsupported', title: 'This run artifact is not supported.' },
+        ],
+        citations: [{ title: 'Source', url: 'https://example.com/source' }],
+      }),
+    ).toEqual([
+      'Artifact: report.txt [file] · api/runs/run-1/artifacts/artifact-1/download',
+      'Artifact: This run artifact is not supported.',
+      'Citation: Source · https://example.com/source',
     ]);
   });
 

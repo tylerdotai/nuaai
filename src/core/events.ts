@@ -27,6 +27,8 @@ export const eventTypes = [
   'tool.started',
   'tool.completed',
   'tool.failed',
+  'artifact.created',
+  'artifact.failed',
   'memory.stored',
   'memory.retrieved',
   'task.queued',

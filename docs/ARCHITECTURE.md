@@ -30,7 +30,7 @@ Ink TUI / React web client
 1. **Perception:** an authenticated Web, Matrix, CLI, TUI, or scheduler request enters a durable thread and captures current context.
 2. **Decision:** the selected provider receives the layered system prompt plus one stable tool catalog filtered by the client permission profile.
 3. **Action:** a structured provider tool call is validated against the advertised catalog and executed once through the daemon-owned registry.
-4. **Observation:** the bounded tool result is persisted as a typed artifact and returned to the provider with the assistant tool-call message.
+4. **Observation:** the bounded tool result is persisted as internal execution metadata and returned to the provider with the assistant tool-call message. Separately, explicit structured artifact candidates, successful workspace writes, and web sources are validated and captured as first-class run artifacts.
 5. **Continuation:** the loop repeats until a verified final response, explicit failure, cancellation, timeout, or configured turn limit. Exhausting the tool budget disables further tools and requests a final answer from gathered evidence.
 6. **Commit:** authoritative output and lifecycle evidence are written by the active thread writer and projected to connected clients.
 
@@ -38,7 +38,9 @@ Before each provider turn, the runtime applies a provider-neutral token budget u
 
 ## Persistence
 
-SQLite stores sessions, threads, messages, runs, events, memories, tasks, schedules, secrets, skills, and plugins. Runtime initialization uses idempotent schema creation. Events are versioned, redacted before persistence, and replayable by cursor through HTTP or WebSocket subscription.
+SQLite stores sessions, threads, messages, runs, run-artifact records, events, memories, tasks, schedules, secrets, skills, and plugins. Runtime initialization uses idempotent schema creation. Events are versioned, redacted before persistence, and replayable by cursor through HTTP or WebSocket subscription.
+
+Run artifacts have stable IDs and remain bound to exactly one run and thread. Stored bytes are copied once into owner-only `.nuaai/artifacts/<run-id>/` paths; SQLite records the stored byte length and SHA-256 checksum. Text-like content is redacted before the immutable copy is written, and artifact provenance records that the checksum covers stored sanitized bytes rather than claiming byte-for-byte identity with the workspace source. Citation-only records instead checksum the canonical HTTPS URL payload. The legacy `message_artifacts` table remains internal transcript/tool-loop metadata and is not used as an artifact store.
 
 Token pressure creates a durable deterministic extractive checkpoint without deleting transcript rows. Each checkpoint records source start/end message IDs, source message count, canonical source SHA-256 and provenance version, estimated original/summary tokens, checkpoint version, and update time. Rolling checkpoints retain previously selected records when possible, never cut a UTF-8 string or source record, and produce identical provider context after restart. `context.compacted` and `context.selected` events expose counts and token estimates only, never message content.
 
@@ -52,4 +54,4 @@ Ollama uses the local HTTP API for streaming chat and embeddings. Codex turns us
 
 ## Client boundary
 
-The TUI and React dashboard never call providers directly. Both use authenticated daemon routes and WebSocket events. The daemon remains the only component allowed to mutate runtime state.
+The TUI and React dashboard never call providers directly. Both use authenticated daemon routes and WebSocket events. The daemon remains the only component allowed to mutate runtime state. Artifact list, detail, and byte-range download routes validate run ownership; web download URLs are mount-relative so a `/nuaai` deployment cannot escape to the origin root. The structured thread presentation attaches artifacts and citations only to their owning assistant run.

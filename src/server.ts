@@ -6,12 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
 import { type WebSocket, WebSocketServer } from 'ws';
 
+import { RunArtifactRegistry } from './artifacts/registry.js';
 import { harnessConfig } from './config/index.js';
 import type { AgentRuntime } from './core/runtime.js';
 import type { Scheduler } from './core/scheduler.js';
 import { createToken, inspectToken, validateToken } from './gateway/token.js';
 import type { McpManager } from './integrations/mcp.js';
-import type { DatabaseStore, EventPage, RunRow } from './memory/db.js';
+import type { DatabaseStore, EventPage, RunArtifactRow, RunRow } from './memory/db.js';
 import type { PluginRegistry } from './plugins/registry.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import {
@@ -53,6 +54,64 @@ function publicRun(run: RunRow): Omit<RunRow, 'input' | 'correlationId'> {
   return safe;
 }
 
+function publicRunArtifact(artifact: RunArtifactRow): Omit<RunArtifactRow, 'storagePath'> & {
+  downloadUrl?: string;
+} {
+  const { storagePath, ...safe } = artifact;
+  return {
+    ...safe,
+    ...(storagePath
+      ? {
+          downloadUrl: `api/runs/${encodeURIComponent(artifact.runId)}/artifacts/${encodeURIComponent(artifact.id)}/download`,
+        }
+      : {}),
+  };
+}
+
+function contentDisposition(title: string): string {
+  const fallback = title.replace(/[^a-z0-9._-]+/gi, '_').slice(0, 180) || 'artifact';
+  const encoded = encodeURIComponent(title).replace(
+    /[!'()*]/g,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
+function requestedByteRange(
+  value: string | undefined,
+  size: number,
+): { start: number; end: number } | null | 'invalid' {
+  if (!value) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(value.trim());
+  if (!match || (!match[1] && !match[2]) || size <= 0) return 'invalid';
+  if (!match[1]) {
+    const suffix = Number(match[2]);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return 'invalid';
+    return { start: Math.max(0, size - suffix), end: size - 1 };
+  }
+  const start = Number(match[1]);
+  const end = match[2] ? Number(match[2]) : size - 1;
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    end < start ||
+    start >= size
+  )
+    return 'invalid';
+  return { start, end: Math.min(end, size - 1) };
+}
+
+function artifactDownloadHeaders(artifact: RunArtifactRow): Record<string, string> {
+  return {
+    'accept-ranges': 'bytes',
+    'cache-control': 'private, no-store',
+    'content-disposition': contentDisposition(artifact.title),
+    'content-type': artifact.mimeType,
+    'x-content-type-options': 'nosniff',
+  };
+}
+
 export interface GatewayServices {
   root: string;
   port: number;
@@ -65,6 +124,7 @@ export interface GatewayServices {
   runPermissions?: PermissionContext;
   runtime: AgentRuntime;
   store: DatabaseStore;
+  artifacts?: RunArtifactRegistry;
   providers: ProviderRegistry;
   scheduler: Scheduler;
   skills: SkillRegistry;
@@ -126,6 +186,7 @@ export function createApp(services: GatewayServices): Hono {
   const runPermissionProfile = services.runPermissionProfile ?? 'read-only';
   const runPermissions =
     services.runPermissions ?? permissionContextForProfile(runPermissionProfile);
+  const artifacts = services.artifacts ?? new RunArtifactRegistry(services.root, services.store);
   const protectedRoute = async (
     context: Parameters<NonNullable<Parameters<Hono['use']>[1]>>[0],
     next: () => Promise<void>,
@@ -306,6 +367,65 @@ export function createApp(services: GatewayServices): Hono {
     } catch (error) {
       return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
     }
+  });
+  app.get('/api/runs/:runId/artifacts', (context) => {
+    const runId = context.req.param('runId');
+    if (!services.store.getRun(runId)) return context.json({ error: 'Run not found' }, 404);
+    context.header('cache-control', 'private, no-store');
+    return context.json({
+      artifacts: services.store.listRunArtifacts(runId).map(publicRunArtifact),
+    });
+  });
+  app.get('/api/runs/:runId/artifacts/:artifactId', (context) => {
+    const runId = context.req.param('runId');
+    const artifact = services.store.getRunArtifact(context.req.param('artifactId'));
+    if (!services.store.getRun(runId) || !artifact || artifact.runId !== runId)
+      return context.json({ error: 'Artifact not found' }, 404);
+    context.header('cache-control', 'private, no-store');
+    return context.json(publicRunArtifact(artifact));
+  });
+  app.get('/api/runs/:runId/artifacts/:artifactId/download', async (context) => {
+    const runId = context.req.param('runId');
+    const artifact = services.store.getRunArtifact(context.req.param('artifactId'));
+    if (
+      !services.store.getRun(runId) ||
+      !artifact ||
+      artifact.runId !== runId ||
+      !artifact.storagePath
+    )
+      return context.json({ error: 'Artifact not found' }, 404);
+    let bytes: Buffer;
+    try {
+      bytes = await artifacts.readStored(artifact);
+    } catch {
+      return context.json({ error: 'Artifact not found' }, 404);
+    }
+    const headers = artifactDownloadHeaders(artifact);
+    const range = requestedByteRange(context.req.header('range'), bytes.byteLength);
+    if (range === 'invalid')
+      return new Response(JSON.stringify({ error: 'Requested range is not satisfiable' }), {
+        status: 416,
+        headers: {
+          ...headers,
+          'content-range': `bytes */${bytes.byteLength}`,
+          'content-type': 'application/json; charset=utf-8',
+        },
+      });
+    if (range) {
+      const partial = bytes.subarray(range.start, range.end + 1);
+      return new Response(partial, {
+        status: 206,
+        headers: {
+          ...headers,
+          'content-length': String(partial.byteLength),
+          'content-range': `bytes ${range.start}-${range.end}/${bytes.byteLength}`,
+        },
+      });
+    }
+    return new Response(bytes, {
+      status: 200,
+      headers: { ...headers, 'content-length': String(bytes.byteLength) },
+    });
   });
   app.get('/api/runs/:id', (context) => {
     const run = services.store.getRun(context.req.param('id'));

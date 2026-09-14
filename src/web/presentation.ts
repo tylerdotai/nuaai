@@ -1,16 +1,26 @@
 import type { EventRecord } from '../core/events.js';
-import type { DatabaseStore, MessageArtifactRow, RunRow } from '../memory/db.js';
+import type { DatabaseStore, MessageArtifactRow, RunArtifactRow, RunRow } from '../memory/db.js';
 import type {
   ActivityGroup,
   ActivityItem,
   ArtifactView,
+  CitationView,
   MessageView,
   MessageViewStatus,
+  RunArtifactKind,
   ThreadPresentation,
 } from './contracts.js';
 
 const terminalRunEvents = new Set(['run.completed', 'run.failed', 'run.cancelled']);
 const internalArtifactKinds = new Set(['run_link', 'tool_calls', 'tool_result']);
+const supportedRunArtifactKinds = new Set<RunArtifactKind>([
+  'file',
+  'diff',
+  'test-report',
+  'screenshot',
+  'citation',
+  'deployment-receipt',
+]);
 
 function boundedText(value: unknown, maximum = 500): string {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
@@ -134,6 +144,65 @@ function unsupportedArtifacts(artifacts: MessageArtifactRow[]): ArtifactView[] {
     }));
 }
 
+function safeHttpsUrl(value: string | null): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function presentRunArtifacts(rows: RunArtifactRow[]): {
+  artifacts: ArtifactView[];
+  citations: CitationView[];
+} {
+  const artifacts: ArtifactView[] = [];
+  const citations: CitationView[] = [];
+  for (const row of rows) {
+    if (!supportedRunArtifactKinds.has(row.kind as RunArtifactKind)) {
+      artifacts.push({
+        type: 'unsupported',
+        sourceKind: boundedText(row.kind, 80),
+        label: 'This run artifact is not supported in this NUAAI version.',
+      });
+      continue;
+    }
+    const externalUrl = safeHttpsUrl(row.externalUrl);
+    if (row.kind === 'citation') {
+      if (externalUrl)
+        citations.push({ id: row.id, title: boundedText(row.title, 240), url: externalUrl });
+      else
+        artifacts.push({
+          type: 'unsupported',
+          sourceKind: 'citation',
+          label: 'This run artifact is not supported in this NUAAI version.',
+        });
+      continue;
+    }
+    artifacts.push({
+      type: 'artifact',
+      id: row.id,
+      runId: row.runId,
+      kind: row.kind as Exclude<RunArtifactKind, 'citation'>,
+      title: boundedText(row.title, 240),
+      mimeType: boundedText(row.mimeType, 160),
+      byteSize: row.byteSize,
+      sha256: row.sha256,
+      sourceTool: boundedText(row.sourceTool, 160),
+      createdAt: row.createdAt,
+      ...(row.storagePath
+        ? {
+            downloadUrl: `api/runs/${encodeURIComponent(row.runId)}/artifacts/${encodeURIComponent(row.id)}/download`,
+          }
+        : {}),
+      ...(externalUrl ? { externalUrl } : {}),
+    });
+  }
+  return { artifacts, citations };
+}
+
 function failureForRun(
   run: RunRow,
   events: Array<EventRecord & { id: number }>,
@@ -203,6 +272,10 @@ export function buildThreadPresentation(
     const run = linkedRunId ? getRun(linkedRunId) : undefined;
     if (message.role === 'assistant' && run) representedAssistantRuns.add(run.id);
     const events = run ? getEvents(run.id) : [];
+    const runArtifacts =
+      message.role === 'assistant' && run
+        ? presentRunArtifacts(store.listRunArtifacts(run.id))
+        : { artifacts: [], citations: [] };
     const status = message.role === 'assistant' && run ? messageStatus(run.status) : 'completed';
     views.push({
       id: message.role === 'assistant' && run ? `run:${run.id}:assistant` : message.id,
@@ -216,9 +289,9 @@ export function buildThreadPresentation(
       status,
       activities: message.role === 'assistant' && run ? activityForRun(run, events) : [],
       ...(run ? { error: failureForRun(run, events) } : {}),
-      citations: [],
+      citations: runArtifacts.citations,
       attachments: [],
-      artifacts: unsupportedArtifacts(artifacts),
+      artifacts: [...runArtifacts.artifacts, ...unsupportedArtifacts(artifacts)],
     });
   }
 
@@ -230,6 +303,7 @@ export function buildThreadPresentation(
     !representedAssistantRuns.has(latestRun.id)
   ) {
     const events = getEvents(latestRun.id);
+    const runArtifacts = presentRunArtifacts(store.listRunArtifacts(latestRun.id));
     const markdown =
       latestRun.status === 'queued' || latestRun.status === 'running'
         ? activeRunOutput(latestRun, events)
@@ -244,9 +318,9 @@ export function buildThreadPresentation(
       status: messageStatus(latestRun.status),
       activities: activityForRun(latestRun, events),
       ...(failureForRun(latestRun, events) ? { error: failureForRun(latestRun, events) } : {}),
-      citations: [],
+      citations: runArtifacts.citations,
       attachments: [],
-      artifacts: [],
+      artifacts: runArtifacts.artifacts,
     });
   }
 

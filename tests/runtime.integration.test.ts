@@ -436,7 +436,7 @@ describe('SQLite persistence and vector memory', () => {
           value: string;
         }
       ).value,
-    ).toBe('4');
+    ).toBe('5');
     const legacyRoot = await makeRoot();
     await mkdir(workspaceDirectory(legacyRoot), { recursive: true });
     const legacyDb = new Database(join(workspaceDirectory(legacyRoot), 'memory.db'));
@@ -460,7 +460,7 @@ describe('SQLite persistence and vector memory', () => {
           .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
           .get() as { value: string }
       ).value,
-    ).toBe('4');
+    ).toBe('5');
     expect(
       (upgraded.raw.prepare('PRAGMA table_info(plugins)').all() as Array<{ name: string }>).map(
         (column) => column.name,
