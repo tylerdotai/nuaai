@@ -46,7 +46,7 @@ The default path is a local model endpoint: native Ollama or an OpenAI-compatibl
 ## What ships
 
 - Durable SQLite runtime with sessions, threads, messages, runs, events, memories, tasks, schedules, skills, plugins, and vector rows.
-- Observe → plan → act runtime loop with streaming, cancellation, timeouts, bounded output, and explicit manual resume after an interrupted daemon run.
+- Observe → plan → act runtime loop with streaming, cancellation, timeouts, bounded output, explicit manual resume after an interrupted model run, and durable per-action approvals for profile-governed tools.
 - Dual local-provider adapter: native Ollama chat/embedding APIs or OpenAI-compatible `/v1` chat, tools, embeddings, and model discovery.
 - Optional Codex Responses provider using the installed Codex CLI's ChatGPT OAuth state. Turns stream from the fixed Codex backend; tool calls execute through NUAAI's permission-filtered runtime and return as verified observations.
 - Matrix bridge with invite auto-join, outbound replies, and a required static user or room allowlist.
@@ -55,7 +55,7 @@ The default path is a local model endpoint: native Ollama or an OpenAI-compatibl
 - Optional local voice input/output: Matrix audio and video attachments can use Faster-Whisper transcription, and completed responses can return Kokoro WAV audio. Text remains primary; voice input and TTS are independently disabled by default and require explicit runtime commands.
 - Local web search through SearXNG with DuckDuckGo fallback.
 - Model-facing page extraction through headless Playwright with public-address resolution, safe-port enforcement, credential rejection, service workers and WebSockets disabled, redirects blocked, and validation before every direct HTTP request.
-- AES-256-GCM encrypted secret-manager values and redacted event/tool artifacts. Conversation, run, and memory content remains durable operator data and is stored verbatim.
+- AES-256-GCM encrypted secret-manager values and redacted event/tool artifacts. Approval rows store payload hashes and bounded redacted previews rather than raw action arguments. Conversation, run, and memory content remains durable operator data and is stored verbatim.
 - Automatic recall uses semantic retrieval when embeddings are available and bounded lexical retrieval otherwise; exceptional run failures are persisted into thread context for truthful follow-up diagnosis.
 - Workspace traversal, symlink, and hard-link protection; command allowlists; subprocess timeouts; and daemon authentication.
 - Bounded workspace file inspection for metadata and text previews; configured MCP servers are namespaced and permission-filtered.
@@ -224,6 +224,7 @@ Matrix admission and delivery policy is daemon-owned, before model execution:
 - Runs allow 48 tool calls by default. Reaching the budget stops further actions and forces a no-tools finalization turn from evidence already gathered instead of discarding the work as a hard failure.
 - Runs allow 48 ordinary model turns plus one no-tools finalization grace turn. Streamed output is batched, reset at each provider-attempt boundary, and snapshotted durably so reconnects preserve the complete current response without combining discarded drafts.
 - The central tool registry declares owner, cost class, auth mode, side effects, approval policy, and a per-run ceiling for every tool. Registry admission validates permission, input, weighted run cost, and per-tool usage before emitting `tool.started`; `computer.use`, generic MCP execution, and external-agent dispatch are execute-gated high-cost boundaries.
+- Every tool marked with profile approval pauses before its side effect. The PWA exposes a pending-action inbox with the exact tool, redacted target, risk, payload hash, expiry, and payload-bound **Approve once** / **Deny** controls; the TUI shows the same pending facts. Approval revalidates current permissions and tool authority and is consumed once at execution.
 - When MCP is configured through the registry, models receive stable generic `mcp.discover` and `mcp.execute` tools rather than every discovered remote schema. Discovery stays available without duplicating the executable authority or inflating each provider prompt.
 
 The current bridge does not decrypt encrypted-room events. Use an unencrypted bot room until a real Matrix crypto client is implemented; the bridge does not claim E2EE support.
@@ -322,6 +323,7 @@ The daemon is the source of truth. Clients do not call providers directly or mai
   },
   "limits": {
     "runTimeoutMs": 960000,
+    "approvalTtlMs": 900000,
     "maxContextBytes": 32000,
     "maxMemoryContextBytes": 8000
   },

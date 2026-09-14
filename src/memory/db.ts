@@ -7,6 +7,15 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { load as loadSqliteVec } from 'sqlite-vec';
 
 import { workspaceDirectory } from '../config/index.js';
+import {
+  type ApprovalDecision,
+  type ApprovalRequestInput,
+  type ApprovalRequestRow,
+  ApprovalStateError,
+  approvalPayloadHash,
+  boundedApprovalPreview,
+  resultHash,
+} from '../core/approvals.js';
 import type { EventRecord } from '../core/events.js';
 import { redactValue } from '../security/redaction.js';
 
@@ -190,6 +199,31 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       claimed_at INTEGER NOT NULL,
       lease_until INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS approval_requests (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      session_id TEXT,
+      tool_call_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      arguments_preview TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      required_permission TEXT NOT NULL,
+      permission_source TEXT NOT NULL,
+      risk TEXT NOT NULL,
+      target TEXT NOT NULL,
+      provider_owned INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      decided_at INTEGER,
+      execution_started_at INTEGER,
+      execution_completed_at INTEGER,
+      result_hash TEXT,
+      result_preview TEXT,
+      execution_error TEXT,
+      UNIQUE(run_id, tool_call_id, payload_hash)
+    );
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       event_id TEXT NOT NULL UNIQUE,
@@ -268,6 +302,8 @@ function createSchema(db: MemoryDatabase, vector = false): void {
     CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages(thread_id, created_at);
     CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs(thread_id, created_at);
     CREATE UNIQUE INDEX IF NOT EXISTS runs_correlation_id_idx ON runs(correlation_id);
+    CREATE INDEX IF NOT EXISTS approval_requests_status_idx ON approval_requests(status, expires_at);
+    CREATE INDEX IF NOT EXISTS approval_requests_run_idx ON approval_requests(run_id, created_at);
     CREATE TABLE IF NOT EXISTS memory_vector_refs (
       memory_id TEXT PRIMARY KEY,
       vector_rowid INTEGER NOT NULL
@@ -293,7 +329,7 @@ function createSchema(db: MemoryDatabase, vector = false): void {
   ];
   for (const [name, migration] of pluginMigrations)
     if (!pluginColumns.some((column) => column.name === name)) db.exec(migration);
-  db.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
+  db.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
   if (vector) {
     db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(embedding float[768]);');
   }
@@ -905,7 +941,7 @@ export class DatabaseStore {
   listActiveRunsForThread(threadId: string): RunRow[] {
     const rows = this.database.raw
       .prepare(
-        "SELECT id FROM runs WHERE thread_id = ? AND status IN ('queued', 'running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at ASC, rowid ASC",
+        "SELECT id FROM runs WHERE thread_id = ? AND status IN ('queued', 'running', 'paused') ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END, created_at ASC, rowid ASC",
       )
       .all(threadId) as Array<{ id: string }>;
     return rows.map(({ id }) => this.getRun(id)).filter((run): run is RunRow => Boolean(run));
@@ -970,6 +1006,235 @@ export class DatabaseStore {
     this.database.raw
       .prepare('UPDATE runs SET cancel_requested = 1, updated_at = ? WHERE id = ?')
       .run(Date.now(), id);
+  }
+
+  createApprovalRequest(input: ApprovalRequestInput, now = Date.now()): ApprovalRequestRow {
+    const id = input.id ?? randomUUID();
+    if (!input.runId || !input.threadId || !input.toolCallId || !input.toolName)
+      throw new Error('Approval request binding is incomplete');
+    if (input.expiresAt <= now || input.expiresAt > now + 86_400_000)
+      throw new Error('Approval expiry is outside the allowed range');
+    const expectedHash = approvalPayloadHash(input.runId, input.toolName, input.canonicalArguments);
+    if (input.payloadHash !== expectedHash)
+      throw new ApprovalStateError(
+        'Approval payload hash does not match its binding',
+        'approval_payload_mismatch',
+      );
+    this.database.raw
+      .prepare(
+        `INSERT INTO approval_requests
+          (id, run_id, thread_id, session_id, tool_call_id, tool_name, arguments_preview,
+           payload_hash, required_permission, permission_source, risk, target, provider_owned,
+           status, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      )
+      .run(
+        id,
+        input.runId,
+        input.threadId,
+        input.sessionId ?? null,
+        input.toolCallId,
+        input.toolName,
+        boundedApprovalPreview(JSON.parse(input.canonicalArguments) as unknown, 500),
+        input.payloadHash,
+        input.requiredPermission,
+        input.permissionSource,
+        boundedApprovalPreview(input.risk, 120),
+        boundedApprovalPreview(input.target, 160),
+        input.providerOwned ? 1 : 0,
+        now,
+        input.expiresAt,
+      );
+    return this.getApprovalRequest(id) as ApprovalRequestRow;
+  }
+
+  getApprovalRequest(id: string): ApprovalRequestRow | undefined {
+    const row = this.database.raw.prepare('SELECT * FROM approval_requests WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.approvalFromRow(row) : undefined;
+  }
+
+  listApprovalRequests(status?: ApprovalRequestRow['status']): ApprovalRequestRow[] {
+    const rows = this.database.raw
+      .prepare(
+        status
+          ? 'SELECT * FROM approval_requests WHERE status = ? ORDER BY created_at DESC, rowid DESC'
+          : 'SELECT * FROM approval_requests ORDER BY created_at DESC, rowid DESC',
+      )
+      .all(...(status ? [status] : [])) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.approvalFromRow(row));
+  }
+
+  decideApprovalRequest(
+    id: string,
+    decision: ApprovalDecision,
+    now = Date.now(),
+    expectedPayloadHash?: string,
+  ): ApprovalRequestRow {
+    const outcome = this.transaction((): ApprovalRequestRow | 'expired' => {
+      const current = this.getApprovalRequest(id);
+      if (!current)
+        throw new ApprovalStateError(`Unknown approval request: ${id}`, 'approval_not_found');
+      if (expectedPayloadHash !== undefined && current.payloadHash !== expectedPayloadHash)
+        throw new ApprovalStateError(
+          `Approval request ${id} payload hash does not match the displayed request`,
+          'approval_payload_mismatch',
+        );
+      if (current.status !== 'pending')
+        throw new ApprovalStateError(
+          `Approval request ${id} is not pending (status: ${current.status})`,
+          current.status === 'executed' ? 'approval_consumed' : 'approval_not_pending',
+        );
+      if (current.expiresAt <= now) {
+        this.database.raw
+          .prepare(
+            "UPDATE approval_requests SET status = 'expired', decided_at = ? WHERE id = ? AND status = 'pending'",
+          )
+          .run(now, id);
+        return 'expired';
+      }
+      const result = this.database.raw
+        .prepare(
+          "UPDATE approval_requests SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending' AND expires_at > ?",
+        )
+        .run(decision, now, id, now);
+      if (result.changes !== 1)
+        throw new ApprovalStateError(
+          `Approval request ${id} was already decided`,
+          'approval_not_pending',
+        );
+      return this.getApprovalRequest(id) as ApprovalRequestRow;
+    });
+    if (outcome === 'expired')
+      throw new ApprovalStateError(`Approval request ${id} expired`, 'approval_expired');
+    return outcome;
+  }
+
+  claimApprovalExecution(
+    id: string,
+    expected: { runId: string; toolName: string; canonicalArguments: string },
+    now = Date.now(),
+  ): ApprovalRequestRow {
+    const outcome = this.transaction((): ApprovalRequestRow | 'expired' => {
+      const current = this.getApprovalRequest(id);
+      if (!current)
+        throw new ApprovalStateError(`Unknown approval request: ${id}`, 'approval_not_found');
+      const expectedHash = approvalPayloadHash(
+        expected.runId,
+        expected.toolName,
+        expected.canonicalArguments,
+      );
+      if (
+        current.runId !== expected.runId ||
+        current.toolName !== expected.toolName ||
+        current.payloadHash !== expectedHash
+      )
+        throw new ApprovalStateError(
+          `Approval request ${id} payload binding does not match`,
+          'approval_payload_mismatch',
+        );
+      if (current.expiresAt <= now) {
+        if (current.status === 'pending' || current.status === 'approved')
+          this.database.raw
+            .prepare(
+              "UPDATE approval_requests SET status = 'expired', execution_error = ? WHERE id = ? AND status IN ('pending', 'approved')",
+            )
+            .run('Approval expired before execution', id);
+        return 'expired';
+      }
+      if (current.status !== 'approved')
+        throw new ApprovalStateError(
+          current.status === 'executed'
+            ? `Approval request ${id} was already consumed`
+            : `Approval request ${id} is not approved (status: ${current.status})`,
+          current.status === 'executed' ? 'approval_consumed' : 'approval_not_pending',
+        );
+      const result = this.database.raw
+        .prepare(
+          "UPDATE approval_requests SET status = 'executed', execution_started_at = ? WHERE id = ? AND status = 'approved' AND expires_at > ?",
+        )
+        .run(now, id, now);
+      if (result.changes !== 1)
+        throw new ApprovalStateError(
+          `Approval request ${id} was already consumed`,
+          'approval_consumed',
+        );
+      return this.getApprovalRequest(id) as ApprovalRequestRow;
+    });
+    if (outcome === 'expired')
+      throw new ApprovalStateError(`Approval request ${id} expired`, 'approval_expired');
+    return outcome;
+  }
+
+  completeApprovalExecution(id: string, result: unknown, now = Date.now()): ApprovalRequestRow {
+    const current = this.getApprovalRequest(id);
+    if (!current)
+      throw new ApprovalStateError(`Unknown approval request: ${id}`, 'approval_not_found');
+    if (current.status !== 'executed')
+      throw new ApprovalStateError(
+        `Approval request ${id} was not claimed`,
+        'approval_not_pending',
+      );
+    this.database.raw
+      .prepare(
+        'UPDATE approval_requests SET execution_completed_at = ?, result_hash = ?, result_preview = ?, execution_error = NULL WHERE id = ?',
+      )
+      .run(now, resultHash(result), boundedApprovalPreview(result), id);
+    return this.getApprovalRequest(id) as ApprovalRequestRow;
+  }
+
+  failApprovalExecution(id: string, error: unknown, now = Date.now()): ApprovalRequestRow {
+    const current = this.getApprovalRequest(id);
+    if (!current)
+      throw new ApprovalStateError(`Unknown approval request: ${id}`, 'approval_not_found');
+    if (current.status !== 'approved' && current.status !== 'executed') return current;
+    this.database.raw
+      .prepare(
+        "UPDATE approval_requests SET status = 'failed', execution_completed_at = ?, execution_error = ? WHERE id = ? AND status IN ('approved', 'executed')",
+      )
+      .run(now, boundedApprovalPreview(error instanceof Error ? error.message : error), id);
+    return this.getApprovalRequest(id) as ApprovalRequestRow;
+  }
+
+  expireApprovalRequest(id: string, now = Date.now()): ApprovalRequestRow | undefined {
+    this.database.raw
+      .prepare(
+        "UPDATE approval_requests SET status = 'expired', decided_at = COALESCE(decided_at, ?) WHERE id = ? AND status IN ('pending', 'approved') AND expires_at <= ?",
+      )
+      .run(now, id, now);
+    return this.getApprovalRequest(id);
+  }
+
+  private approvalFromRow(row: Record<string, unknown>): ApprovalRequestRow {
+    return {
+      id: String(row.id),
+      runId: String(row.run_id),
+      threadId: String(row.thread_id),
+      sessionId: row.session_id === null ? null : String(row.session_id),
+      toolCallId: String(row.tool_call_id),
+      toolName: String(row.tool_name),
+      argumentsPreview: String(row.arguments_preview),
+      payloadHash: String(row.payload_hash),
+      requiredPermission: String(
+        row.required_permission,
+      ) as ApprovalRequestRow['requiredPermission'],
+      permissionSource: String(row.permission_source),
+      risk: String(row.risk),
+      target: String(row.target),
+      providerOwned: Boolean(row.provider_owned),
+      status: String(row.status) as ApprovalRequestRow['status'],
+      createdAt: Number(row.created_at),
+      expiresAt: Number(row.expires_at),
+      decidedAt: row.decided_at === null ? null : Number(row.decided_at),
+      executionStartedAt:
+        row.execution_started_at === null ? null : Number(row.execution_started_at),
+      executionCompletedAt:
+        row.execution_completed_at === null ? null : Number(row.execution_completed_at),
+      resultHash: row.result_hash === null ? null : String(row.result_hash),
+      resultPreview: row.result_preview === null ? null : String(row.result_preview),
+      executionError: row.execution_error === null ? null : String(row.execution_error),
+    };
   }
 
   storeMemory(

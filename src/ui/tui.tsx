@@ -101,37 +101,53 @@ async function loadConversationMessages(
 }
 
 async function loadCatalog(baseUrl: string, token: string): Promise<TuiEvent> {
-  const [tasks, schedules, memories, skills, plugins, providers, secrets] = await Promise.all([
-    request<{
-      tasks: Array<{ id: string; status: string; kind: string; scheduleId: string | null }>;
-    }>(baseUrl, token, '/api/tasks'),
-    request<{
-      schedules: Array<{
-        id: string;
-        name: string;
-        type: string;
-        expression: string;
-        agentInput: string;
-        enabled: boolean;
-        nextRunAt: number | null;
-      }>;
-    }>(baseUrl, token, '/api/schedules'),
-    request<{
-      memories: Array<{ id: string; content: string; hasEmbedding: boolean }>;
-    }>(baseUrl, token, '/api/memory'),
-    request<{
-      skills: Array<{ name: string; description: string; source?: string }>;
-    }>(baseUrl, token, '/api/skills'),
-    request<{
-      plugins: Array<{ name: string; version: string; capabilities: string[] }>;
-      health: Array<{ name: string; enabled: boolean }>;
-    }>(baseUrl, token, '/api/plugins'),
-    request<{
-      providers: Array<{ name: string; available: boolean; detail: string; models?: string[] }>;
-      active: { name: string; model: string };
-    }>(baseUrl, token, '/api/providers'),
-    request<{ names: string[] }>(baseUrl, token, '/api/secrets'),
-  ]);
+  const [tasks, schedules, memories, skills, plugins, providers, secrets, approvals] =
+    await Promise.all([
+      request<{
+        tasks: Array<{ id: string; status: string; kind: string; scheduleId: string | null }>;
+      }>(baseUrl, token, '/api/tasks'),
+      request<{
+        schedules: Array<{
+          id: string;
+          name: string;
+          type: string;
+          expression: string;
+          agentInput: string;
+          enabled: boolean;
+          nextRunAt: number | null;
+        }>;
+      }>(baseUrl, token, '/api/schedules'),
+      request<{
+        memories: Array<{ id: string; content: string; hasEmbedding: boolean }>;
+      }>(baseUrl, token, '/api/memory'),
+      request<{
+        skills: Array<{ name: string; description: string; source?: string }>;
+      }>(baseUrl, token, '/api/skills'),
+      request<{
+        plugins: Array<{ name: string; version: string; capabilities: string[] }>;
+        health: Array<{ name: string; enabled: boolean }>;
+      }>(baseUrl, token, '/api/plugins'),
+      request<{
+        providers: Array<{ name: string; available: boolean; detail: string; models?: string[] }>;
+        active: { name: string; model: string };
+      }>(baseUrl, token, '/api/providers'),
+      request<{ names: string[] }>(baseUrl, token, '/api/secrets'),
+      request<{
+        approvals: Array<{
+          id: string;
+          runId: string;
+          threadId: string;
+          toolName: string;
+          status: string;
+          payloadHash: string;
+          target: string;
+          risk: string;
+          providerOwned: boolean;
+          createdAt: number;
+          expiresAt: number;
+        }>;
+      }>(baseUrl, token, '/api/approvals?status=pending'),
+    ]);
 
   return {
     type: 'catalog.loaded',
@@ -150,6 +166,7 @@ async function loadCatalog(baseUrl: string, token: string): Promise<TuiEvent> {
     })),
     providers: providers.providers,
     secretNames: secrets.names,
+    approvals: approvals.approvals,
   };
 }
 
@@ -297,7 +314,8 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
       if (value.type !== 'event' || !value.event) return;
       const tuiEvent = toTuiEvent(value.event);
       if (tuiEvent) dispatch(tuiEvent);
-      if (value.event.type === 'run.completed') void refresh();
+      if (value.event.type === 'run.completed' || value.event.type.startsWith('approval.'))
+        void refresh();
     };
     socket.onerror = () => {
       setStatus('WebSocket error');
@@ -643,6 +661,24 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
           {tuiState.retry.maxAttempts})
         </Text>
       )}
+      {tuiState.approvals.map((approval) => (
+        <Box
+          key={approval.id}
+          flexDirection="column"
+          borderStyle="round"
+          borderColor="yellow"
+          paddingX={1}
+        >
+          <Text color="yellow" bold>
+            Approval required · {approval.toolName}
+          </Text>
+          <Text>
+            Target: {approval.target} · Risk: {approval.risk}
+          </Text>
+          <Text>Hash: {approval.payloadHash}</Text>
+          <Text>Expires: {new Date(approval.expiresAt).toISOString()}</Text>
+        </Box>
+      ))}
       {error && <Text color="red">Error: {error}</Text>}
       <Box flexDirection="column" marginTop={1}>
         <Text color="green">Sessions</Text>

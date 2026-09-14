@@ -4,6 +4,15 @@ All notable NUAAI changes are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Payload-bound per-action approvals now pause profile-governed tools before side effects, persist a durable one-time SQLite state machine, revalidate current permission and tool authority, and resume the same run only for the exact SHA-256-bound payload.
+- Authenticated approval list/detail/approve/deny APIs, approval lifecycle events, a functional PWA approval inbox, and TUI pending-action visibility.
+
+### Security
+
+- Approval records and client events expose only the payload hash plus bounded redacted target/result previews; raw canonical arguments are never stored in the approval table. Decisions must include the hash shown to the operator, and stale hashes, replay, expiry, denial, and concurrent decisions fail closed.
+
 ## [1.0.1] - 2026-09-14
 
 ### Fixed

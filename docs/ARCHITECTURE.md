@@ -31,8 +31,9 @@ Ink TUI / React web client
 2. **Decision:** the selected provider receives the layered system prompt plus one stable tool catalog filtered by the client permission profile.
 3. **Action:** a structured provider tool call is validated against the advertised catalog and executed once through the daemon-owned registry.
 4. **Observation:** the bounded tool result is persisted as a typed artifact and returned to the provider with the assistant tool-call message.
-5. **Continuation:** the loop repeats until a verified final response, explicit failure, cancellation, timeout, or configured turn limit. Exhausting the tool budget disables further tools and requests a final answer from gathered evidence.
-6. **Commit:** authoritative output and lifecycle evidence are written by the active thread writer and projected to connected clients.
+5. **Continuation:** the loop repeats until a verified final response, explicit failure, cancellation, timeout, configured turn limit, or an action requiring approval. Profile-governed actions create a durable payload-bound request and set the same run to `paused`; approval revalidates authority and resumes that run, while denial or expiry ends it without executing the action.
+6. **Approval:** each request binds the run ID, canonical registry tool name, and canonical arguments into a SHA-256 hash. SQLite stores the hash plus redacted bounded operator previews—not raw arguments—and atomically consumes an approved request once immediately before execution. Pending requests survive daemon restart; a resumed provider must propose the exact same payload hash before execution.
+7. **Commit:** authoritative output and lifecycle evidence are written by the active thread writer and projected to connected clients.
 
 ## Persistence
 

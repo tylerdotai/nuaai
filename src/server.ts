@@ -7,6 +7,7 @@ import { Hono } from 'hono';
 import { type WebSocket, WebSocketServer } from 'ws';
 
 import { harnessConfig } from './config/index.js';
+import { ApprovalStateError, approvalStatuses } from './core/approvals.js';
 import type { AgentRuntime } from './core/runtime.js';
 import type { Scheduler } from './core/scheduler.js';
 import { createToken, inspectToken, validateToken } from './gateway/token.js';
@@ -182,6 +183,50 @@ export function createApp(services: GatewayServices): Hono {
       webPermissionProfile: runPermissionProfile,
     }),
   );
+  app.get('/api/approvals', (context) => {
+    const requestedStatus = context.req.query('status');
+    if (requestedStatus && !approvalStatuses.includes(requestedStatus as never))
+      return context.json({ error: 'Invalid approval status' }, 400);
+    return context.json({
+      approvals: services.runtime.listApprovals(requestedStatus as never),
+    });
+  });
+  app.get('/api/approvals/:id', (context) => {
+    const approval = services.runtime.getApproval(context.req.param('id'));
+    return approval ? context.json(approval) : context.json({ error: 'Approval not found' }, 404);
+  });
+  app.post('/api/approvals/:id/approve', async (context) => {
+    const body = (await context.req.json().catch(() => ({}))) as { payloadHash?: string };
+    if (!body.payloadHash?.match(/^[a-f0-9]{64}$/u))
+      return context.json({ error: 'payloadHash is required' }, 400);
+    try {
+      return context.json(
+        services.runtime.approveApproval(context.req.param('id'), body.payloadHash),
+      );
+    } catch (error) {
+      const status =
+        error instanceof ApprovalStateError && error.code === 'approval_not_found' ? 404 : 409;
+      return context.json(
+        { error: error instanceof Error ? error.message : String(error) },
+        status,
+      );
+    }
+  });
+  app.post('/api/approvals/:id/deny', async (context) => {
+    const body = (await context.req.json().catch(() => ({}))) as { payloadHash?: string };
+    if (!body.payloadHash?.match(/^[a-f0-9]{64}$/u))
+      return context.json({ error: 'payloadHash is required' }, 400);
+    try {
+      return context.json(services.runtime.denyApproval(context.req.param('id'), body.payloadHash));
+    } catch (error) {
+      const status =
+        error instanceof ApprovalStateError && error.code === 'approval_not_found' ? 404 : 409;
+      return context.json(
+        { error: error instanceof Error ? error.message : String(error) },
+        status,
+      );
+    }
+  });
   app.get('/api/sessions', (context) =>
     context.json({
       sessions: services.runtime.listSessions(context.req.query('includeOrphans') === 'true'),
@@ -294,6 +339,7 @@ export function createApp(services: GatewayServices): Hono {
           provider: body.provider,
           model: body.model,
           permissions: runPermissions,
+          permissionSource: 'web',
         }),
       );
     } catch (error) {
@@ -327,7 +373,7 @@ export function createApp(services: GatewayServices): Hono {
     if (!run) return context.json({ error: 'Run not found' }, 404);
     if (run.threadId !== threadId)
       return context.json({ error: 'Run does not belong to this thread' }, 409);
-    if (!['queued', 'running'].includes(run.status))
+    if (!['queued', 'running', 'paused'].includes(run.status))
       return context.json({ error: 'Run is not active' }, 409);
     try {
       services.runtime.cancelRun(run.id);

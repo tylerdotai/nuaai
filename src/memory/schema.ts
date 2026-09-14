@@ -55,6 +55,31 @@ export const runs = sqliteTable('runs', {
   correlationId: text('correlation_id').notNull(),
 });
 
+export const approvalRequests = sqliteTable('approval_requests', {
+  id: text('id').primaryKey(),
+  runId: text('run_id').notNull(),
+  threadId: text('thread_id').notNull(),
+  sessionId: text('session_id'),
+  toolCallId: text('tool_call_id').notNull(),
+  toolName: text('tool_name').notNull(),
+  argumentsPreview: text('arguments_preview').notNull(),
+  payloadHash: text('payload_hash').notNull(),
+  requiredPermission: text('required_permission').notNull(),
+  permissionSource: text('permission_source').notNull(),
+  risk: text('risk').notNull(),
+  target: text('target').notNull(),
+  providerOwned: integer('provider_owned', { mode: 'boolean' }).notNull().default(false),
+  status: text('status').notNull(),
+  createdAt: integer('created_at').notNull(),
+  expiresAt: integer('expires_at').notNull(),
+  decidedAt: integer('decided_at'),
+  executionStartedAt: integer('execution_started_at'),
+  executionCompletedAt: integer('execution_completed_at'),
+  resultHash: text('result_hash'),
+  resultPreview: text('result_preview'),
+  executionError: text('execution_error'),
+});
+
 export const memories = sqliteTable('memory_records', {
   id: text('id').primaryKey(),
   content: text('content').notNull(),

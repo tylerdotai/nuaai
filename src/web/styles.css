@@ -1451,6 +1451,57 @@ kbd {
   width: 100%;
 }
 
+.approval-inbox {
+  background: color-mix(in srgb, var(--error) 7%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--error) 35%, var(--border));
+  border-radius: 14px;
+  margin: 1rem;
+  padding: 1rem;
+}
+
+.approval-inbox-heading,
+.approval-inbox-heading > div {
+  align-items: center;
+  display: flex;
+  gap: 0.65rem;
+  justify-content: space-between;
+}
+
+.approval-inbox h2 {
+  font-size: 0.95rem;
+}
+
+.approval-card {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-top: 0.75rem;
+  padding: 0.85rem;
+}
+
+.approval-card dl {
+  display: grid;
+  gap: 0.55rem;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.approval-card dt {
+  color: var(--text-muted);
+  font-size: 0.6rem;
+  text-transform: uppercase;
+}
+
+.approval-card dd {
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  margin: 0.2rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.approval-hash {
+  font-family: var(--font-mono);
+}
+
 .automation-layout {
   display: grid;
   gap: 1rem;
