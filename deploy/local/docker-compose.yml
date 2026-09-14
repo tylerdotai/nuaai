@@ -1,7 +1,8 @@
 services:
   synapse:
-    image: matrixdotorg/synapse:latest
+    image: matrixdotorg/synapse:v1.160.0@sha256:78de1d10bef02e375f861d1cc99f8bedd9381d4f9083ea8b2c22a053477b205f
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       SYNAPSE_CONFIG_DIR: /data
     ports:
@@ -10,7 +11,7 @@ services:
       - ./state/synapse:/data
 
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng@sha256:4da2820fd56920bf05303183b2f3a8c8cce18fcbcd88526cae31bc039b2d4dd1
     restart: unless-stopped
     env_file:
       - .env.integrations
@@ -23,13 +24,13 @@ services:
       - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
 
   crawl4ai:
-    image: unclecode/crawl4ai:latest
+    image: unclecode/crawl4ai@sha256:a45fd08f8f15f67026c1bff0a151f0479244caf6751a0c6943b3870efafcd025
     restart: unless-stopped
     ports:
       - "127.0.0.1:${NUAAI_CRAWL4AI_PORT}:11235"
 
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
+    image: ghcr.io/flaresolverr/flaresolverr@sha256:7962759d99d7e125e108e0f5e7f3cdbcd36161776d058d1d9b7153b92ef1af9e
     restart: unless-stopped
     environment:
       LOG_LEVEL: info

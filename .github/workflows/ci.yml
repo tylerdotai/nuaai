@@ -31,35 +31,17 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Install media test tools
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ffmpeg zip unzip
+
       - name: Install dependencies
         run: npm ci
 
-      - name: Static checks
-        run: npm run check
-
-      - name: Unit and integration tests
-        run: npm test
-
-      - name: Strict per-file coverage
-        run: npm run test:coverage
-
-      - name: Build Node daemon
-        run: npm run build
-
-      - name: Build web dashboard
-        run: npm run build:web
-
-      - name: Install Chromium for browser smoke
+      - name: Install Chromium for browser E2E
         run: npx playwright install --with-deps chromium
 
-      - name: Browser E2E
-        run: npm run test:e2e
-
-      - name: Dependency audit
-        run: npm audit --audit-level=low
-
-      - name: Version and tag consistency
-        run: npm run version:check
+      - name: Canonical release gate
+        run: npm run gate
 
       - name: Diff hygiene
         run: git diff --check

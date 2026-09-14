@@ -1,8 +1,13 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomBytes, randomInt } from 'node:crypto';
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { createConnection } from 'node:net';
 import { dirname, resolve } from 'node:path';
+
+import { localIntegrationSelection } from './local-integration-policy.mjs';
+import { reserveConfiguredPort } from './local-port-policy.mjs';
+import { hardenSynapseRegistration, matrixOperatorPolicy } from './matrix-bootstrap-policy.mjs';
 
 const root = resolve(process.env.NUAAI_ROOT ?? resolve(import.meta.dirname, '..'));
 const composeFile = resolve(root, 'deploy/local/docker-compose.yml');
@@ -12,6 +17,11 @@ const runtimeRoot = resolve(root, '.nuaai');
 const envFile = resolve(localRoot, '.env.integrations');
 const matrixEnvFile = resolve(runtimeRoot, 'matrix.env');
 const botPasswordFile = resolve(synapseState, '.nuaai-bot-password');
+const operatorPasswordFile = resolve(synapseState, '.nuaai-operator-password');
+const integrations = localIntegrationSelection(process.argv.slice(2));
+const require = createRequire(import.meta.url);
+const synapseImage =
+  'matrixdotorg/synapse:v1.160.0@sha256:78de1d10bef02e375f861d1cc99f8bedd9381d4f9083ea8b2c22a053477b205f';
 
 function runDocker(args, options = {}) {
   const result = spawnSync(
@@ -38,7 +48,7 @@ function chownSynapseState(uid, gid) {
       '/bin/chown',
       '-v',
       `${synapseState}:/data`,
-      'matrixdotorg/synapse:latest',
+      synapseImage,
       '-R',
       `${uid}:${gid}`,
       '/data',
@@ -78,16 +88,8 @@ function portFromUrl(value) {
 }
 
 async function choosePort(candidate, used) {
-  if (
-    Number.isInteger(candidate) &&
-    candidate >= 40_000 &&
-    candidate <= 60_000 &&
-    !used.has(candidate) &&
-    !(await portInUse(candidate))
-  ) {
-    used.add(candidate);
-    return candidate;
-  }
+  const configured = reserveConfiguredPort(candidate, used);
+  if (configured) return configured;
   let port = randomInt(40_000, 60_000);
   while (used.has(port) || (await portInUse(port))) port = randomInt(40_000, 60_000);
   used.add(port);
@@ -130,6 +132,19 @@ function stopLegacyContainer(name) {
   spawnSync('docker', ['stop', name], { cwd: root, stdio: 'ignore' });
 }
 
+function ensureBrowserRuntime() {
+  const packageFile = require.resolve('playwright/package.json');
+  const result = spawnSync(
+    process.execPath,
+    [resolve(dirname(packageFile), 'cli.js'), 'install', 'chromium'],
+    {
+      cwd: root,
+      stdio: 'inherit',
+    },
+  );
+  if (result.status !== 0) throw new Error('Playwright Chromium installation failed');
+}
+
 function detectServerName() {
   try {
     const raw = execFileSync('tailscale', ['status', '--json'], { encoding: 'utf8' });
@@ -162,14 +177,7 @@ async function ensureSynapseConfig(serverName) {
   let config = await readFile(configFile, 'utf8');
   if (!/^registration_shared_secret:/m.test(config))
     config += `\nregistration_shared_secret: "${randomBytes(32).toString('hex')}"\n`;
-  config = config.replace(/^enable_registration:\s*.*$/m, 'enable_registration: true');
-  if (!/^enable_registration:/m.test(config)) config += 'enable_registration: true\n';
-  config = config.replace(
-    /^enable_registration_without_verification:\s*.*$/m,
-    'enable_registration_without_verification: true',
-  );
-  if (!/^enable_registration_without_verification:/m.test(config))
-    config += 'enable_registration_without_verification: true\n';
+  config = hardenSynapseRegistration(config);
   if (!/^public_baseurl:/m.test(config)) config += `public_baseurl: "https://${serverName}/"\n`;
   config = config.replace(/(^\s*- port:)\s*\d+/m, '$1 8008');
   await writeFile(configFile, config, { mode: 0o600 });
@@ -273,7 +281,40 @@ async function ensureBotAccount(serverName, synapsePort) {
   await chmod(matrixEnvFile, 0o600);
 }
 
-async function enableDaemonMatrix(serverName, synapsePort) {
+async function ensureOperatorAccount(serverName) {
+  const policy = matrixOperatorPolicy(
+    [],
+    process.env.NUAAI_MATRIX_OPERATOR_LOCALPART || 'operator',
+    serverName,
+  );
+  ensureSynapseOwnership();
+  try {
+    await readFile(operatorPasswordFile, 'utf8');
+  } catch {
+    await writeFile(operatorPasswordFile, randomBytes(32).toString('base64url'), { mode: 0o600 });
+  }
+  await chmod(operatorPasswordFile, 0o600);
+  ensureSynapseServiceOwnership();
+  runDocker([
+    'exec',
+    '-T',
+    'synapse',
+    'register_new_matrix_user',
+    '-c',
+    '/data/homeserver.yaml',
+    '-u',
+    policy.localpart,
+    '--password-file',
+    '/data/.nuaai-operator-password',
+    '--no-admin',
+    '--exists-ok',
+    'http://localhost:8008',
+  ]);
+  ensureSynapseOwnership();
+  return policy;
+}
+
+async function enableDaemonMatrix(serverName, synapsePort, operatorPolicy) {
   const configFile = resolve(runtimeRoot, 'config.json');
   let config = {};
   try {
@@ -281,11 +322,17 @@ async function enableDaemonMatrix(serverName, synapsePort) {
   } catch {
     // `nuaai init` may not have run yet; the daemon will create the workspace first.
   }
+  const admission = matrixOperatorPolicy(
+    config.matrix?.allowedUsers ?? [],
+    operatorPolicy.localpart,
+    serverName,
+  );
   config.matrix = {
     ...(config.matrix ?? {}),
     enabled: true,
     homeserverUrl: `http://127.0.0.1:${synapsePort}`,
     userId: `@nuaai:${serverName}`,
+    allowedUsers: admission.allowedUsers,
   };
   config.features = {
     ...(config.features ?? {}),
@@ -296,25 +343,44 @@ async function enableDaemonMatrix(serverName, synapsePort) {
 }
 
 const serverName = detectServerName();
-await mkdir(synapseState, { recursive: true });
 const ports = await ensureLocalPorts();
 await ensureSearchSecret(ports);
-await ensureSynapseConfig(serverName);
-stopLegacyContainer('crawl4ai');
-stopLegacyContainer('flaresolverr');
-const services = ['synapse', 'searxng', 'crawl4ai', 'flaresolverr'];
-runDocker(['up', '-d', ...services]);
-await waitForSynapse(ports.synapsePort);
-await ensureBotAccount(serverName, ports.synapsePort);
-await enableDaemonMatrix(serverName, ports.synapsePort);
+let operatorPolicy;
+if (integrations.matrix) {
+  await mkdir(synapseState, { recursive: true });
+  await ensureSynapseConfig(serverName);
+}
+if (integrations.search) stopLegacyContainer('crawl4ai');
+if (integrations.browser) {
+  stopLegacyContainer('flaresolverr');
+  ensureBrowserRuntime();
+}
+runDocker(['up', '-d', ...integrations.services]);
+if (integrations.matrix) {
+  await waitForSynapse(ports.synapsePort);
+  await ensureBotAccount(serverName, ports.synapsePort);
+  operatorPolicy = await ensureOperatorAccount(serverName);
+  await enableDaemonMatrix(serverName, ports.synapsePort, operatorPolicy);
+}
 
 process.stdout.write(
   `${[
     'Local integrations are running.',
-    `Matrix server name: ${serverName}`,
-    `Matrix bot: @nuaai:${serverName}`,
-    'Matrix credentials: .nuaai/matrix.env (secret values not printed)',
+    ...(integrations.matrix
+      ? [
+          `Matrix server name: ${serverName}`,
+          `Matrix bot: @nuaai:${serverName}`,
+          `Matrix operator: ${operatorPolicy.userId}`,
+          'Matrix operator password: deploy/local/state/synapse/.nuaai-operator-password (secret value not printed)',
+          'Matrix credentials: .nuaai/matrix.env (secret values not printed)',
+        ]
+      : []),
     `NUAAI web UI: http://127.0.0.1:${ports.daemonPort}`,
-    `Search services: loopback high ports ${ports.searxngPort}, ${ports.crawl4aiPort}, ${ports.flaresolverrPort}`,
+    ...(integrations.search
+      ? [`Search services: loopback high ports ${ports.searxngPort}, ${ports.crawl4aiPort}`]
+      : []),
+    ...(integrations.browser
+      ? [`Browser fallback service: loopback high port ${ports.flaresolverrPort}`]
+      : []),
   ].join('\n')}\n`,
 );

@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { access, open, readFile, unlink } from 'node:fs/promises';
+import { access, chmod, link, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import { workspaceDirectory } from '../config/index.js';
+
+const malformedLockStaleMs = 5_000;
 
 interface LockRecord {
   pid: number;
@@ -48,39 +50,58 @@ async function unlinkIfPresent(path: string): Promise<void> {
   }
 }
 
+async function malformedLockIsStale(path: string): Promise<boolean> {
+  try {
+    return Date.now() - (await stat(path)).mtimeMs >= malformedLockStaleMs;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+}
+
 export async function acquireDaemonLock(root = process.cwd()): Promise<DaemonLock> {
-  const path = resolve(workspaceDirectory(root), 'daemon.lock');
+  const directory = workspaceDirectory(root);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const path = resolve(directory, 'daemon.lock');
   const owner = randomUUID();
   const record: LockRecord = { pid: process.pid, owner, startedAt: Date.now() };
+  const temporaryPath = `${path}.${owner}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify(record)}\n`, {
+    encoding: 'utf8',
+    flag: 'wx',
+    mode: 0o600,
+  });
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const handle = await open(path, 'wx', 0o600);
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8');
-      } finally {
-        await handle.close();
+        await link(temporaryPath, path);
+        let released = false;
+        return {
+          path,
+          release: async () => {
+            if (released) return;
+            released = true;
+            const current = await readLock(path);
+            if (current?.owner === owner) await unlinkIfPresent(path);
+          },
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        const current = await readLock(path);
+        if (current && (await processIsAlive(current.pid)))
+          throw new Error(`Daemon already running (pid ${current.pid})`);
+        if (!current && !(await malformedLockIsStale(path)))
+          throw new Error('Daemon lock exists but is not readable');
+        await unlinkIfPresent(path);
       }
-      let released = false;
-      return {
-        path,
-        release: async () => {
-          if (released) return;
-          released = true;
-          const current = await readLock(path);
-          if (current?.owner === owner) await unlinkIfPresent(path);
-        },
-      };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      const current = await readLock(path);
-      if (current && (await processIsAlive(current.pid)))
-        throw new Error(`Daemon already running (pid ${current.pid})`);
-      await unlinkIfPresent(path);
     }
-  }
 
-  throw new Error('Unable to acquire daemon lock');
+    throw new Error('Unable to acquire daemon lock');
+  } finally {
+    await unlinkIfPresent(temporaryPath);
+  }
 }
 
 export async function daemonLockExists(root = process.cwd()): Promise<boolean> {

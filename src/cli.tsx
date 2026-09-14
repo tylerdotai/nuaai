@@ -1,19 +1,34 @@
+import { resolve } from 'node:path';
+
 import { render } from 'ink';
 import { createElement } from 'react';
 
 import { defaultRuntimeConfig, harnessConfig, loadRuntimeConfig } from './config/index.js';
 import { startDaemon } from './daemon.js';
-import { ensureRuntimeIdentity } from './gateway/runtime.js';
+import { createBrowserPairingToken, ensureRuntimeIdentity } from './gateway/runtime.js';
 import { runOnboarding } from './onboarding.js';
+import { installUserService, runUserServiceAction } from './service.js';
 import { Tui } from './ui/tui.js';
 import { getVersion } from './version.js';
 import { initWorkspace } from './workspace/fs.js';
 
+async function daemonRequest(baseUrl: string, path: string, init?: RequestInit): Promise<Response> {
+  try {
+    const response = await fetch(`${baseUrl}${path}`, init);
+    if (!response.ok)
+      throw new Error(`NUAAI daemon request failed at ${baseUrl}${path}: HTTP ${response.status}`);
+    return response;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('NUAAI daemon request failed'))
+      throw error;
+    throw new Error(`NUAAI daemon is not reachable at ${baseUrl}. Start it with: nuaai daemon`);
+  }
+}
+
 async function apiRequest<T>(baseUrl: string, token: string, path: string): Promise<T> {
-  const response = await fetch(`${baseUrl}${path}`, {
+  const response = await daemonRequest(baseUrl, path, {
     headers: { authorization: `Bearer ${token}` },
   });
-  if (!response.ok) throw new Error(`Request failed: ${response.status}`);
   return response.json() as Promise<T>;
 }
 
@@ -33,6 +48,22 @@ async function main(): Promise<void> {
     await startDaemon();
     return;
   }
+  if (command === 'service') {
+    const action = args[1];
+    if (action === 'install') {
+      const path = await installUserService(process.cwd());
+      process.stdout.write(`NUAAI user service installed: ${path}\n`);
+      process.stdout.write('The service was not started or enabled.\n');
+      return;
+    }
+    if (!action || !['start', 'stop', 'restart', 'status'].includes(action))
+      throw new Error('Usage: nuaai service <install|start|stop|restart|status>');
+    const result = await runUserServiceAction(action as 'start' | 'stop' | 'restart' | 'status');
+    if (result.stdout) process.stdout.write(`${result.stdout}\n`);
+    if (result.stderr) process.stderr.write(`${result.stderr}\n`);
+    if (result.exitCode !== 0) process.exitCode = result.exitCode;
+    return;
+  }
   if (command === 'onboard') {
     const onboarding = await runOnboarding(
       process.cwd(),
@@ -42,7 +73,9 @@ async function main(): Promise<void> {
     const daemon = await startDaemon();
     const config = await loadRuntimeConfig();
     if (onboarding.launch === 'web') {
-      process.stdout.write(`NUAAI web dashboard: http://${config.host}:${daemon.gateway.port}\n`);
+      process.stdout.write(
+        `NUAAI web dashboard: http://${config.host}:${daemon.gateway.port}/#token=${encodeURIComponent(createBrowserPairingToken(process.cwd()))}\n`,
+      );
       return;
     }
     const identity = ensureRuntimeIdentity(process.cwd());
@@ -65,37 +98,33 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return;
   }
+  if (command === 'pair') {
+    const config = await loadRuntimeConfig().catch(() => defaultRuntimeConfig());
+    const baseUrl = (args[1] ?? `http://${config.host}:${config.port}`).replace(/\/$/, '');
+    process.stdout.write(
+      `${baseUrl}/#token=${encodeURIComponent(createBrowserPairingToken(process.cwd()))}\n`,
+    );
+    return;
+  }
   if (command === 'run') {
     const input = args.slice(1).join(' ').trim();
     if (!input) throw new Error('Usage: nuaai run <input>');
     const config = await loadRuntimeConfig();
     const identity = ensureRuntimeIdentity(process.cwd());
-    const sessions = await apiRequest<{ sessions: Array<{ id: string }> }>(
-      `http://${config.host}:${config.port}`,
-      identity.token,
-      '/api/sessions',
-    );
-    let sessionId = sessions.sessions[0]?.id;
-    if (!sessionId) {
-      const response = await fetch(`http://${config.host}:${config.port}/api/sessions`, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${identity.token}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ title: 'CLI session' }),
-      });
-      const created = (await response.json()) as { session: { id: string } };
-      sessionId = created.session.id;
-    }
-    const session = await apiRequest<{ threads: Array<{ id: string }> }>(
-      `http://${config.host}:${config.port}`,
-      identity.token,
-      `/api/sessions/${sessionId}`,
-    );
-    const response = await fetch(`http://${config.host}:${config.port}/api/runs`, {
+    const baseUrl = `http://${config.host}:${config.port}`;
+    const sourceKey = `cli:${resolve(process.cwd())}`;
+    const response = await daemonRequest(baseUrl, '/api/sessions/resolve', {
       method: 'POST',
       headers: { authorization: `Bearer ${identity.token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ threadId: session.threads[0].id, input }),
+      body: JSON.stringify({ title: 'CLI session', sourceKey }),
     });
-    process.stdout.write(`${JSON.stringify(await response.json(), null, 2)}\n`);
+    const session = (await response.json()) as { thread: { id: string } };
+    const runResponse = await daemonRequest(baseUrl, '/api/runs', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${identity.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ threadId: session.thread.id, input }),
+    });
+    process.stdout.write(`${JSON.stringify(await runResponse.json(), null, 2)}\n`);
     return;
   }
   const config = await loadRuntimeConfig().catch(() => defaultRuntimeConfig());

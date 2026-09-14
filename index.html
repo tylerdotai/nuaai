@@ -2,11 +2,27 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NUAAI</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0d0f" />
+    <meta name="description" content="Private command surface for the NUAAI local agent runtime." />
+    <meta name="robots" content="noindex, nofollow, noarchive" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="NUAAI" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon-192.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="icon-192.svg" />
+    <title>NUAAI — command surface</title>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/web/main.tsx"></script>
+    <script>
+      if ('serviceWorker' in navigator) {
+        const appBase = location.pathname === '/nuaai' || location.pathname.startsWith('/nuaai/') ? '/nuaai/' : '/';
+        window.addEventListener('load', () => navigator.serviceWorker.register(`${appBase}sw.js`, { scope: appBase }));
+      }
+    </script>
   </body>
 </html>

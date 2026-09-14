@@ -2,6 +2,77 @@
 
 All notable NUAAI changes are recorded here.
 
+## [1.0.0] - 2026-09-13
+
+### Added
+
+- Viewport-bound responsive PWA with durable conversation/thread selection, one authoritative streamed response, run activity, Memory, Automations, System, reconnect/error states, keyboard commands, and mobile navigation.
+- Opt-in user-service commands: `install`, `start`, `stop`, `restart`, and `status`. Installation does not start or enable the daemon.
+- Tailscale onboarding route plan for Synapse at `/` and NUAAI at `/nuaai`.
+- OpenAI-compatible `/v1` mode for local chat, tool calls, embeddings, and model discovery while retaining native Ollama APIs.
+- Real browser E2E assertions for desktop/mobile geometry, persistence, cancellation, tools, automation outcomes, section navigation, and browser errors.
+- Explicit browser pairing through a five-minute, fragment-based `nuaai pair` URL that exchanges for a separate mount-scoped browser session; loading the static shell no longer bootstraps an authenticated cookie.
+- Installed-tarball release smoke covering the packaged CLI, daemon, web bundle, browser pairing, authenticated APIs, and all first-party skills.
+- Thread-scoped `run.history` tool for bounded model-visible diagnosis without exposing the private runtime database or cross-session data.
+
+### Changed
+
+- Authenticated Web, allowlisted Matrix, and scheduled runs default to configurable operator permissions; read-only remains an explicit profile.
+- Codex model turns use the direct ChatGPT Codex Responses endpoint with CLI-owned OAuth; actions use the same NUAAI permission-filtered tool loop as local providers.
+- Interrupted runs are marked failed and require explicit resume instead of replaying work automatically.
+- Matrix requires a static user or room allowlist when enabled.
+- Onboarding starts only selected integration services, installs the pinned Playwright runtime when requested, and keeps Synapse public registration disabled.
+- Ordinary assistant responses no longer enter durable memory automatically; memory writes remain explicit.
+- Runtime identity tokens rotate after expiration.
+- The default per-run tool budget is 48 calls; budget exhaustion now forces a no-tools finalization turn from completed evidence.
+- The release gate now runs formatting/lint, strict TypeScript, 80% per-file coverage over its documented runtime/core scope, fresh Node/web builds, browser E2E, installed-package smoke, version checks, and moderate-or-higher dependency audit enforcement.
+
+### Fixed
+
+- Restored the deleted Synapse Compose service, pinned Synapse v1.160.0, and pinned every local integration image by immutable registry digest.
+- Automatically loads generated `.nuaai/matrix.env` without overriding explicit process environment values.
+- Scheduled tasks now fail when the underlying agent run fails or is cancelled.
+- Run timeouts are reported as failures with timeout context instead of cancellations.
+- Provider-owned action failures can no longer produce successful runs.
+- WebSocket replay filters by subscribed session and inbound WebSocket/HTTP payloads are bounded.
+- Per-thread queued-run counts now remain correct while a writer is active and after a rejected run.
+- Generic command paths stay within the project root; interpreter/package-manager/provider executables are not exposed through the generic command tool.
+- Workspace writes refuse symlink and hard-link targets; runtime/database files use owner-only permissions.
+- CLI daemon failures now name the unreachable endpoint and recovery command instead of only printing `fetch failed`.
+- Hono and Vitest/coverage patch updates remove all moderate-or-higher dependency advisories.
+- Replaced the non-completing Codex CLI/App Server model-turn path with fixed-host streaming Responses, provider-safe tool-name mapping, structured function-call replay, bounded/redacted SSE errors, and Codex-owned near-expiry credential refresh.
+- Removed the dormant App Server turn adapter and its test-only integration surface after production routing moved to direct Responses; the Codex CLI remains only for login, model metadata, credential refresh, and the existing compatibility adapter.
+- Codex Responses now cancels unfinished success and error bodies and unlocks SSE readers, preventing per-turn connection leakage in long-running sessions and repeated HTTP failures.
+- Serialized Matrix status reactions prevent duplicate-reaction errors during rapid run events.
+- Matrix checkpoints advance only after handlers complete; deterministic transaction IDs and stable event keys make run, command-response, and `/new` retries idempotent.
+- Daemon ownership is acquired atomically before runtime mutation, queued context is loaded at execution time, and shutdown aborts active/nested work before draining.
+- Protected paths now include trusted extension/runtime state, Git metadata, and credential-like project files; workspace commands reject symlink/path escapes, mutating or indirect-read options, unsafe process listings, and ambient environment inheritance.
+- Every model-triggered child process—including Codex, media/audio helpers, MCP, workspace commands, plugins, and external agents—receives an explicit minimal environment instead of inheriting daemon credentials.
+- Existing databases archive duplicate legacy Matrix source bindings before installing unique ownership indexes, preserving upgrade startup.
+- Provider tools now remain stable across turns instead of depending on brittle lexical routing; authenticated operator clients expose typed write/execute tools and reject only calls outside the permission-filtered catalog.
+- Per-provider model selections persist independently; local catalogs remain live-discovered, and Codex exposes only visible models from the authenticated CLI cache.
+- The outer run timeout now exceeds the Codex turn timeout, Matrix retries bounded `429` responses with the same transaction ID, reaction churn is reduced, and provider stderr cannot persist unbounded remote response bodies.
+- Browser and page-fetch tools reject credential-bearing, unsafe-port, local, private, link-local, mixed-DNS, redirect, and private-subresource destinations; arbitrary model-facing fetches no longer delegate redirects to Crawl4AI or FlareSolverr.
+- Read-only runs can no longer persist learned skills; durable learning requires write permission and filesystem capability.
+- An unavailable inactive provider now stays scoped to its provider card and a brief status notice; the healthy active runtime no longer triggers the global failure alert.
+- Mobile layout rows now reserve the real device safe-area inset so bottom navigation, drawers, scrims, and alerts cannot cover System content.
+- Automatic memory retrieval now falls back to lexical ranking when embeddings are unavailable or return no matches.
+- Exceptional run failures are persisted as assistant context, runtime-owned tool events share stable call IDs, and the PWA displays bounded failure causes while reconciling legacy id-less tool events.
+
+### Verification
+
+- Vitest: 239 tests passed in the canonical Node 22 release gate.
+- Scoped per-file V8 coverage aggregate results: statements 94.23%, branches 85.92%, functions 95.54%, lines 96.95%.
+- Node and web production builds: passed.
+- Playwright built-web E2E: 3 flows passed: the full desktop/mobile workflow, inactive-provider failure scoping, and mobile safe-area geometry.
+- Clean tarball install, installed CLI initialization, daemon health, graceful shutdown, port cleanup, and lock cleanup: passed.
+- Package graph: valid.
+- Dependency audit: 0 moderate, high, or critical advisories; one accepted dev-only low advisory in tsup's Windows development-server dependency.
+- Live service: systemd active, local and Tailscale NUAAI HTTP 200, local and Tailscale Matrix HTTP 200, and no post-restart journal errors.
+- Live Matrix: generated operator login, private-room invite/join, `/status` response, room cleanup, and disposable device cleanup passed.
+- Live local model: NUAAI completed an authenticated API turn through llama.cpp and Nemotron 3.5 Lightning 30B with exact expected output. The currently running llama.cpp servers do not expose embeddings.
+- Codex Responses: direct endpoint probe, authenticated Sol completion, live `workspace.list`, live `workspace.write` → `workspace.read`, and the exact requested code review completed. The review used 22 paired tool calls and lexical memory retrieval. A live `run.history` follow-up returned the exact prior failure cause.
+
 ## [0.1.0] - 2026-08-15
 
 ### Added

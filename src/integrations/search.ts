@@ -1,3 +1,7 @@
+import { existsSync } from 'node:fs';
+
+import { PublicOutboundUrlPolicy } from '../security/outbound-url.js';
+
 export interface SearchResult {
   title: string;
   url: string;
@@ -23,18 +27,6 @@ function cleanHtml(value: string): string {
     .replace(/&gt;/g, '>')
     .replace(/\s+/g, ' ')
     .trim();
-}
-
-function ensureHttpUrl(value: string): URL {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error('Browser URL must be a valid http or https URL');
-  }
-  if (!['http:', 'https:'].includes(url.protocol))
-    throw new Error('Browser URL must use http or https');
-  return url;
 }
 
 async function readJson(response: Response): Promise<unknown> {
@@ -107,14 +99,15 @@ export class Crawl4AiClient {
   constructor(
     private readonly baseUrl: string,
     private readonly fetchImpl: FetchLike = fetch,
+    private readonly outboundUrlPolicy = new PublicOutboundUrlPolicy(),
   ) {}
 
   async crawl(url: string): Promise<PageResult> {
-    ensureHttpUrl(url);
+    const target = (await this.outboundUrlPolicy.assertAllowed(url)).toString();
     const response = await this.fetchImpl(new URL('/crawl', this.baseUrl), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ urls: [url], bypass_cache: true, word_count_threshold: 10 }),
+      body: JSON.stringify({ urls: [target], bypass_cache: true, word_count_threshold: 10 }),
       signal: AbortSignal.timeout(60_000),
     });
     const value = (await readJson(response)) as {
@@ -134,20 +127,84 @@ export class Crawl4AiClient {
     const result = value.results?.[0] ?? value;
     const text = result.markdown ?? result.fit_markdown ?? result.cleaned_html ?? '';
     if (!text) throw new Error('Crawl4AI returned no page text');
-    return { url: result.url ?? url, title: result.title ?? '', text };
+    const resultUrl = (await this.outboundUrlPolicy.assertAllowed(result.url ?? target)).toString();
+    return { url: resultUrl, title: result.title ?? '', text };
   }
 }
 
 export interface BrowserSession {
-  newPage(): Promise<{
+  newPage(options: { serviceWorkers: 'block' }): Promise<{
+    route(
+      pattern: string,
+      handler: (route: {
+        request(): { url(): string };
+        fetch(options: { maxRedirects: 0 }): Promise<{ status(): number }>;
+        fulfill(options: { response: { status(): number } }): Promise<void>;
+        abort(): Promise<void>;
+      }) => Promise<void>,
+    ): Promise<void>;
+    routeWebSocket(
+      pattern: string,
+      handler: (route: { close(options?: { code?: number; reason?: string }): void }) => void,
+    ): Promise<void>;
     goto(
       url: string,
       options: { waitUntil: 'domcontentloaded'; timeout: number },
     ): Promise<unknown>;
+    url(): string;
     title(): Promise<string>;
     locator(selector: string): { innerText(options: { timeout: number }): Promise<string> };
   }>;
   close(): Promise<void>;
+}
+
+interface BrowserLaunchOptions {
+  headless: true;
+  executablePath?: string;
+  channel?: 'chrome';
+}
+
+function boundedError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length <= 300 ? message : `${message.slice(0, 299)}…`;
+}
+
+export async function launchBrowserWithFallback(options: {
+  configuredExecutablePath?: string;
+  managedExecutablePath: string;
+  exists?: (path: string) => boolean;
+  launch(options: BrowserLaunchOptions): Promise<BrowserSession>;
+}): Promise<BrowserSession> {
+  const exists = options.exists ?? existsSync;
+  const failures: string[] = [];
+  const configured = options.configuredExecutablePath?.trim();
+  if (configured) {
+    if (exists(configured)) {
+      try {
+        return await options.launch({ executablePath: configured, headless: true });
+      } catch (error) {
+        failures.push(`configured executable ${configured}: ${boundedError(error)}`);
+      }
+    } else failures.push(`configured executable missing at ${configured}`);
+  }
+  if (exists(options.managedExecutablePath)) {
+    try {
+      return await options.launch({
+        executablePath: options.managedExecutablePath,
+        headless: true,
+      });
+    } catch (error) {
+      failures.push(`managed Chromium ${options.managedExecutablePath}: ${boundedError(error)}`);
+    }
+  } else failures.push(`managed Chromium missing at ${options.managedExecutablePath}`);
+  try {
+    return await options.launch({ channel: 'chrome', headless: true });
+  } catch (error) {
+    failures.push(`system Chrome: ${boundedError(error)}`);
+  }
+  throw new Error(
+    `Browser launch failed: ${failures.join('; ')}. Run \`npx playwright install chromium\` or configure a valid Chrome executable.`,
+  );
 }
 
 export class BrowserAutomationClient {
@@ -156,6 +213,7 @@ export class BrowserAutomationClient {
       launch?: () => Promise<BrowserSession>;
       timeoutMs?: number;
       maxTextBytes?: number;
+      urlPolicy?: PublicOutboundUrlPolicy;
     } = {},
   ) {}
 
@@ -164,26 +222,59 @@ export class BrowserAutomationClient {
   }
 
   async open(rawUrl: string): Promise<PageResult> {
-    const url = ensureHttpUrl(rawUrl).toString();
+    const policy = this.options.urlPolicy ?? new PublicOutboundUrlPolicy();
+    const url = (await policy.assertAllowed(rawUrl)).toString();
     const browser = await (
       this.options.launch ??
       (async () => {
         const playwrightPackage = 'playwright';
         const { chromium } = (await import(playwrightPackage)) as typeof import('playwright');
-        return chromium.launch({ headless: true });
+        return launchBrowserWithFallback({
+          ...(process.env.NUAAI_PLAYWRIGHT_EXECUTABLE_PATH?.trim()
+            ? { configuredExecutablePath: process.env.NUAAI_PLAYWRIGHT_EXECUTABLE_PATH.trim() }
+            : {}),
+          managedExecutablePath: chromium.executablePath(),
+          launch: (launchOptions) =>
+            chromium.launch(launchOptions) as unknown as Promise<BrowserSession>,
+        });
       })
     )();
     try {
-      const page = await browser.newPage();
-      await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: this.options.timeoutMs ?? 30_000,
+      const page = await browser.newPage({ serviceWorkers: 'block' });
+      let blockedNavigation: Error | undefined;
+      await page.route('**/*', async (route) => {
+        try {
+          await policy.assertAllowed(route.request().url());
+          const response = await route.fetch({ maxRedirects: 0 });
+          if (response.status() === 101 || (response.status() >= 300 && response.status() < 400))
+            throw new Error(
+              'Browser redirects are blocked; protocol upgrades are blocked by outbound policy',
+            );
+          await route.fulfill({ response });
+        } catch (error) {
+          blockedNavigation = error instanceof Error ? error : new Error(String(error));
+          await route.abort();
+        }
       });
+      await page.routeWebSocket('**/*', (route) => {
+        route.close({ code: 1008, reason: 'Blocked by NUAAI outbound policy' });
+      });
+      try {
+        await page.goto(url, {
+          waitUntil: 'domcontentloaded',
+          timeout: this.options.timeoutMs ?? 30_000,
+        });
+      } catch (error) {
+        if (blockedNavigation) throw blockedNavigation;
+        throw error;
+      }
+      if (blockedNavigation) throw blockedNavigation;
+      const finalUrl = (await policy.assertAllowed(page.url())).toString();
       const text = await page
         .locator('body')
         .innerText({ timeout: this.options.timeoutMs ?? 30_000 });
       return {
-        url,
+        url: finalUrl,
         title: await page.title(),
         text: text.slice(0, this.options.maxTextBytes ?? 1_000_000),
       };
@@ -197,6 +288,7 @@ export class FlareSolverrClient {
   constructor(
     private readonly baseUrl: string,
     private readonly fetchImpl: FetchLike = fetch,
+    private readonly outboundUrlPolicy = new PublicOutboundUrlPolicy(),
   ) {}
 
   async crawl(url: string): Promise<PageResult> {
@@ -204,11 +296,11 @@ export class FlareSolverrClient {
   }
 
   async scrape(url: string): Promise<PageResult> {
-    ensureHttpUrl(url);
+    const target = (await this.outboundUrlPolicy.assertAllowed(url)).toString();
     const response = await this.fetchImpl(new URL('/v1', this.baseUrl), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ cmd: 'request.get', url, maxTimeout: 60_000 }),
+      body: JSON.stringify({ cmd: 'request.get', url: target, maxTimeout: 60_000 }),
       signal: AbortSignal.timeout(75_000),
     });
     const value = (await readJson(response)) as {
@@ -216,48 +308,41 @@ export class FlareSolverrClient {
     };
     const solution = value.solution;
     if (!solution?.response) throw new Error('FlareSolverr returned no page response');
-    return { url: solution.url ?? url, title: solution.title ?? '', text: solution.response };
+    const resultUrl = (
+      await this.outboundUrlPolicy.assertAllowed(solution.url ?? target)
+    ).toString();
+    return { url: resultUrl, title: solution.title ?? '', text: solution.response };
   }
 }
 
 interface SearchClient {
   search(query: string, limit?: number): Promise<SearchResult[]>;
 }
-interface PageClient {
-  crawl(url: string): Promise<PageResult>;
-}
 interface BrowserClient {
   open(url: string): Promise<PageResult>;
-}
-interface FlareClient {
-  scrape(url: string): Promise<PageResult>;
 }
 
 export class SearchStack {
   private readonly searxng: SearchClient;
   private readonly duckduckgo: SearchClient;
-  private readonly crawl4ai: PageClient;
   private readonly browser?: BrowserClient;
-  private readonly flaresolverr?: FlareClient;
+  private readonly outboundUrlPolicy: PublicOutboundUrlPolicy;
 
   constructor(
     options: {
       searxng?: SearchClient;
       duckduckgo?: SearchClient;
-      crawl4ai?: PageClient;
       browser?: BrowserClient | null;
-      flaresolverr?: FlareClient | null;
+      urlPolicy?: PublicOutboundUrlPolicy;
     } = {},
   ) {
+    this.outboundUrlPolicy = options.urlPolicy ?? new PublicOutboundUrlPolicy();
     this.searxng = options.searxng ?? new SearxngSearchClient('http://127.0.0.1:40102');
     this.duckduckgo = options.duckduckgo ?? new DuckDuckGoSearchClient();
-    this.crawl4ai = options.crawl4ai ?? new Crawl4AiClient('http://127.0.0.1:40103');
     this.browser =
-      options.browser === null ? undefined : (options.browser ?? new BrowserAutomationClient());
-    this.flaresolverr =
-      options.flaresolverr === null
+      options.browser === null
         ? undefined
-        : (options.flaresolverr ?? new FlareSolverrClient('http://127.0.0.1:40104'));
+        : (options.browser ?? new BrowserAutomationClient({ urlPolicy: this.outboundUrlPolicy }));
   }
 
   async search(query: string, limit = 10): Promise<SearchResult[]> {
@@ -276,28 +361,11 @@ export class SearchStack {
 
   async open(url: string): Promise<PageResult> {
     if (!this.browser) throw new Error('Browser automation is disabled');
-    return this.browser.open(url);
+    const target = (await this.outboundUrlPolicy.assertAllowed(url)).toString();
+    return this.browser.open(target);
   }
 
   async fetch(url: string): Promise<PageResult> {
-    try {
-      return await this.crawl4ai.crawl(url);
-    } catch (firstError) {
-      try {
-        if (!this.browser) throw new Error('Browser automation is disabled');
-        return await this.browser.open(url);
-      } catch (secondError) {
-        try {
-          if (!this.flaresolverr) throw new Error('FlareSolverr is disabled');
-          return await this.flaresolverr.scrape(url);
-        } catch (thirdError) {
-          throw new Error(
-            `Page providers failed: ${[firstError, secondError, thirdError]
-              .map((error) => (error instanceof Error ? error.message : String(error)))
-              .join('; ')}`,
-          );
-        }
-      }
-    }
+    return this.open(url);
   }
 }

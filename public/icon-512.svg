@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">NUAAI</title>
+  <rect width="512" height="512" fill="#0b0d0f"/>
+  <path d="M70 378V134h64l112 142V134h64v244h-64L134 236v142H70Z" fill="#72dbb5"/>
+  <path d="M346 134h96v53h-96zM346 229h96v53h-96zM346 325h96v53h-96z" fill="#f3f0e8"/>
+</svg>

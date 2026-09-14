@@ -43,6 +43,10 @@ export function applyOnboardingAnswers(
       browser: answers.browser,
       telemetry: false,
     },
+    web: {
+      ...config.web,
+      ...(answers.tailscale ? { publicBasePath: '/nuaai' } : {}),
+    },
     matrix: { ...config.matrix, enabled: answers.matrix },
   };
 }
@@ -75,7 +79,17 @@ function runCommand(command: string, args: string[], cwd: string): Promise<numbe
   });
 }
 
-async function runLocalBootstrap(root: string): Promise<void> {
+export function localBootstrapArgs(
+  integrations: Pick<OnboardingAnswers, 'matrix' | 'search' | 'browser'>,
+): string[] {
+  return [
+    ...(integrations.matrix ? ['--matrix'] : []),
+    ...(integrations.search ? ['--search'] : []),
+    ...(integrations.browser ? ['--browser'] : []),
+  ];
+}
+
+async function runLocalBootstrap(root: string, answers: OnboardingAnswers): Promise<void> {
   const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const candidates = [
     resolve(root, 'scripts/setup-local-integrations.mjs'),
@@ -84,7 +98,11 @@ async function runLocalBootstrap(root: string): Promise<void> {
   for (const script of candidates) {
     try {
       await access(script);
-      const code = await runCommand(process.execPath, [script], root);
+      const code = await runCommand(
+        process.execPath,
+        [script, ...localBootstrapArgs(answers)],
+        root,
+      );
       if (code !== 0) throw new Error(`Local integration bootstrap exited with code ${code}`);
       return;
     } catch (error) {
@@ -94,10 +112,23 @@ async function runLocalBootstrap(root: string): Promise<void> {
   throw new Error('Local integration bootstrap script is not included in this installation');
 }
 
-async function enableTailscaleServe(synapseUrl: string): Promise<void> {
-  const port = new URL(synapseUrl).port;
-  const code = await runCommand('tailscale', ['serve', '--bg', port], process.cwd());
-  if (code !== 0) throw new Error('Tailscale Serve could not expose the local Matrix homeserver');
+export function tailscaleServeCommands(synapseUrl: string, daemonUrl: string): string[][] {
+  const synapsePort = new URL(synapseUrl).port;
+  const daemonPort = new URL(daemonUrl).port;
+  if (!synapsePort || !daemonPort)
+    throw new Error('Tailscale Serve endpoints require an explicit port');
+  return [
+    ['serve', '--bg', synapsePort],
+    ['serve', '--bg', '--set-path', '/nuaai', daemonPort],
+  ];
+}
+
+async function enableTailscaleServe(synapseUrl: string, daemonUrl: string): Promise<void> {
+  for (const args of tailscaleServeCommands(synapseUrl, daemonUrl)) {
+    const code = await runCommand('tailscale', args, process.cwd());
+    if (code !== 0)
+      throw new Error('Tailscale Serve could not expose the local Matrix and NUAAI services');
+  }
 }
 
 export async function runOnboarding(
@@ -165,10 +196,14 @@ export async function runOnboarding(
 
   let effective = next;
   if (answers.matrix || answers.search || answers.browser) {
-    await runLocalBootstrap(root);
+    await runLocalBootstrap(root, answers);
     effective = await loadRuntimeConfig(root);
   }
-  if (answers.tailscale) await enableTailscaleServe(effective.matrix.homeserverUrl);
+  if (answers.tailscale)
+    await enableTailscaleServe(
+      effective.matrix.homeserverUrl,
+      `http://127.0.0.1:${effective.port}`,
+    );
 
   output.write(`\nConfiguration saved to ${configPath}\n`);
   output.write('Telemetry: disabled\n');

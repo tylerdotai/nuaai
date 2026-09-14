@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -11,13 +11,17 @@ import {
   defaultRuntimeConfig,
   loadRuntimeConfig,
   parseRuntimeConfig,
+  persistProviderSelection,
   workspaceDirectory,
 } from '../src/config/index.js';
 import { createEvent } from '../src/core/events.js';
-import { AgentRuntime } from '../src/core/runtime.js';
+import { loadSessionIdentity } from '../src/core/identity.js';
+import { AgentRuntime, requestRequiresVerifiedTool } from '../src/core/runtime.js';
 import { Scheduler, nextCronRun } from '../src/core/scheduler.js';
+import { startDaemon } from '../src/daemon.js';
 import { acquireDaemonLock, daemonLockExists } from '../src/gateway/lock.js';
-import { ensureRuntimeIdentity } from '../src/gateway/runtime.js';
+import { createBrowserPairingToken, ensureRuntimeIdentity } from '../src/gateway/runtime.js';
+import { createToken, validateToken } from '../src/gateway/token.js';
 import { SearchStack } from '../src/integrations/search.js';
 import {
   DatabaseStore,
@@ -34,10 +38,12 @@ import { DeterministicProvider } from '../src/providers/test.js';
 import type {
   ProviderAdapter,
   ProviderHealth,
+  ProviderImage,
   ProviderRequest,
   ProviderStreamEvent,
 } from '../src/providers/types.js';
 import { decryptSecret, encryptSecret, rotateSecret } from '../src/security/encryption.js';
+import { PublicOutboundUrlPolicy } from '../src/security/outbound-url.js';
 import { type PermissionContext, assertPermission } from '../src/security/permissions.js';
 import { redactText, redactValue } from '../src/security/redaction.js';
 import { SecretsManager } from '../src/security/secrets.js';
@@ -110,17 +116,143 @@ describe('runtime configuration and security primitives', () => {
     const root = await makeRoot();
     const defaults = defaultRuntimeConfig(root);
     expect(defaults).toMatchObject({ name: 'NUAAI', version: 1, workspaceRoot: resolve(root) });
-    expect(parseRuntimeConfig({ provider: { name: 'codex' } }, root)).toMatchObject({
-      name: 'NUAAI',
-      provider: { name: 'codex', model: '' },
+    expect(defaults.permissions).toEqual({
+      web: 'operator',
+      matrix: 'operator',
+      scheduler: 'operator',
     });
+    expect(defaults.limits.runTimeoutMs).toBeGreaterThan(defaults.provider.codex.timeoutMs);
+    expect(defaults.limits.maxToolCalls).toBe(48);
+    const codexConfig = parseRuntimeConfig({ provider: { name: 'codex' } }, root);
+    expect(codexConfig).toMatchObject({
+      name: 'NUAAI',
+      provider: {
+        name: 'codex',
+        model: '',
+        codex: {
+          executable: 'codex',
+          timeoutMs: 900_000,
+        },
+      },
+    });
+    expect(codexConfig.provider.codex).not.toHaveProperty('sandboxMode');
+    expect(codexConfig.provider.codex).not.toHaveProperty('approvalPolicy');
+    expect(codexConfig.provider.codex).not.toHaveProperty('postToolQuietTimeoutMs');
     expect(
       parseRuntimeConfig({ provider: { name: 'codex', model: 'gpt-live' } }, root),
     ).toMatchObject({
       provider: { name: 'codex', model: 'gpt-live' },
     });
+    const migratedCodexConfig = parseRuntimeConfig(
+      {
+        provider: {
+          name: 'codex',
+          codex: {
+            sandboxMode: 'danger-full-access',
+            approvalPolicy: 'never',
+            postToolQuietTimeoutMs: 90_000,
+          },
+        },
+      },
+      root,
+    );
+    expect(migratedCodexConfig.provider.codex).toEqual({
+      executable: 'codex',
+      timeoutMs: 900_000,
+    });
+    expect(() =>
+      parseRuntimeConfig(
+        {
+          matrix: {
+            enabled: true,
+            homeserverUrl: 'https://matrix.example.test',
+            userId: '@nuaai:example.test',
+            accessToken: 'test-token',
+            allowedUsers: [],
+            allowedRooms: [],
+          },
+        },
+        root,
+      ),
+    ).toThrow('Matrix requires at least one allowed user or room');
     expect(workspaceDirectory(root)).toBe(join(root, '.nuaai'));
     await expect(loadRuntimeConfig(root)).resolves.toMatchObject({ name: 'NUAAI', version: 1 });
+    const previousPort = process.env.NUAAI_PORT;
+    process.env.NUAAI_PORT = '41234';
+    expect(parseRuntimeConfig({}, root).port).toBe(41234);
+    if (previousPort === undefined) process.env.NUAAI_PORT = undefined;
+    else process.env.NUAAI_PORT = previousPort;
+    const matrixEnvironment = {
+      NUAAI_MATRIX_ALLOWED_USERS: '@operator:example.org,@ops:example.org',
+      NUAAI_MATRIX_ALLOWED_ROOMS: '!room:example.org',
+      NUAAI_MATRIX_REQUIRE_MENTION: 'true',
+      NUAAI_MATRIX_MAX_MESSAGE_LENGTH: '12000',
+    };
+    const previousMatrixEnvironment = Object.fromEntries(
+      Object.keys(matrixEnvironment).map((name) => [name, process.env[name]]),
+    );
+    try {
+      Object.assign(process.env, matrixEnvironment);
+      expect(parseRuntimeConfig({}, root).matrix).toMatchObject({
+        allowedUsers: ['@operator:example.org', '@ops:example.org'],
+        allowedRooms: ['!room:example.org'],
+        requireMention: true,
+        maxMessageLength: 12_000,
+      });
+    } finally {
+      for (const [name, value] of Object.entries(previousMatrixEnvironment)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+    await expect(persistProviderSelection(root, 'ollama', 'vision-model')).resolves.toBeUndefined();
+    await expect(loadRuntimeConfig(root)).resolves.toMatchObject({
+      provider: {
+        name: 'ollama',
+        model: 'vision-model',
+        selectedModels: { ollama: 'vision-model' },
+      },
+    });
+    await expect(persistProviderSelection(root, 'codex', 'gpt-5.6-sol')).resolves.toBeUndefined();
+    await expect(loadRuntimeConfig(root)).resolves.toMatchObject({
+      provider: {
+        name: 'codex',
+        model: 'gpt-5.6-sol',
+        selectedModels: { ollama: 'vision-model', codex: 'gpt-5.6-sol' },
+      },
+    });
+    await expect(persistProviderSelection(root, '', 'model')).rejects.toThrow(
+      'Provider and model are required',
+    );
+  });
+
+  it('loads the generated Matrix environment without overriding explicit process values', async () => {
+    const root = await makeRoot();
+    const tokenName = 'NUAAI_MATRIX_ACCESS_TOKEN';
+    const userName = 'NUAAI_MATRIX_USER_ID';
+    const previousToken = process.env[tokenName];
+    const previousUser = process.env[userName];
+    try {
+      delete process.env[tokenName];
+      process.env[userName] = '@explicit:example.org';
+      await writeFile(
+        join(workspaceDirectory(root), 'matrix.env'),
+        'NUAAI_MATRIX_ACCESS_TOKEN=fixture-access-token\nNUAAI_MATRIX_USER_ID=@file:example.org\n',
+        { mode: 0o600 },
+      );
+
+      await expect(loadRuntimeConfig(root)).resolves.toMatchObject({
+        matrix: {
+          accessToken: 'fixture-access-token',
+          userId: '@explicit:example.org',
+        },
+      });
+    } finally {
+      if (previousToken === undefined) delete process.env[tokenName];
+      else process.env[tokenName] = previousToken;
+      if (previousUser === undefined) delete process.env[userName];
+      else process.env[userName] = previousUser;
+    }
   });
 
   it('encrypts, decrypts, rotates, and rejects malformed secrets', () => {
@@ -159,6 +291,40 @@ describe('runtime configuration and security primitives', () => {
     const second = ensureRuntimeIdentity(root);
     expect(first).toEqual(second);
     expect(first.token).toContain('.');
+    expect(validateToken(first.token, first.secret)).toMatchObject({ sub: 'local-client' });
+  });
+
+  it('rotates an expired runtime token while preserving the runtime secret', async () => {
+    const root = await makeRoot();
+    const first = ensureRuntimeIdentity(root);
+    const expired = createToken({ sub: 'local-client', exp: 1 }, first.secret, 2_000);
+    await writeFile(
+      join(workspaceDirectory(root), 'runtime.json'),
+      `${JSON.stringify({ secret: first.secret, token: expired }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    const refreshed = ensureRuntimeIdentity(root);
+    expect(refreshed.secret).toBe(first.secret);
+    expect(refreshed.token).not.toBe(expired);
+    expect(validateToken(refreshed.token, refreshed.secret)).toMatchObject({ sub: 'local-client' });
+  });
+
+  it('mints a five-minute browser-pairing token without replacing the runtime bearer', async () => {
+    const root = await makeRoot();
+    const runtime = ensureRuntimeIdentity(root);
+    const now = 1_800_000_000_000;
+
+    const pairing = createBrowserPairingToken(root, now);
+
+    expect(pairing).not.toBe(runtime.token);
+    expect(validateToken(pairing, runtime.secret, now)).toMatchObject({
+      sub: 'browser-pairing',
+      purpose: 'browser-pairing',
+      iat: Math.floor(now / 1_000),
+      exp: Math.floor(now / 1_000) + 300,
+    });
+    expect(ensureRuntimeIdentity(root).token).toBe(runtime.token);
   });
 
   it('prevents duplicate daemon locks and releases ownership safely', async () => {
@@ -170,17 +336,49 @@ describe('runtime configuration and security primitives', () => {
     await second.release();
   });
 
+  it('acquires exactly one daemon lock in an uninitialized workspace', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuaai-uninitialized-lock-'));
+    roots.push(root);
+    const attempts = await Promise.allSettled([acquireDaemonLock(root), acquireDaemonLock(root)]);
+    const acquired = attempts.filter(
+      (attempt): attempt is PromiseFulfilledResult<Awaited<ReturnType<typeof acquireDaemonLock>>> =>
+        attempt.status === 'fulfilled',
+    );
+    expect(acquired).toHaveLength(1);
+    expect(attempts.filter((attempt) => attempt.status === 'rejected')).toHaveLength(1);
+    await acquired[0].value.release();
+  });
+
+  it('rejects a second daemon before creating identity, config, or database state', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nuaai-second-daemon-'));
+    roots.push(root);
+    await mkdir(workspaceDirectory(root), { recursive: true });
+    const owner = await acquireDaemonLock(root);
+
+    await expect(startDaemon(root)).rejects.toThrow('Daemon already running');
+    for (const name of ['config.json', 'runtime.json', 'memory.db']) {
+      await expect(stat(join(workspaceDirectory(root), name))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    }
+    await owner.release();
+  });
+
   it('reclaims malformed and stale daemon locks without deleting another owner', async () => {
     const root = await makeRoot();
     const lockPath = join(root, '.nuaai', 'daemon.lock');
     expect(await daemonLockExists(root)).toBe(false);
 
     await writeFile(lockPath, 'not-json\n');
+    await expect(acquireDaemonLock(root)).rejects.toThrow('not readable');
+    await utimes(lockPath, new Date(0), new Date(0));
     const malformed = await acquireDaemonLock(root);
     expect(await daemonLockExists(root)).toBe(true);
     await malformed.release();
 
     await writeFile(lockPath, JSON.stringify({ pid: 0, owner: 'stale' }));
+    await expect(acquireDaemonLock(root)).rejects.toThrow('not readable');
+    await utimes(lockPath, new Date(0), new Date(0));
     const incomplete = await acquireDaemonLock(root);
     await incomplete.release();
 
@@ -199,12 +397,32 @@ describe('runtime configuration and security primitives', () => {
     await unlink(lockPath);
     expect(await daemonLockExists(root)).toBe(false);
   });
+
+  it('loads both identity files once and bounds oversized instructions', async () => {
+    const root = await makeRoot();
+    await writeFile(join(root, 'AGENTS.md'), 'workspace rules');
+    await writeFile(join(root, 'SOUL.md'), 'agent identity');
+    expect(loadSessionIdentity(root)).toContain('## AGENTS.md\nworkspace rules');
+    expect(loadSessionIdentity(root)).toContain('## SOUL.md\nagent identity');
+
+    await writeFile(join(root, 'SOUL.md'), 'x'.repeat(12_001));
+    const bounded = loadSessionIdentity(root);
+    expect(bounded).toContain('[truncated by NUAAI]');
+    expect(Buffer.byteLength(bounded, 'utf8')).toBeGreaterThan(12_000);
+  });
+
+  it('returns a truthful empty identity when workspace instruction files are absent', async () => {
+    const root = await makeRoot();
+    expect(loadSessionIdentity(root)).toBe('No AGENTS.md or SOUL.md was present at session start.');
+  });
 });
 
 describe('SQLite persistence and vector memory', () => {
   it('persists sessions, messages, runs, events, memory, secrets, and schedules', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
+    expect((await stat(workspaceDirectory(root))).mode & 0o777).toBe(0o700);
+    expect((await stat(join(workspaceDirectory(root), 'memory.db'))).mode & 0o777).toBe(0o600);
     expect(
       (
         store.database.raw
@@ -265,6 +483,20 @@ describe('SQLite persistence and vector memory', () => {
       101,
     );
     expect(store.listMessages(created.thread.id)).toEqual([message]);
+    for (let index = 0; index < 5; index += 1)
+      store.addMessage(
+        created.thread.id,
+        'user',
+        `recent-${index}`,
+        'deterministic',
+        'local-test',
+        110 + index,
+      );
+    expect(store.listMessages(created.thread.id, 3).map((entry) => entry.content)).toEqual([
+      'recent-2',
+      'recent-3',
+      'recent-4',
+    ]);
 
     const event = store.appendEvent(
       createEvent(
@@ -280,6 +512,51 @@ describe('SQLite persistence and vector memory', () => {
     expect(store.listEvents(0)[0]).toMatchObject({
       id: event.id,
       payload: { token: '[REDACTED]' },
+    });
+
+    const crowded = store.createSession('Crowded event history', 200);
+    const selected = store.createSession('Selected event history', 201);
+    for (let index = 0; index < 1_005; index += 1)
+      store.appendEvent(
+        createEvent(
+          'message.created',
+          { content: `irrelevant-${index}` },
+          {
+            sessionId: crowded.session.id,
+            threadId: crowded.thread.id,
+          },
+        ),
+      );
+    const selectedEvents = Array.from({ length: 3 }, (_, index) =>
+      store.appendEvent(
+        createEvent(
+          'message.created',
+          { content: `selected-${index}` },
+          {
+            sessionId: selected.session.id,
+            threadId: selected.thread.id,
+          },
+        ),
+      ),
+    );
+
+    const firstSelectedPage = store.listEventsForSession(selected.session.id, 0, 2);
+    expect(firstSelectedPage).toMatchObject({
+      events: selectedEvents.slice(0, 2),
+      hasMore: true,
+      nextCursor: selectedEvents[1]?.id,
+    });
+    expect(
+      store.listEventsForSession(selected.session.id, firstSelectedPage.nextCursor, 2),
+    ).toEqual({
+      events: selectedEvents.slice(2),
+      hasMore: false,
+      nextCursor: selectedEvents[2]?.id,
+    });
+    expect(store.listEventsForThread(selected.thread.id, 0, 10)).toEqual({
+      events: selectedEvents,
+      hasMore: false,
+      nextCursor: selectedEvents[2]?.id,
     });
 
     const run = store.createRun(
@@ -337,6 +614,149 @@ describe('SQLite persistence and vector memory', () => {
     expect(store.listSchedules()[0]).toMatchObject({ enabled: 0, nextRunAt: null });
     expect(() => store.updateSchedule('missing', { enabled: false })).toThrow('Unknown schedule');
   });
+
+  it('selects the newest thread run deterministically and snapshots its latest activity', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const created = store.createSession('Run snapshots', 100);
+    const first = store.createRun(
+      created.thread.id,
+      'first',
+      'deterministic',
+      'local-test',
+      'snapshot-first',
+      200,
+    );
+    const latest = store.createRun(
+      created.thread.id,
+      'latest',
+      'deterministic',
+      'local-test',
+      'snapshot-latest',
+      200,
+    );
+    expect(store.getLatestRun(created.thread.id)?.id).toBe(latest.id);
+
+    for (let index = 0; index < 4; index += 1)
+      store.appendEvent(
+        createEvent(
+          index === 0 ? 'run.started' : 'model.delta',
+          { text: `delta-${index}` },
+          {
+            sessionId: created.session.id,
+            threadId: created.thread.id,
+            runId: latest.id,
+          },
+        ),
+      );
+    store.appendEvent(
+      createEvent(
+        'run.completed',
+        { output: 'first result' },
+        {
+          sessionId: created.session.id,
+          threadId: created.thread.id,
+          runId: first.id,
+        },
+      ),
+    );
+
+    const snapshot = store.listRecentEventsForRun(latest.id, 2);
+    expect(snapshot.map((event) => event.payload.text)).toEqual(['delta-2', 'delta-3']);
+    expect(snapshot[0]?.id).toBeLessThan(snapshot[1]?.id ?? 0);
+  });
+
+  it('paginates older thread messages by a stable row cursor when timestamps tie', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const created = store.createSession('Message pages', 100);
+    for (let index = 0; index < 5; index += 1)
+      store.addMessage(created.thread.id, 'user', `message-${index}`, undefined, undefined, 200);
+
+    const newest = store.listMessagePage(created.thread.id, undefined, 2);
+    expect(newest.messages.map((message) => message.content)).toEqual(['message-3', 'message-4']);
+    expect(newest.hasMore).toBe(true);
+    const middle = store.listMessagePage(created.thread.id, newest.nextCursor, 2);
+    expect(middle.messages.map((message) => message.content)).toEqual(['message-1', 'message-2']);
+    expect(middle.hasMore).toBe(true);
+    const oldest = store.listMessagePage(created.thread.id, middle.nextCursor, 2);
+    expect(oldest.messages.map((message) => message.content)).toEqual(['message-0']);
+    expect(oldest.hasMore).toBe(false);
+  });
+
+  it('lists the running thread owner before queued follow-ups and excludes other threads', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const created = store.createSession('Thread run queue', 100);
+    const otherThread = store.createThread(created.session.id, 'Other', 101);
+    const running = store.createRun(
+      created.thread.id,
+      'running',
+      'codex',
+      'gpt-test',
+      'queue-running',
+      200,
+    );
+    store.updateRun(running.id, { status: 'running' }, 201);
+    const queued = store.createRun(
+      created.thread.id,
+      'queued',
+      'codex',
+      'gpt-test',
+      'queue-follow-up',
+      202,
+    );
+    store.createRun(otherThread.id, 'other', 'codex', 'gpt-test', 'queue-other', 203);
+
+    expect(store.listActiveRunsForThread(created.thread.id).map((run) => run.id)).toEqual([
+      running.id,
+      queued.id,
+    ]);
+  });
+
+  it('archives duplicate legacy source bindings before creating unique indexes', async () => {
+    const root = await makeRoot();
+    const databasePath = join(workspaceDirectory(root), 'memory.db');
+    const legacy = new Database(databasePath);
+    legacy.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source_key TEXT,
+        context TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        source_key TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO sessions VALUES ('older', 'Older', 'active', 'matrix:source', '', 1, 1);
+      INSERT INTO sessions VALUES ('newer', 'Newer', 'active', 'matrix:source', '', 2, 2);
+      INSERT INTO threads VALUES ('older-thread', 'older', 'Main', 'matrix:source:main', 1, 1);
+      INSERT INTO threads VALUES ('newer-thread', 'newer', 'Main', 'matrix:source:main', 2, 2);
+    `);
+    legacy.close();
+
+    const upgraded = openAppDatabase(root);
+    const sessions = upgraded.raw
+      .prepare('SELECT id, source_key AS sourceKey FROM sessions ORDER BY updated_at DESC')
+      .all() as Array<{ id: string; sourceKey: string }>;
+    const threads = upgraded.raw
+      .prepare('SELECT id, source_key AS sourceKey FROM threads ORDER BY updated_at DESC')
+      .all() as Array<{ id: string; sourceKey: string }>;
+
+    expect(sessions[0]).toEqual({ id: 'newer', sourceKey: 'matrix:source' });
+    expect(sessions[1]?.sourceKey).toMatch(/^matrix:source:history:older:legacy:/);
+    expect(threads[0]).toEqual({ id: 'newer-thread', sourceKey: 'matrix:source:main' });
+    expect(threads[1]?.sourceKey).toMatch(/^matrix:source:main:history:older-thread:legacy:/);
+    upgraded.raw.close();
+  });
 });
 
 describe('secrets manager, workspace tools, skills, and plugins', () => {
@@ -383,7 +803,7 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
   it('executes secure workspace tools and enforces permissions', async () => {
     const root = await makeRoot();
     const tools = new ToolRegistry(root);
-    expect(tools.list()).toHaveLength(5);
+    expect(tools.list()).toHaveLength(8);
     expect(tools.schemas().map((tool) => tool.name)).toContain('workspace.command');
     await tools.execute(
       'workspace.write',
@@ -419,7 +839,7 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
     await expect(
       tools.execute(
         'workspace.command',
-        { command: process.execPath, args: ['-e', 'process.stdout.write("ok")'] },
+        { command: 'printf', args: ['ok'] },
         {
           root,
           permissions: permissive,
@@ -455,9 +875,10 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
           { title: 'result', url: 'https://example.com', snippet: '', source: 'searxng' },
         ],
       },
-      crawl4ai: {
-        crawl: async () => ({ url: 'https://example.com', title: 'page', text: 'body' }),
+      browser: {
+        open: async () => ({ url: 'https://example.com', title: 'page', text: 'body' }),
       },
+      urlPolicy: new PublicOutboundUrlPolicy(async () => [{ address: '93.184.216.34', family: 4 }]),
     });
     const networkTools = new ToolRegistry(root, searchStack, { browserEnabled: false });
     const networkPermissions: PermissionContext = {
@@ -465,6 +886,7 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
       capabilities: { ...permissive.capabilities, network: true },
     };
     expect(networkTools.schemas().map((tool) => tool.name)).toContain('web.search');
+    expect(networkTools.schemas().map((tool) => tool.name)).not.toContain('web.fetch');
     expect(networkTools.schemas().map((tool) => tool.name)).not.toContain('browser.open');
     await expect(
       networkTools.execute(
@@ -479,7 +901,7 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
         { url: 'https://example.com' },
         { root, permissions: networkPermissions },
       ),
-    ).resolves.toMatchObject({ text: 'body' });
+    ).rejects.toThrow('Unknown tool');
     await expect(
       networkTools.execute(
         'web.search',
@@ -497,7 +919,9 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
         { root, permissions: permissive },
       ),
     ).rejects.toThrow('Unknown tool');
-    await expect(readWorkspaceFile(root, 'skills')).rejects.toThrow('Not a regular file');
+    await expect(readWorkspaceFile(root, '.nuaai/skills')).rejects.toThrow(
+      'Protected workspace file',
+    );
     await expect(assertSafeExistingPath(root, '../outside')).rejects.toThrow(
       'Path escapes workspace',
     );
@@ -509,9 +933,22 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
     await expect(runWorkspaceCommand('/bin/sh', [], root)).rejects.toThrow(
       'Absolute command is not allowlisted',
     );
-    await expect(
-      runWorkspaceCommand(process.execPath, ['-e', 'process.exit(3)'], root),
-    ).resolves.toMatchObject({ exitCode: 3 });
+    await expect(runWorkspaceCommand('printf "hello world"', [], root)).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: 'hello world',
+    });
+    await expect(runWorkspaceCommand('printf hello\\ world', [], root)).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: 'hello world',
+    });
+    await expect(runWorkspaceCommand('printf hi > output.txt', [], root)).rejects.toThrow(
+      'Shell operators are not supported',
+    );
+    await expect(runWorkspaceCommand('cat', ['missing-command-file'], root)).resolves.toMatchObject(
+      {
+        exitCode: 1,
+      },
+    );
     expect(await listWorkspaceFiles(root)).toContain('notes.txt');
     expect(await readWorkspaceFile(root, 'notes.txt')).toBe('hello world');
     expect(await searchWorkspace(root, 'WORLD')).toEqual([
@@ -840,6 +1277,52 @@ describe('providers and scheduler', () => {
       }))
         toolEvents.push(event);
       expect(toolEvents[0]).toMatchObject({ type: 'tool_call', name: 'workspace.list' });
+      const writeEvents: ProviderStreamEvent[] = [];
+      for await (const event of provider.stream({
+        model: 'local-test',
+        messages: [{ role: 'user', content: 'browser write smoke' }],
+      }))
+        writeEvents.push(event);
+      expect(writeEvents[0]).toMatchObject({
+        type: 'tool_call',
+        name: 'workspace.write',
+        arguments: { path: 'work-sample-output.txt', content: 'agentic-write-ok' },
+      });
+      const markdownEvents: ProviderStreamEvent[] = [];
+      for await (const event of provider.stream({
+        model: 'local-test',
+        messages: [{ role: 'user', content: 'browser markdown smoke' }],
+      }))
+        markdownEvents.push(event);
+      expect(markdownEvents).toEqual([
+        {
+          type: 'delta',
+          text: '## Verified output\n\n| Check | Result |\n| --- | --- |\n| Renderer | Passed |\n\n```ts\nconst answer = 42;\n```\n\n<script>alert("nope")</script>',
+        },
+        {
+          type: 'done',
+          text: '## Verified output\n\n| Check | Result |\n| --- | --- |\n| Renderer | Passed |\n\n```ts\nconst answer = 42;\n```\n\n<script>alert("nope")</script>',
+        },
+      ]);
+      const failedEvents: ProviderStreamEvent[] = [];
+      await expect(async () => {
+        for await (const event of provider.stream({
+          model: 'local-test',
+          messages: [{ role: 'user', content: 'browser failure smoke' }],
+        }))
+          failedEvents.push(event);
+      }).rejects.toThrow('Deterministic browser failure');
+      expect(failedEvents).toEqual([]);
+      const recoveredEvents: ProviderStreamEvent[] = [];
+      for await (const event of provider.stream({
+        model: 'local-test',
+        messages: [{ role: 'user', content: 'browser failure smoke' }],
+      }))
+        recoveredEvents.push(event);
+      expect(recoveredEvents).toEqual([
+        { type: 'delta', text: 'NUAAI deterministic test response' },
+        { type: 'done', text: 'NUAAI deterministic test response' },
+      ]);
       const controller = new AbortController();
       const slowEvents: ProviderStreamEvent[] = [];
       const slowStream = provider.stream({
@@ -865,7 +1348,9 @@ describe('providers and scheduler', () => {
       expect(registry.list()).toEqual(['codex', 'deterministic', 'ollama']);
       expect(registry.get('deterministic').name).toBe('deterministic');
       expect(await registry.health()).toHaveLength(3);
+      expect(await registry.catalog()).toMatchObject({ active: { name: 'ollama', model: 'test' } });
       expect(() => registry.get('missing')).toThrow('Unknown provider');
+      await registry.close();
       const testMode = process.env.NUAAI_TEST_MODE;
       Reflect.deleteProperty(process.env, 'NUAAI_TEST_MODE');
       try {
@@ -888,17 +1373,123 @@ describe('providers and scheduler', () => {
     }
   });
 
+  it('discovers models and switches only after health and persistence succeed', async () => {
+    const originalFetch = globalThis.fetch;
+    const persisted: Array<{ provider: string; model: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/api/tags'))
+        return responseJson({ models: [{ name: 'qwen3.5:latest' }, { name: 'qwen3.5:next' }] });
+      return responseJson({}, 404);
+    }) as typeof fetch;
+    try {
+      const registry = new ProviderRegistry({
+        root: process.cwd(),
+        providerName: 'ollama',
+        model: 'qwen3.5:latest',
+        baseUrl: 'http://ollama.local',
+        embeddingModel: 'embed',
+        timeoutMs: 5_000,
+        codexEnabled: false,
+        selectedModels: { ollama: 'qwen3.5:latest', codex: 'gpt-5.6-sol' },
+        persistSelection: async (provider, model) => {
+          persisted.push({ provider, model });
+        },
+      });
+      expect(registry.active()).toEqual({ name: 'ollama', model: 'qwen3.5:latest' });
+      expect(registry.selection('codex')).toEqual({ name: 'codex', model: 'gpt-5.6-sol' });
+      expect(await registry.switch('ollama', 'qwen3.5:next')).toEqual({
+        name: 'ollama',
+        model: 'qwen3.5:next',
+      });
+      expect(persisted).toEqual([{ provider: 'ollama', model: 'qwen3.5:next' }]);
+      await expect(registry.switch('ollama', 'missing')).rejects.toThrow('not available');
+      expect(registry.active().model).toBe('qwen3.5:next');
+
+      const fallbackRegistry = new ProviderRegistry({
+        root: process.cwd(),
+        providerName: 'codex',
+        model: '',
+        baseUrl: 'http://ollama.local',
+        embeddingModel: 'embed',
+        timeoutMs: 5_000,
+        codexEnabled: false,
+      });
+      expect(fallbackRegistry.selection('ollama')).toEqual({
+        name: 'ollama',
+        model: 'qwen3.5:latest',
+      });
+      expect(() => fallbackRegistry.selection('missing')).toThrow('Unknown provider');
+
+      const noPersistenceRegistry = new ProviderRegistry({
+        root: process.cwd(),
+        providerName: 'ollama',
+        model: 'qwen3.5:latest',
+        baseUrl: 'http://ollama.local',
+        embeddingModel: 'embed',
+        timeoutMs: 5_000,
+        codexEnabled: false,
+      });
+      await expect(noPersistenceRegistry.switch('ollama', 'qwen3.5:next')).resolves.toEqual({
+        name: 'ollama',
+        model: 'qwen3.5:next',
+      });
+
+      const codexDefaultRegistry = new ProviderRegistry({
+        root: process.cwd(),
+        providerName: 'codex',
+        model: 'gpt-default',
+        baseUrl: 'http://ollama.local',
+        embeddingModel: 'embed',
+        timeoutMs: 5_000,
+        ollamaEnabled: false,
+      });
+      expect(codexDefaultRegistry.selection('codex')).toEqual({
+        name: 'codex',
+        model: 'gpt-default',
+      });
+      await fallbackRegistry.close();
+      await noPersistenceRegistry.close();
+      await codexDefaultRegistry.close();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('rejects switching to an unavailable provider without changing the active selection', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => responseJson({}, 503)) as typeof fetch;
+    try {
+      const registry = new ProviderRegistry({
+        root: process.cwd(),
+        providerName: 'ollama',
+        model: 'model',
+        baseUrl: 'http://ollama.local',
+        embeddingModel: 'embed',
+        timeoutMs: 5_000,
+        codexEnabled: false,
+      });
+      await expect(registry.switch('ollama', 'model')).rejects.toThrow('unavailable');
+      expect(registry.active()).toEqual({ name: 'ollama', model: 'model' });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('parses Ollama streaming, modern and legacy embeddings, and health states', async () => {
     const originalFetch = globalThis.fetch;
     const calls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    let nativeRequestBody: Record<string, unknown> | undefined;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       calls.push(url);
-      if (url.endsWith('/api/chat'))
+      if (url.endsWith('/api/chat')) {
+        nativeRequestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
         return responseStream([
           JSON.stringify({ message: { content: 'Hello ' } }),
           JSON.stringify({ message: { content: 'world' }, done: true }),
         ]);
+      }
       if (url.endsWith('/api/embed')) return responseJson({ embeddings: [[1, 2, 3]] });
       if (url.endsWith('/api/tags')) return responseJson({ models: [{ name: 'test-model' }] });
       return responseJson({}, 404);
@@ -916,12 +1507,17 @@ describe('providers and scheduler', () => {
       for await (const event of provider.stream({
         model: '',
         messages: [{ role: 'user', content: 'hi' }],
+        systemPrompt: 'Follow verified policy',
       }))
         events.push(event);
       expect(events).toEqual([
         { type: 'delta', text: 'Hello ' },
         { type: 'delta', text: 'world' },
         { type: 'done', text: 'Hello world' },
+      ]);
+      expect(nativeRequestBody?.messages).toEqual([
+        { role: 'system', content: 'Follow verified policy' },
+        { role: 'user', content: 'hi' },
       ]);
       expect(await provider.embed('hi')).toEqual([1, 2, 3]);
       expect(await provider.health()).toMatchObject({ available: true, models: ['test-model'] });
@@ -953,6 +1549,181 @@ describe('providers and scheduler', () => {
       });
     } finally {
       globalThis.fetch = legacyFetch;
+    }
+  });
+
+  it('uses OpenAI-compatible local chat, tools, embeddings, and model health for v1 bases', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+    let requestBody: Record<string, unknown> | undefined;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith('/chat/completions')) {
+        requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return responseJson({
+          choices: [
+            {
+              message: {
+                content: 'Local answer',
+                tool_calls: [
+                  {
+                    id: 'openai-call-1',
+                    type: 'function',
+                    function: { name: 'workspace_list', arguments: '{"path":"."}' },
+                  },
+                ],
+              },
+            },
+          ],
+        });
+      }
+      if (url.endsWith('/embeddings')) return responseJson({ data: [{ embedding: [6, 7, 8] }] });
+      if (url.endsWith('/models')) return responseJson({ data: [{ id: 'local-model' }] });
+      return responseJson({}, 404);
+    }) as typeof fetch;
+    try {
+      const provider = new OllamaProvider(
+        {
+          baseUrl: 'http://llama.local/v1/',
+          model: 'local-model',
+          embeddingModel: 'local-embed',
+          embeddingBaseUrl: 'http://embed.local/v1/',
+        },
+        5_000,
+      );
+      const events: ProviderStreamEvent[] = [];
+      for await (const event of provider.stream({
+        model: '',
+        messages: [{ role: 'user', content: 'inspect files' }],
+        tools: [
+          {
+            name: 'workspace.list',
+            description: 'List files',
+            parameters: { type: 'object', properties: {} },
+          },
+        ],
+      }))
+        events.push(event);
+      expect(events).toEqual([
+        { type: 'delta', text: 'Local answer' },
+        {
+          type: 'tool_call',
+          id: 'openai-call-1',
+          name: 'workspace.list',
+          arguments: { path: '.' },
+        },
+        { type: 'done', text: 'Local answer' },
+      ]);
+      expect(requestBody).toMatchObject({ model: 'local-model', stream: false });
+      expect(requestBody?.tools).toEqual([
+        {
+          type: 'function',
+          function: {
+            name: 'workspace_list',
+            description: 'List files',
+            parameters: { type: 'object', properties: {} },
+          },
+        },
+      ]);
+      expect(await provider.embed('hi')).toEqual([6, 7, 8]);
+      expect(await provider.health()).toMatchObject({ available: true, models: ['local-model'] });
+      expect(calls).toEqual(
+        expect.arrayContaining([
+          'http://llama.local/v1/chat/completions',
+          'http://embed.local/v1/embeddings',
+          'http://llama.local/v1/models',
+        ]),
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('converts a sole fenced JSON request for an advertised tool into a tool call', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      responseJson({
+        choices: [
+          {
+            message: {
+              content: '```json\n{\n  "tool": "workspace.list",\n  "arguments": {}\n}\n```',
+            },
+          },
+        ],
+      })) as typeof fetch;
+    try {
+      const provider = new OllamaProvider(
+        {
+          baseUrl: 'http://llama.local/v1',
+          model: 'local-model',
+          embeddingModel: 'local-embed',
+        },
+        5_000,
+      );
+      const events: ProviderStreamEvent[] = [];
+      for await (const event of provider.stream({
+        model: '',
+        messages: [{ role: 'user', content: 'Try something' }],
+        tools: [
+          {
+            name: 'workspace.list',
+            description: 'List files',
+            parameters: { type: 'object', properties: {} },
+          },
+        ],
+      }))
+        events.push(event);
+
+      expect(events).toEqual([
+        {
+          type: 'tool_call',
+          id: expect.any(String),
+          name: 'workspace.list',
+          arguments: {},
+        },
+        { type: 'done', text: '' },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('keeps prose containing tool-call JSON as assistant text', async () => {
+    const originalFetch = globalThis.fetch;
+    const content =
+      'For example:\n```json\n{"tool":"workspace.list","arguments":{}}\n```\nUse that shape.';
+    globalThis.fetch = (async () =>
+      responseJson({ choices: [{ message: { content } }] })) as typeof fetch;
+    try {
+      const provider = new OllamaProvider(
+        {
+          baseUrl: 'http://llama.local/v1',
+          model: 'local-model',
+          embeddingModel: 'local-embed',
+        },
+        5_000,
+      );
+      const events: ProviderStreamEvent[] = [];
+      for await (const event of provider.stream({
+        model: '',
+        messages: [{ role: 'user', content: 'Show an example' }],
+        tools: [
+          {
+            name: 'workspace.list',
+            description: 'List files',
+            parameters: { type: 'object', properties: {} },
+          },
+        ],
+      }))
+        events.push(event);
+
+      expect(events).toEqual([
+        { type: 'delta', text: content },
+        { type: 'done', text: content },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 
@@ -991,8 +1762,11 @@ describe('providers and scheduler', () => {
             parameters: { type: 'object', properties: {} },
           },
         ],
+        reasoning: false,
       }))
         events.push(event);
+      expect(requestBody?.options).toEqual({ num_ctx: 262_144 });
+      expect(requestBody?.think).toBe(false);
       expect(requestBody?.tools).toEqual([
         {
           type: 'function',
@@ -1012,17 +1786,101 @@ describe('providers and scheduler', () => {
     }
   });
 
+  it('serializes image content using Ollama native vision payloads', async () => {
+    const originalFetch = globalThis.fetch;
+    let requestBody: Record<string, unknown> | undefined;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return responseStream([
+        JSON.stringify({ message: { content: 'image inspected' }, done: true }),
+      ]);
+    }) as typeof fetch;
+    try {
+      const provider = new OllamaProvider(
+        { baseUrl: 'http://ollama.local', model: 'vision-model', embeddingModel: 'embed-model' },
+        5_000,
+      );
+      for await (const _event of provider.stream({
+        model: 'vision-model',
+        messages: [
+          {
+            role: 'user',
+            content: 'What is in this image?',
+            images: [{ name: 'photo.png', mimeType: 'image/png', data: 'aGVsbG8=' }],
+          },
+        ],
+      })) {
+        // Drain the provider stream so the request completes.
+      }
+      expect(requestBody?.messages).toEqual([
+        {
+          role: 'user',
+          content: 'What is in this image?',
+          images: ['aGVsbG8='],
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('returns the final Codex message even when the CLI hangs during teardown', async () => {
+    const root = await makeRoot();
+    const executable = join(root, 'codex-hanging-fake.mjs');
+    await writeFile(
+      executable,
+      `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+if (args.includes('--version')) {
+  process.stdout.write('codex-fake 1\\n');
+  process.exit(0);
+}
+const outputIndex = args.indexOf('--output-last-message');
+if (outputIndex < 0 || !args[outputIndex + 1]) process.exit(2);
+writeFileSync(args[outputIndex + 1], 'hello world');
+setInterval(() => {}, 1_000);
+`,
+    );
+    await chmod(executable, 0o755);
+    const provider = new CodexProvider({
+      executable,
+      model: 'model',
+      workspaceRoot: root,
+      timeoutMs: 2_000,
+    });
+    const events: ProviderStreamEvent[] = [];
+
+    for await (const event of provider.stream({
+      model: 'model',
+      messages: [{ role: 'user', content: 'hello' }],
+    }))
+      events.push(event);
+
+    expect(events).toEqual([
+      { type: 'delta', text: 'hello world' },
+      { type: 'done', text: 'hello world' },
+    ]);
+  });
+
   it('executes Codex through a real subprocess boundary', async () => {
     const root = await makeRoot();
     const executable = join(root, 'codex-fake.mjs');
     const argsPath = join(root, 'codex-args.json');
+    const stdinPath = join(root, 'codex-stdin.txt');
     await writeFile(
       executable,
       `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)));
 if (process.argv.includes('--version')) process.stdout.write('codex-fake 1\\n');
-else process.stdout.write(JSON.stringify({ item: { type: 'error', message: 'non-fatal warning' } }) + '\\n' + JSON.stringify({ item: { text: 'hello' } }) + '\\n' + JSON.stringify({ item: { text: 'hello world' } }) + '\\n');
+else {
+  let input = '';
+  process.stdin.setEncoding('utf8');
+  for await (const chunk of process.stdin) input += chunk;
+  writeFileSync(${JSON.stringify(stdinPath)}, input);
+  process.stdout.write(JSON.stringify({ item: { type: 'error', message: 'non-fatal warning' } }) + '\\n' + JSON.stringify({ item: { text: 'hello' } }) + '\\n' + JSON.stringify({ item: { text: 'hello world' } }) + '\\n');
+}
 `,
     );
     await chmod(executable, 0o755);
@@ -1035,19 +1893,28 @@ else process.stdout.write(JSON.stringify({ item: { type: 'error', message: 'non-
     const events: ProviderStreamEvent[] = [];
     for await (const event of provider.stream({
       model: 'model',
-      messages: [{ role: 'user', content: 'hello' }],
+      messages: [
+        { role: 'system', content: 'private runtime catalog' },
+        { role: 'user', content: 'hello' },
+      ],
     }))
       events.push(event);
     expect(events).toEqual([
-      { type: 'delta', text: 'hello' },
-      { type: 'delta', text: ' world' },
+      { type: 'delta', text: 'hello world' },
       { type: 'done', text: 'hello world' },
     ]);
     const explicitArgs = JSON.parse(await readFile(argsPath, 'utf8')) as string[];
-    expect(explicitArgs).toContain('--json');
+    expect(explicitArgs).not.toContain('--json');
+    expect(explicitArgs).not.toContain('--ephemeral');
+    expect(explicitArgs).toContain('--output-last-message');
+    expect(explicitArgs).toContain('--ask-for-approval');
+    expect(explicitArgs).toContain('never');
+    expect(explicitArgs.indexOf('--ask-for-approval')).toBeLessThan(explicitArgs.indexOf('exec'));
     expect(explicitArgs).toContain('--model');
     expect(explicitArgs).toContain('model');
-    expect(explicitArgs).not.toContain('--ask-for-approval');
+    expect(explicitArgs.join(' ')).not.toContain('private runtime catalog');
+    expect(explicitArgs.join(' ')).not.toContain('hello');
+    expect(await readFile(stdinPath, 'utf8')).toBe('[user]\nhello');
     const defaultProvider = new CodexProvider({
       executable,
       model: '',
@@ -1297,6 +2164,79 @@ else process.stdout.write(JSON.stringify({ item: { type: 'error', message: 'non-
       status: 'failed',
       payload: { error: 'background failed' },
     });
+    const falseSuccess = new Scheduler(
+      store,
+      (type) => events.push(type),
+      async () => ({ status: 'failed', output: 'provider failed' }),
+    );
+    const falseSuccessSchedule = falseSuccess.create({
+      name: 'failed run result',
+      type: 'manual',
+      expression: '',
+      agentInput: 'report real terminal state',
+    });
+    await falseSuccess.trigger(falseSuccessSchedule.id);
+    expect(
+      store.listTasks().find((task) => task.scheduleId === falseSuccessSchedule.id),
+    ).toMatchObject({
+      status: 'failed',
+      payload: { error: 'Agent run ended with status: failed' },
+    });
+  });
+
+  it('exposes durable memory and background-task operations as model-facing tools', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = new DeterministicProvider();
+    const providers = providerMap({ ollama: provider });
+    let release!: () => void;
+    const scheduler = new Scheduler(
+      store,
+      () => undefined,
+      async () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const tools = new ToolRegistry(root, undefined, {}, { store, scheduler, providers });
+    const context = { root, permissions: permissive };
+    const stored = (await tools.execute(
+      'memory.store',
+      { content: 'Tyler prefers local-first software', metadata: { token: 'private' } },
+      context,
+    )) as { id: string; stored: boolean; hasEmbedding: boolean };
+    expect(stored).toMatchObject({ stored: true, hasEmbedding: true });
+    expect(
+      await tools.execute('memory.search', { query: 'local-first software' }, context),
+    ).toMatchObject({ mode: 'semantic', results: [expect.objectContaining({ id: stored.id })] });
+    expect(await tools.execute('memory.forget', { id: stored.id }, context)).toEqual({
+      id: stored.id,
+      deleted: true,
+    });
+    const schedule = (await tools.execute(
+      'schedule.create',
+      { name: 'manual schedule', type: 'manual', expression: '', agentInput: 'run it' },
+      context,
+    )) as { id: string };
+    expect(await tools.execute('schedule.list', {}, context)).toMatchObject({
+      schedules: [expect.objectContaining({ id: schedule.id })],
+    });
+    const task = (await tools.execute(
+      'task.create',
+      { name: 'long task', agentInput: 'background work' },
+      context,
+    )) as { id: string; status: string };
+    expect(task.status).toBe('queued');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(await tools.execute('task.cancel', { id: task.id }, context)).toEqual({
+      ok: true,
+      id: task.id,
+    });
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(store.listTasks().find((entry) => entry.id === task.id)).toMatchObject({
+      status: 'cancelled',
+    });
   });
 });
 
@@ -1349,11 +2289,17 @@ describe('agent runtime orchestration', () => {
       status: 'completed',
       output: 'NUAAI deterministic test response',
     });
-    expect(runtime.listMessages(created.thread.id).map((message) => message.role)).toEqual([
-      'user',
-      'assistant',
+    const runMessages = runtime.listMessages(created.thread.id);
+    expect(runMessages.map((message) => message.role)).toEqual(['user', 'assistant']);
+    expect(
+      runMessages.map((message) =>
+        store.listMessageArtifacts(message.id).find((artifact) => artifact.kind === 'run_link'),
+      ),
+    ).toEqual([
+      expect.objectContaining({ payload: { runId: run.id } }),
+      expect.objectContaining({ payload: { runId: run.id } }),
     ]);
-    expect(store.searchMemoryRows()).toHaveLength(1);
+    expect(store.searchMemoryRows()).toHaveLength(0);
     expect(events).toEqual(
       expect.arrayContaining([
         'session.created',
@@ -1364,8 +2310,12 @@ describe('agent runtime orchestration', () => {
         'model.delta',
         'model.completed',
         'run.completed',
-        'memory.stored',
       ]),
+    );
+    expect(events).not.toContain('memory.stored');
+    expect(runtime.capabilities().permissions).toEqual(['read']);
+    expect(runtime.capabilities().tools.map((tool) => tool.name)).not.toEqual(
+      expect.arrayContaining(['workspace.write', 'workspace.command']),
     );
     expect(runtime.status().activeRuns).toBe(0);
     await expect(runtime.waitForRun('missing')).rejects.toThrow('Unknown run');
@@ -1396,6 +2346,908 @@ describe('agent runtime orchestration', () => {
       status: 'failed',
     });
     unsubscribe();
+  });
+
+  it('projects provider-owned tool events without re-executing them in NUAAI', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let registryExecutions = 0;
+    const provider: ProviderAdapter = {
+      ...makeAgentProvider('codex', async function* () {
+        yield {
+          type: 'tool_started',
+          id: 'codex-tool-1',
+          name: 'codex.shell',
+          arguments: { command: 'pwd' },
+        };
+        yield {
+          type: 'tool_completed',
+          id: 'codex-tool-1',
+          name: 'codex.shell',
+          arguments: { command: 'pwd' },
+          result: '/workspace',
+          isError: false,
+        };
+        yield { type: 'delta', text: 'Codex completed the command.' };
+        yield { type: 'done', text: '' };
+      }),
+      ownsToolLoop: true,
+    };
+    const tools = new ToolRegistry(root);
+    const originalExecute = tools.execute.bind(tools);
+    tools.execute = (async (...args) => {
+      registryExecutions += 1;
+      return originalExecute(...args);
+    }) as typeof tools.execute;
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ codex: provider, ollama: provider }),
+      tools,
+    });
+    const created = runtime.createSession('Codex provider-owned loop');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Run pwd and report the result.',
+      provider: 'codex',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Codex completed the command.',
+    });
+    expect(registryExecutions).toBe(0);
+    expect(
+      store
+        .listEvents()
+        .filter((event) => event.runId === run.id)
+        .map((event) => event.type),
+    ).toEqual(expect.arrayContaining(['tool.started', 'tool.completed', 'run.completed']));
+  });
+
+  it('fails provider-owned runs when an action reports an error', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider: ProviderAdapter = {
+      ...makeAgentProvider('codex', async function* () {
+        yield { type: 'tool_started', id: 'failed-action', name: 'codex.shell', arguments: {} };
+        yield {
+          type: 'tool_completed',
+          id: 'failed-action',
+          name: 'codex.shell',
+          arguments: {},
+          result: 'command failed',
+          isError: true,
+        };
+        yield { type: 'done', text: 'Everything worked.' };
+      }),
+      ownsToolLoop: true,
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ codex: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Provider failure truth');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Run the action.',
+      provider: 'codex',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('action failed'),
+    });
+  });
+
+  it('serializes runs in one thread and prevents provider overlap', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const order: string[] = [];
+    const contexts = new Map<string, Array<{ role: string; content: string }>>();
+    let active = 0;
+    let maximumActive = 0;
+    const provider = makeAgentProvider('queued', async function* (request) {
+      const input = request.messages.at(-1)?.content ?? '';
+      contexts.set(
+        input,
+        request.messages.map(({ role, content }) => ({ role, content })),
+      );
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      order.push(`start:${request.messages.at(-1)?.content}`);
+      await new Promise((resolve) =>
+        setTimeout(resolve, request.messages.at(-1)?.content === 'one' ? 30 : 0),
+      );
+      order.push(`end:${request.messages.at(-1)?.content}`);
+      active -= 1;
+      yield { type: 'done', text: `done:${request.messages.at(-1)?.content}` };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ queued: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Queued runs');
+    const first = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'one',
+      provider: 'queued',
+    });
+    const second = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'two',
+      provider: 'queued',
+    });
+
+    await expect(
+      Promise.all([runtime.waitForRun(first.id), runtime.waitForRun(second.id)]),
+    ).resolves.toEqual([
+      expect.objectContaining({ status: 'completed', output: 'done:one' }),
+      expect.objectContaining({ status: 'completed', output: 'done:two' }),
+    ]);
+    expect(maximumActive).toBe(1);
+    expect(order).toEqual(['start:one', 'end:one', 'start:two', 'end:two']);
+    expect(contexts.get('one')).not.toContainEqual({ role: 'user', content: 'two' });
+    expect(contexts.get('two')).toContainEqual({ role: 'assistant', content: 'done:one' });
+    expect(
+      store
+        .listEvents()
+        .filter((event) => event.type === 'run.queued')
+        .map((event) => event.runId),
+    ).toEqual([first.id, second.id]);
+  });
+
+  it('reuses an existing source run for the same idempotency key', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let providerCalls = 0;
+    const provider = makeAgentProvider('idempotent', async function* () {
+      providerCalls += 1;
+      yield { type: 'done', text: 'once' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ idempotent: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Idempotent source');
+
+    const first = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'handle once',
+      provider: 'idempotent',
+      idempotencyKey: 'matrix:$event',
+    });
+    const duplicate = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'handle once',
+      provider: 'idempotent',
+      idempotencyKey: 'matrix:$event',
+    });
+
+    expect(duplicate.id).toBe(first.id);
+    await expect(runtime.waitForRun(first.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'once',
+    });
+    expect(providerCalls).toBe(1);
+  });
+
+  it('marks interrupted runs failed instead of replaying them after restart', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const created = store.createSession('Interrupted run');
+    const interrupted = store.createRun(
+      created.thread.id,
+      'do not repeat this action',
+      'restart-test',
+      'agent-model',
+      'interrupted-correlation',
+    );
+    store.updateRun(interrupted.id, { status: 'running' });
+    let providerCalls = 0;
+    const provider = makeAgentProvider('restart-test', async function* () {
+      providerCalls += 1;
+      yield { type: 'done', text: 'replayed' };
+    });
+
+    new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'restart-test': provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(providerCalls).toBe(0);
+    expect(store.getRun(interrupted.id)).toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('interrupted by daemon restart'),
+    });
+  });
+
+  it('marks a run timeout as failed with an explicit timeout reason', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = makeAgentProvider('slow', async function* (request) {
+      const signal = request.signal;
+      if (!signal) throw new Error('Expected a run cancellation signal');
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+      yield { type: 'done', text: 'unreachable' };
+    });
+    const config = defaultRuntimeConfig(root);
+    config.limits.runTimeoutMs = 10;
+    const runtime = new AgentRuntime({
+      root,
+      config,
+      store,
+      providers: providerMap({ slow: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Timeout truth');
+    const run = runtime.startRun({ threadId: created.thread.id, input: 'wait', provider: 'slow' });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('timed out'),
+    });
+  });
+
+  it('persists a fenced writer claim and refuses a competing owner', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const created = store.createSession('Writer claim');
+    const first = store.createRun(created.thread.id, 'one', 'test', 'model', 'corr-1');
+    const second = store.createRun(created.thread.id, 'two', 'test', 'model', 'corr-2');
+
+    expect(store.claimRunWriter(created.thread.id, first.id, 'owner-a')).toBe(true);
+    expect(store.claimRunWriter(created.thread.id, second.id, 'owner-b')).toBe(false);
+    store.releaseRunWriter(created.thread.id, first.id, 'owner-a');
+    expect(store.claimRunWriter(created.thread.id, second.id, 'owner-b')).toBe(true);
+    store.releaseRunWriter(created.thread.id, second.id, 'owner-b');
+  });
+
+  it('compacts older transcript state while keeping recent messages and summary versioning', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const created = store.createSession('Compaction');
+    for (let index = 0; index < 6; index += 1)
+      store.addMessage(created.thread.id, index % 2 ? 'assistant' : 'user', `message-${index}`);
+
+    const summary = store.compactThread(created.thread.id, 2, 500);
+    expect(summary).toMatchObject({ threadId: created.thread.id, messageCount: 4, version: 1 });
+    const context = store.listContextMessages(created.thread.id, 2);
+    expect(context[0]).toMatchObject({ role: 'system' });
+    expect(context[0]?.content).toContain('message-0');
+    expect(context.map((message) => message.content)).toEqual(
+      expect.arrayContaining(['message-4', 'message-5']),
+    );
+    expect(context.map((message) => message.content)).not.toContain('message-1');
+  });
+
+  it('exposes the same live capability manifest to provider-owned loops and prompts', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = {
+      ...makeAgentProvider('codex', async function* (request) {
+        requests.push(request);
+        yield { type: 'done', text: 'capabilities received' };
+      }),
+      ownsToolLoop: true,
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ codex: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Capability manifest');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Tell me what you can do.',
+      provider: 'codex',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'capabilities received',
+    });
+    const dynamicNames =
+      requests[0]?.dynamicTools?.map((tool) => `${tool.namespace}.${tool.name}`) ?? [];
+    expect(dynamicNames).toEqual(
+      expect.arrayContaining(['nuaai.workspace_read', 'nuaai.workspace_write']),
+    );
+    expect(requests[0]?.systemPrompt).toContain('Live capability manifest');
+    expect(requests[0]?.systemPrompt).toContain('nuaai.workspace_write');
+    expect(store.listEvents().map((event) => event.type)).toEqual(
+      expect.arrayContaining(['capabilities.assembled', 'prompt.assembled']),
+    );
+  });
+
+  it('rejects an action claim when the model emits no tool call', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = makeAgentProvider('hallucinating-action', async function* () {
+      yield { type: 'done', text: 'I found 20 repositories in your GitHub account.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'hallucinating-action': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Verified action contract');
+    const input = 'List all repositories via the GitHub CLI.';
+    expect(requestRequiresVerifiedTool(input)).toBe(true);
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input,
+      provider: 'hallucinating-action',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output:
+        'NUAAI did not verify this request because no tool was executed. I will not report model-generated claims as facts.',
+    });
+    expect(store.listMessages(created.thread.id).at(-1)?.content).toContain('did not verify');
+  });
+
+  it('does not require external evidence for capability questions', () => {
+    expect(requestRequiresVerifiedTool('What tools and browser access do you have?')).toBe(false);
+    expect(requestRequiresVerifiedTool('Tell me a joke about browsers')).toBe(false);
+    expect(requestRequiresVerifiedTool('Stress test yourself. Do not use tools.')).toBe(false);
+    expect(
+      requestRequiresVerifiedTool("What's the latest info on the UFC 330 fight tonight?"),
+    ).toBe(true);
+  });
+
+  it('keeps the allowed tool catalog stable for an ambiguous stress request', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('ambiguous-tools', async function* (request) {
+      requests.push(request);
+      yield { type: 'done', text: 'Specify a capability to test.' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'ambiguous-tools': provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Ambiguous tools');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Stress test yourself.',
+      provider: 'ambiguous-tools',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Specify a capability to test.',
+    });
+    expect(requests[0]?.tools?.length).toBeGreaterThan(0);
+    expect(requests[0]?.tools?.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(['workspace.read', 'workspace.write', 'github.repo.list']),
+    );
+    expect(requests[0]?.reasoning).toBe(true);
+  });
+
+  it('selects web tools for current-information requests', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('current-info', async function* (request) {
+      requests.push(request);
+      yield { type: 'done', text: 'No verified result.' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'current-info': provider, ollama: provider }),
+      tools: new ToolRegistry(root, new SearchStack({ browser: null })),
+    });
+    const created = runtime.createSession('Current information');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: "What's the latest info on the UFC 330 fight tonight?",
+      provider: 'current-info',
+      permissions: {
+        ...permissive,
+        capabilities: { ...permissive.capabilities, network: true },
+      },
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output:
+        'NUAAI did not verify this request because no tool was executed. I will not report model-generated claims as facts.',
+    });
+    expect(requests[0]?.tools?.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(['web.search', 'web.fetch']),
+    );
+  });
+  it('rejects an unverified no-tool claim with a truthful capability failure', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = makeAgentProvider('missing-tool-claim', async function* () {
+      yield {
+        type: 'done',
+        text: 'There is no github.repo.list tool registered, so I will run it later.',
+      };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'missing-tool-claim': provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Missing tool claim');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'List my GitHub repositories.',
+      provider: 'missing-tool-claim',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('rejected an unverified capability claim'),
+    });
+  });
+
+  it('does not reject capability language in ordinary conversation', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = makeAgentProvider('ordinary-capability-language', async function* () {
+      yield {
+        type: 'done',
+        text: "I don't have visibility into the queue or message system from this conversational reply.",
+      };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'ordinary-capability-language': provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Ordinary conversation');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Are you just making stuff up?',
+      provider: 'ordinary-capability-language',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output:
+        "I don't have visibility into the queue or message system from this conversational reply.",
+    });
+  });
+
+  it('sends the complete permission-filtered tool catalog to the provider', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('tool-selection', async function* (request) {
+      requests.push(request);
+      yield { type: 'done', text: 'I did not run a tool.' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'tool-selection': provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Tool selection');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'List my GitHub repositories.',
+      provider: 'tool-selection',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({ status: 'failed' });
+    expect(requests[0]?.tools?.map((tool) => tool.name)).toEqual([
+      'github.auth',
+      'github.repo.list',
+      'workspace.command',
+      'workspace.inspect',
+      'workspace.list',
+      'workspace.read',
+      'workspace.search',
+      'workspace.write',
+    ]);
+  });
+
+  it('rejects repeated model calls to tools outside the permission-filtered catalog', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const execute = vi.fn(async () => ({ ok: true }));
+    let requests = 0;
+    const provider = makeAgentProvider('tool-boundary', async function* () {
+      requests += 1;
+      yield {
+        type: 'tool_call',
+        id: `out-of-scope-${requests}`,
+        name: 'provider.switch',
+        arguments: { provider: 'codex', model: 'gpt-test' },
+      };
+    });
+    const tools = {
+      schemas: () => [
+        {
+          name: 'memory.forget',
+          description: 'Forget persisted memory',
+          parameters: { type: 'object' },
+        },
+        {
+          name: 'github.repo.list',
+          description: 'List GitHub repositories',
+          parameters: { type: 'object' },
+        },
+      ],
+      execute,
+    } as unknown as ToolRegistry;
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'tool-boundary': provider, ollama: provider }),
+      tools,
+    });
+    const created = runtime.createSession('Tool boundary');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Delete that memory.',
+      provider: 'tool-boundary',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('not available for this request'),
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(requests).toBe(2);
+    expect(
+      store
+        .listEvents()
+        .some((event) => event.type === 'tool.failed' && event.payload.reason === 'not_advertised'),
+    ).toBe(true);
+  });
+
+  it('coerces schema-declared numeric tool arguments from Qwen string output', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const calls: Array<Record<string, unknown>> = [];
+    let turn = 0;
+    const provider = makeAgentProvider('numeric-tool-arguments', async function* () {
+      if (turn++ === 0) {
+        yield {
+          type: 'tool_call',
+          id: 'rows-call',
+          name: 'github.repo.list',
+          arguments: { mode: 'rows', limit: '50' },
+        };
+      } else yield { type: 'done', text: 'Rows checked.' };
+    });
+    const tools = {
+      schemas: () => [
+        {
+          name: 'github.repo.list',
+          description: 'List GitHub repositories',
+          parameters: {
+            type: 'object',
+            properties: {
+              mode: { type: 'string' },
+              limit: { type: 'number' },
+            },
+          },
+        },
+      ],
+      execute: async (_name: string, input: Record<string, unknown>) => {
+        calls.push(input);
+        return { exitCode: 0, count: 50, repositories: [] };
+      },
+    } as unknown as ToolRegistry;
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'numeric-tool-arguments': provider, ollama: provider }),
+      tools,
+    });
+    const created = runtime.createSession('Numeric tool arguments');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'List my GitHub repositories.',
+      provider: 'numeric-tool-arguments',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Rows checked.',
+    });
+    expect(calls).toEqual([{ mode: 'rows', limit: 50 }]);
+  });
+
+  it('normalizes the known workspace alias while preserving the raw name in events', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    let turn = 0;
+    const provider = makeAgentProvider('tool-alias', async function* () {
+      if (turn++ === 0)
+        yield {
+          type: 'tool_call',
+          id: 'alias-call',
+          name: 'workspace',
+          arguments: { command: 'printf alias-verified' },
+        };
+      else yield { type: 'done', text: 'alias-verified' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'tool-alias': provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const unsubscribe = runtime.subscribe((event) => {
+      if (event.type === 'tool.started' || event.type === 'tool.completed')
+        events.push({ type: event.type, payload: event.payload });
+    });
+    const created = runtime.createSession('Tool alias');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Run a command and report its output.',
+      provider: 'tool-alias',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'alias-verified',
+    });
+    unsubscribe();
+    expect(events).toEqual([
+      {
+        type: 'tool.started',
+        payload: {
+          id: 'alias-call',
+          name: 'workspace.command',
+          requestedName: 'workspace',
+          arguments: { command: 'printf alias-verified' },
+        },
+      },
+      {
+        type: 'tool.completed',
+        payload: {
+          id: 'alias-call',
+          name: 'workspace.command',
+          requestedName: 'workspace',
+          result: { exitCode: 0, stdout: 'alias-verified', stderr: '' },
+          resultBytes: 52,
+          resultTruncated: false,
+        },
+      },
+    ]);
+  });
+
+  it('does not let model synthesis overwrite an authoritative repository count', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let turn = 0;
+    const provider = makeAgentProvider('count-invariant', async function* () {
+      const currentTurn = turn++;
+      if (currentTurn === 0) {
+        yield {
+          type: 'tool_call',
+          id: 'count-call',
+          name: 'github.repo.list',
+          arguments: { mode: 'count', limit: 1000 },
+        };
+      } else if (currentTurn === 1) {
+        yield {
+          type: 'tool_call',
+          id: 'rows-call',
+          name: 'github.repo.list',
+          arguments: { mode: 'rows', limit: 50 },
+        };
+      } else yield { type: 'done', text: '34' };
+    });
+    const tools = {
+      schemas: () => [
+        {
+          name: 'github.repo.list',
+          description: 'List GitHub repositories',
+          parameters: { type: 'object' },
+        },
+      ],
+      execute: async (_name: string, input: { mode: string; limit: number }) =>
+        input.mode === 'count'
+          ? { exitCode: 0, count: 152, limit: input.limit }
+          : { exitCode: 0, count: 50, repositories: [] },
+    } as unknown as ToolRegistry;
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'count-invariant': provider, ollama: provider }),
+      tools,
+    });
+    const created = runtime.createSession('Repository count invariant');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'List my GitHub repositories and report the exact verified count.',
+      provider: 'count-invariant',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: '152',
+    });
+  });
+
+  it('persists provider failure details instead of an empty failure output', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = makeAgentProvider('provider-error', async function* () {
+      yield { type: 'done', text: '' };
+      throw new Error('Ollama request timed out');
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'provider-error': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Provider failure contract');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'hello',
+      provider: 'provider-error',
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: 'NUAAI could not complete the run: Ollama request timed out',
+    });
+  });
+
+  it('passes active-run images to the provider without persisting image bytes', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('vision', async function* (request) {
+      requests.push(request);
+      yield { type: 'done', text: 'Image inspected.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ vision: provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Vision runtime');
+    const image: ProviderImage = {
+      name: 'photo.png',
+      mimeType: 'image/png',
+      data: 'aGVsbG8=',
+    };
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect this image',
+      provider: 'vision',
+      images: [image],
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Image inspected.',
+    });
+    expect(requests[0]?.messages.at(-1)).toMatchObject({
+      role: 'user',
+      content: 'inspect this image',
+      images: [image],
+    });
+    expect(
+      store
+        .listMessages(created.thread.id)
+        .every((message) => !message.content.includes('aGVsbG8=')),
+    ).toBe(true);
+  });
+
+  it('routes source keys across resumed, new, and switched sessions', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = new DeterministicProvider();
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ deterministic: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const sourceKey = 'matrix:room:@operator';
+    const first = runtime.getOrCreateSession(sourceKey, 'First');
+    runtime.getOrCreateThread(first.session.id, `${sourceKey}:main`, 'Main');
+    expect(runtime.getOrCreateSession(sourceKey, 'Ignored').session.id).toBe(first.session.id);
+    const second = runtime.startNewSession(sourceKey);
+    expect(second.session.title).toBe('New session');
+    expect(runtime.listSessionsForSource(sourceKey).map((session) => session.id)).toEqual([
+      second.session.id,
+      first.session.id,
+    ]);
+    expect(runtime.switchSession(sourceKey, first.session.id).session.id).toBe(first.session.id);
+    expect(runtime.getOrCreateThread(first.session.id, `${sourceKey}:main`, 'Main').sessionId).toBe(
+      first.session.id,
+    );
+    const third = runtime.createSession('Third');
+    expect(() => runtime.switchSession(sourceKey, third.session.id)).toThrow(
+      'does not belong to this source',
+    );
+    const other = runtime.getOrCreateSession('matrix:room:@other', 'Other');
+    expect(() => runtime.switchSession(sourceKey, other.session.id)).toThrow(
+      'does not belong to this source',
+    );
+    expect(runtime.switchSession(sourceKey, first.session.id).session.id).toBe(first.session.id);
+  });
+
+  it('reuses a Matrix-created session when the same command event is retried', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = new DeterministicProvider();
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ deterministic: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const sourceKey = 'matrix:room:@operator';
+    runtime.getOrCreateSession(sourceKey, 'First');
+
+    const created = runtime.startNewSession(sourceKey, 'Second', 'matrix:$new-command');
+    const retried = runtime.startNewSession(sourceKey, 'Changed title', 'matrix:$new-command');
+
+    expect(retried.session.id).toBe(created.session.id);
+    expect(retried.thread.id).toBe(created.thread.id);
+    expect(runtime.listSessionsForSource(sourceKey)).toHaveLength(2);
   });
 
   it('executes a real workspace tool call and records tool completion', async () => {
@@ -1431,7 +3283,7 @@ describe('agent runtime orchestration', () => {
     const created = runtime.createSession('Tool runtime');
     const run = runtime.startRun({
       threadId: created.thread.id,
-      input: 'write it',
+      input: 'write a workspace file',
       provider: 'tools',
       permissions: permissive,
     });
@@ -1441,6 +3293,171 @@ describe('agent runtime orchestration', () => {
     });
     await expect(readWorkspaceFile(root, 'tool.txt')).resolves.toBe('tool output');
     expect(events).toContain('tool.completed');
+    expect(store.listThreadArtifacts(created.thread.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'tool_calls' }),
+        expect.objectContaining({ kind: 'tool_result' }),
+      ]),
+    );
+  });
+
+  it('requires a verified final response after tool activity instead of accepting future intent', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('finalization', async function* (request) {
+      requests.push(request);
+      if (requests.length === 1) {
+        yield {
+          type: 'tool_call',
+          id: 'tool-1',
+          name: 'workspace.list',
+          arguments: {},
+        };
+        return;
+      }
+      if (requests.length === 2) {
+        yield { type: 'done', text: "I'll run a verification suite next." };
+        return;
+      }
+      yield { type: 'done', text: 'Verified the workspace results and completed the request.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ finalization: provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Finalization contract');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'verify the workspace',
+      provider: 'finalization',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Verified the workspace results and completed the request.',
+    });
+    expect(requests).toHaveLength(3);
+    expect(requests[2]?.messages.at(-1)).toMatchObject({ role: 'user' });
+    expect(requests[2]?.messages.filter((message) => message.role === 'system')).toHaveLength(1);
+    expect(requests[2]?.messages[0]).toMatchObject({ role: 'system' });
+  });
+
+  it('keeps a non-empty final response when tool activity reaches the turn limit', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let requests = 0;
+    const provider = makeAgentProvider('bounded-final', async function* () {
+      requests += 1;
+      if (requests === 1) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'workspace.list', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'The workspace inspection is complete.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...defaults,
+        limits: { ...defaults.limits, maxTurns: 2 },
+      },
+      store,
+      providers: providerMap({ 'bounded-final': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Bounded final response');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect the workspace',
+      provider: 'bounded-final',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'The workspace inspection is complete.',
+    });
+  });
+
+  it('fails with an explicit message when tool activity reaches the turn limit without final text', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = makeAgentProvider('turn-limit', async function* () {
+      yield { type: 'tool_call', id: 'tool-1', name: 'workspace.list', arguments: {} };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...defaults,
+        limits: { ...defaults.limits, maxTurns: 2 },
+      },
+      store,
+      providers: providerMap({ 'turn-limit': provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Turn limit failure');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'inspect workspace forever',
+      provider: 'turn-limit',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output:
+        'NUAAI could not verify completion: the tool-turn limit was reached before a final response.',
+    });
+  });
+
+  it('fails a run when a tool error remains unresolved instead of reporting success', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = makeAgentProvider('unresolved', async function* (request) {
+      const toolCalls = request.messages.filter((message) => message.role === 'assistant').length;
+      if (toolCalls === 0) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'missing.tool', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: "I'll deal with that later." };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ unresolved: provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Unresolved tool error');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'complete the missing tool task',
+      provider: 'unresolved',
+      permissions: permissive,
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('could not verify completion'),
+    });
   });
 
   it('preserves the assistant tool call and named tool result for the next Ollama turn', async () => {
@@ -1498,6 +3515,392 @@ describe('agent runtime orchestration', () => {
     );
   });
 
+  it('reports tool failures, enforces tool-call limits, and executes MCP tools', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let turn = 0;
+    const provider = makeAgentProvider('tools', async function* () {
+      turn += 1;
+      if (turn === 1) {
+        yield { type: 'tool_call', id: 'tool-1', name: 'missing.tool', arguments: {} };
+        return;
+      }
+      if (turn === 2) {
+        yield { type: 'tool_call', id: 'tool-2', name: 'mcp.local.echo', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'recovered from tool failure' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const events: string[] = [];
+    const mcp = {
+      schemas: () => [
+        {
+          name: 'mcp.local.echo',
+          description: 'Echo through MCP',
+          parameters: { type: 'object' },
+        },
+      ],
+      execute: async () => ({ echoed: true }),
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ tools: provider, ollama }),
+      tools: new ToolRegistry(root),
+      mcp: mcp as never,
+    });
+    runtime.subscribe((event) => events.push(event.type));
+    const created = runtime.createSession('Tool failure');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'recover from a workspace and MCP tool failure',
+      provider: 'tools',
+      permissions: permissive,
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'recovered from tool failure',
+    });
+    expect(events).toContain('tool.failed');
+    expect(
+      store
+        .listMessages(created.thread.id)
+        .some((message) => message.content.includes('not available for this request')),
+    ).toBe(true);
+
+    let mcpTurn = 0;
+    const mcpProvider = makeAgentProvider('mcp-tools', async function* () {
+      mcpTurn += 1;
+      if (mcpTurn === 1) {
+        yield { type: 'tool_call', id: 'mcp-1', name: 'mcp.local.echo', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'MCP complete' };
+    });
+    const mcpRuntime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'mcp-tools': mcpProvider, ollama }),
+      tools: new ToolRegistry(root),
+      mcp: mcp as never,
+    });
+    const mcpSession = mcpRuntime.createSession('MCP runtime');
+    const mcpRun = mcpRuntime.startRun({
+      threadId: mcpSession.thread.id,
+      input: 'use MCP',
+      provider: 'mcp-tools',
+      permissions: permissive,
+    });
+    await expect(mcpRuntime.waitForRun(mcpRun.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'MCP complete',
+    });
+
+    let limitedTurn = 0;
+    const limitedRequests: ProviderRequest[] = [];
+    const limitedProvider = makeAgentProvider('limited', async function* (request) {
+      limitedRequests.push(request);
+      limitedTurn += 1;
+      if (limitedTurn === 1) {
+        yield { type: 'tool_call', id: 'limited-1', name: 'workspace.list', arguments: {} };
+        yield { type: 'tool_call', id: 'limited-2', name: 'workspace.list', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'final answer from gathered evidence' };
+    });
+    const limitedRuntime = new AgentRuntime({
+      root,
+      config: {
+        ...defaultRuntimeConfig(root),
+        limits: { ...defaultRuntimeConfig(root).limits, maxToolCalls: 1 },
+      },
+      store,
+      providers: providerMap({ limited: limitedProvider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const limitedSession = limitedRuntime.createSession('Tool limit');
+    const limitedRun = limitedRuntime.startRun({
+      threadId: limitedSession.thread.id,
+      input: 'exceed',
+      provider: 'limited',
+      permissions: permissive,
+    });
+    await expect(limitedRuntime.waitForRun(limitedRun.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'final answer from gathered evidence',
+    });
+    expect(limitedRequests[1]?.tools).toEqual([]);
+    expect(limitedRequests[1]?.messages.at(-1)?.content).toContain('tool-call budget');
+    expect(
+      store
+        .listEvents()
+        .filter((event) => event.runId === limitedRun.id && event.type.startsWith('tool.'))
+        .map((event) => ({ type: event.type, id: event.payload.id, reason: event.payload.reason })),
+    ).toEqual([
+      { type: 'tool.started', id: 'limited-1', reason: undefined },
+      { type: 'tool.completed', id: 'limited-1', reason: undefined },
+      { type: 'tool.failed', id: 'limited-2', reason: 'tool_budget_exhausted' },
+    ]);
+  });
+
+  it('persists exceptional run failures into the next turn context', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    const failing = makeAgentProvider('failing', async function* (request) {
+      requests.push(request);
+      if (requests.length === 1) throw new Error('provider exploded');
+      yield { type: 'done', text: 'The previous failure is visible.' };
+    });
+    const ollama = makeAgentProvider('ollama', async function* () {
+      yield { type: 'done', text: '' };
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ failing, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Failure continuity');
+    const failed = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Perform a bounded task.',
+      provider: 'failing',
+    });
+    await expect(runtime.waitForRun(failed.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: 'NUAAI could not complete the run: provider exploded',
+    });
+    expect(store.listMessages(created.thread.id).at(-1)).toMatchObject({
+      role: 'assistant',
+      content: 'NUAAI could not complete the run: provider exploded',
+    });
+
+    const followUp = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'What happened?',
+      provider: 'failing',
+    });
+    await expect(runtime.waitForRun(followUp.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'The previous failure is visible.',
+    });
+    expect(requests[1]?.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: 'assistant',
+          content: 'NUAAI could not complete the run: provider exploded',
+        }),
+      ]),
+    );
+  });
+
+  it('falls back to lexical automatic memory retrieval when embeddings are unavailable', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    store.storeMemory(
+      'memory-lexical',
+      'Code reviews should cite concrete evidence from the implementation.',
+      null,
+      {},
+    );
+    const requests: ProviderRequest[] = [];
+    const provider = makeAgentProvider('recall', async function* (request) {
+      requests.push(request);
+      yield { type: 'done', text: 'Memory checked.' };
+    });
+    const ollama = makeAgentProvider(
+      'ollama',
+      async function* () {
+        yield { type: 'done', text: '' };
+      },
+      async () => {
+        throw new Error('embedding endpoint unavailable');
+      },
+    );
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ recall: provider, ollama }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Lexical recall');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'How should code reviews cite concrete evidence?',
+      provider: 'recall',
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+    });
+    expect(requests[0]?.systemPrompt).toContain(
+      'Code reviews should cite concrete evidence from the implementation.',
+    );
+    expect(
+      store
+        .listEvents()
+        .find((event) => event.runId === run.id && event.type === 'memory.retrieved')?.payload,
+    ).toMatchObject({ count: 1, mode: 'lexical' });
+  });
+
+  it('bounds long context and does not persist capability refusals after embedding failure', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const refusalProvider = makeAgentProvider(
+      'refusal',
+      async function* () {
+        yield { type: 'done', text: "I can't access the requested workspace." };
+      },
+      async () => {
+        throw 'embedding unavailable';
+      },
+    );
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...defaultRuntimeConfig(root),
+        limits: { ...defaultRuntimeConfig(root).limits, maxContextBytes: 80 },
+      },
+      store,
+      providers: providerMap({ refusal: refusalProvider, ollama: refusalProvider }),
+      tools: new ToolRegistry(root),
+      identityContext: 'bounded identity',
+    });
+    const created = runtime.createSession('Bounded context');
+    store.addMessage(created.thread.id, 'user', 'old message '.repeat(20));
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Check the latest workspace status.',
+      provider: 'refusal',
+    });
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('rejected an unverified capability claim'),
+    });
+    expect(store.searchMemoryRows()).toHaveLength(0);
+  });
+
+  it('bounds memory injection and isolates memory mutations from prior context', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const requests: ProviderRequest[] = [];
+    vi.spyOn(store, 'searchMemory').mockReturnValue([
+      {
+        id: 'memory-a',
+        content: 'A'.repeat(1000),
+        metadata: {},
+        distance: 0,
+        createdAt: 1,
+      },
+      {
+        id: 'memory-b',
+        content: 'B'.repeat(1000),
+        metadata: {},
+        distance: 0.1,
+        createdAt: 2,
+      },
+    ]);
+    const provider = makeAgentProvider('bounded-memory', async function* (request) {
+      requests.push(request);
+      yield { type: 'done', text: 'Context checked.' };
+    });
+    const defaults = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...defaults,
+        limits: { ...defaults.limits, maxContextBytes: 400, maxMemoryContextBytes: 100 },
+      },
+      store,
+      providers: providerMap({ 'bounded-memory': provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+      identityContext: 'session instructions',
+    });
+    const created = runtime.createSession('Bounded memory');
+    store.addMessage(created.thread.id, 'assistant', 'old conversation that must be bounded');
+
+    const contextualRun = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'What do you remember about this project?',
+      provider: 'bounded-memory',
+    });
+    await expect(runtime.waitForRun(contextualRun.id)).resolves.toMatchObject({
+      status: 'completed',
+    });
+    const contextualSystem = requests[0]?.messages[0]?.content ?? '';
+    const memorySection = contextualSystem.split('Relevant persisted memory:\n')[1] ?? '';
+    expect(Buffer.byteLength(memorySection, 'utf8')).toBeLessThanOrEqual(100);
+    expect(
+      requests[0]?.messages.some((message) =>
+        message.content.includes('old conversation that must be bounded'),
+      ),
+    ).toBe(true);
+
+    const mutationRun = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Delete that memory.',
+      provider: 'bounded-memory',
+    });
+    await expect(runtime.waitForRun(mutationRun.id)).resolves.toMatchObject({
+      status: 'failed',
+    });
+    const mutationSystem = requests[1]?.messages[0]?.content ?? '';
+    expect(mutationSystem).not.toContain('Relevant persisted memory:');
+    expect(
+      requests[1]?.messages.some((message) =>
+        message.content.includes('old conversation that must be bounded'),
+      ),
+    ).toBe(false);
+    expect(
+      store
+        .listEvents()
+        .some(
+          (event) =>
+            event.type === 'memory.retrieved' && event.payload.skipped === 'memory_mutation',
+        ),
+    ).toBe(true);
+  });
+
+  it('reports run timeouts as failures without calling them user cancellations', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const hanging = makeAgentProvider('hanging', async function* (request) {
+      await new Promise<void>((resolvePromise) => {
+        if (request.signal?.aborted) return resolvePromise();
+        request.signal?.addEventListener('abort', () => resolvePromise(), { once: true });
+      });
+      if (request.signal?.aborted) return;
+      yield { type: 'done', text: 'unreachable' };
+    });
+    const timeoutRuntime = new AgentRuntime({
+      root,
+      config: {
+        ...defaultRuntimeConfig(root),
+        limits: { ...defaultRuntimeConfig(root).limits, runTimeoutMs: 10 },
+      },
+      store,
+      providers: providerMap({ hanging, ollama: hanging }),
+      tools: new ToolRegistry(root),
+    });
+    const timeoutSession = timeoutRuntime.createSession('Timeout');
+    const timed = timeoutRuntime.startRun({
+      threadId: timeoutSession.thread.id,
+      input: 'wait',
+      provider: 'hanging',
+    });
+    await expect(timeoutRuntime.waitForRun(timed.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('timed out'),
+    });
+  });
+
   it('only advertises tools allowed by the run permission context', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
@@ -1529,6 +3932,84 @@ describe('agent runtime orchestration', () => {
     expect(names).toContain('workspace.read');
     expect(names).not.toContain('workspace.write');
     expect(names).not.toContain('workspace.command');
+  });
+
+  it('propagates run cancellation into provider-driven MCP calls', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let turn = 0;
+    const provider = makeAgentProvider('mcp-cancel', async function* () {
+      turn += 1;
+      if (turn === 1) {
+        yield { type: 'tool_call', id: 'mcp-cancel-1', name: 'mcp.local.wait', arguments: {} };
+        return;
+      }
+      yield { type: 'done', text: 'unreachable' };
+    });
+    let startedResolve: (() => void) | undefined;
+    const started = new Promise<void>((resolvePromise) => {
+      startedResolve = resolvePromise;
+    });
+    let abortedResolve: (() => void) | undefined;
+    const aborted = new Promise<void>((resolvePromise) => {
+      abortedResolve = resolvePromise;
+    });
+    const mcp = {
+      schemas: () => [
+        {
+          name: 'mcp.local.wait',
+          description: 'Wait until cancelled',
+          parameters: { type: 'object' },
+        },
+      ],
+      execute: async (
+        _name: string,
+        _arguments: Record<string, unknown>,
+        _permissions: unknown,
+        signal?: AbortSignal,
+      ) =>
+        new Promise<never>((_resolvePromise, reject) => {
+          startedResolve?.();
+          const timer = setTimeout(
+            () => reject(new Error('MCP cancellation probe timed out')),
+            250,
+          );
+          signal?.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              abortedResolve?.();
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+        }),
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ 'mcp-cancel': provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+      mcp: mcp as never,
+    });
+    const created = runtime.createSession('MCP cancellation');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'cancel the MCP call',
+      provider: 'mcp-cancel',
+    });
+    await started;
+
+    runtime.cancelRun(run.id);
+
+    expect(
+      await Promise.race([
+        aborted.then(() => true),
+        new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 50)),
+      ]),
+    ).toBe(true);
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({ status: 'cancelled' });
   });
 
   it('cancels a running stream and records provider failures truthfully', async () => {
@@ -1596,7 +4077,49 @@ describe('agent runtime orchestration', () => {
     await expect(runtime.waitForRun(failed.id)).resolves.toMatchObject({ status: 'failed' });
   });
 
-  it('resumes queued runs from persistence after runtime construction', async () => {
+  it('aborts active work, drains the run queue, and rejects new runs during shutdown', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    let aborted = false;
+    const provider = makeAgentProvider('shutdown', async function* (request) {
+      await new Promise<void>((resolvePromise) => {
+        if (request.signal?.aborted) return resolvePromise();
+        request.signal?.addEventListener(
+          'abort',
+          () => {
+            aborted = true;
+            resolvePromise();
+          },
+          { once: true },
+        );
+      });
+    });
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap({ shutdown: provider, ollama: provider }),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Shutdown');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'wait until shutdown',
+      provider: 'shutdown',
+    });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+
+    await runtime.shutdown();
+
+    expect(aborted).toBe(true);
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({ status: 'cancelled' });
+    expect(() => runtime.startRun({ threadId: created.thread.id, input: 'too late' })).toThrow(
+      'Runtime is shutting down',
+    );
+    await expect(runtime.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('marks persisted runs interrupted and only resumes them after an explicit request', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
     const created = store.createSession('Recovery');
@@ -1616,8 +4139,8 @@ describe('agent runtime orchestration', () => {
       tools: new ToolRegistry(root),
     });
     await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
-      status: 'completed',
-      output: 'NUAAI deterministic test response',
+      status: 'failed',
+      output: expect.stringContaining('interrupted by daemon restart'),
     });
     const failed = store.createRun(
       created.thread.id,

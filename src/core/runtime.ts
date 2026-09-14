@@ -1,12 +1,27 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import type { RuntimeConfig } from '../config/index.js';
-import type { DatabaseStore, RunRow, SessionRow, ThreadRow } from '../memory/db.js';
+import type { McpManager } from '../integrations/mcp.js';
+import type { DatabaseStore, MessageRow, RunRow, SessionRow, ThreadRow } from '../memory/db.js';
 import type { ProviderRegistry } from '../providers/registry.js';
-import type { ProviderAdapter, ProviderMessage } from '../providers/types.js';
-import type { PermissionContext } from '../security/permissions.js';
+import type {
+  ProviderAdapter,
+  ProviderDynamicTool,
+  ProviderImage,
+  ProviderMessage,
+} from '../providers/types.js';
+import { type PermissionContext, permissionContextForProfile } from '../security/permissions.js';
+import type { SkillLearner } from '../skills/learner.js';
+import type { SkillRegistry } from '../skills/registry.js';
 import type { ToolRegistry } from '../tools/registry.js';
+import {
+  buildCapabilityManifest,
+  classifyVerificationPolicy,
+  verificationRequiresEvidence,
+} from './capabilities.js';
 import { type EventRecord, createEvent } from './events.js';
+import { assembleSystemPrompt } from './prompt.js';
+import { SessionRunQueue } from './queue.js';
 
 export interface RuntimeOptions {
   root: string;
@@ -14,48 +29,225 @@ export interface RuntimeOptions {
   store: DatabaseStore;
   providers: ProviderRegistry;
   tools: ToolRegistry;
+  identityContext?: string;
+  mcp?: McpManager;
+  skills?: SkillRegistry;
+  skillLearner?: SkillLearner;
 }
 export interface RunRequest {
   threadId: string;
   input: string;
+  images?: ProviderImage[];
   provider?: string;
   model?: string;
+  idempotencyKey?: string;
   permissions?: PermissionContext;
 }
 export type RuntimeListener = (event: EventRecord & { id: number }) => void;
 
+function selectContextMessages<T extends { role: string; content: string }>(
+  messages: T[],
+  maxBytes: number,
+): T[] {
+  const selected: T[] = [];
+  let bytes = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const messageBytes = Buffer.byteLength(message.content, 'utf8') + 32;
+    if (selected.length && bytes + messageBytes > maxBytes) break;
+    selected.unshift(message);
+    bytes += messageBytes;
+  }
+  return selected;
+}
+
+function isCapabilityRefusal(value: string): boolean {
+  return (
+    /\b(?:i\s+(?:can't|cannot|do not|don't)\s+(?:access|create|send|read|run|have)|what\s+i\s+cannot|not able to|without direct access)\b/i.test(
+      value,
+    ) || /\b(?:there (?:is|are)|i have)\s+no\b.{0,80}\b(?:tool|access|shell|browser)\b/i.test(value)
+  );
+}
+
+function looksLikeFutureIntent(value: string): boolean {
+  return /\b(?:i['’]ll|i will|let me)\s+(?:run|check|inspect|verify|try|look|explore|do)\b/i.test(
+    value,
+  );
+}
+
+export function requestRequiresVerifiedTool(input: string): boolean {
+  return verificationRequiresEvidence(classifyVerificationPolicy(input));
+}
+
+type ProviderToolSchema = ReturnType<ToolRegistry['schemas']>[number];
+
+export function selectProviderTools(
+  input: string,
+  tools: ProviderToolSchema[],
+): ProviderToolSchema[] {
+  return /\b(?:do not|don't|without|no)\s+(?:use|call|run|execute)\s+(?:any\s+)?tools?\b/i.test(
+    input,
+  )
+    ? []
+    : tools;
+}
+
+function selectCodexDynamicTools(
+  tools: ToolRegistry,
+  mcp: McpManager | undefined,
+  permissions: PermissionContext,
+  root: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): ProviderDynamicTool[] {
+  const toolDefinitions =
+    typeof (tools as ToolRegistry & { list?: unknown }).list === 'function'
+      ? tools.list()
+      : tools.schemas(permissions).map((tool) => ({ ...tool, permission: 'read' as const }));
+  const localTools = toolDefinitions
+    .filter((tool) => permissions.approved.has(tool.permission))
+    .map((tool) => ({
+      namespace: 'nuaai',
+      name: tool.name.replaceAll('.', '_'),
+      description: tool.description,
+      parameters: tool.parameters,
+      execute: (input: Record<string, unknown>) =>
+        tools.execute(tool.name, input, { root, permissions, timeoutMs, signal }),
+    }));
+  const mcpTools = (mcp?.schemas(permissions) ?? []).map((tool) => ({
+    namespace: 'nuaai',
+    name: tool.name.replaceAll('.', '_'),
+    description: tool.description,
+    parameters: tool.parameters,
+    execute: (input: Record<string, unknown>) =>
+      mcp?.execute(tool.name, input, permissions, signal) ??
+      Promise.reject(new Error('MCP unavailable')),
+  }));
+  return [...localTools, ...mcpTools];
+}
+
+function normalizeNumericArguments(
+  args: Record<string, unknown>,
+  tool: ProviderToolSchema | undefined,
+): Record<string, unknown> {
+  if (!tool || typeof tool.parameters !== 'object' || tool.parameters === null) return args;
+  const properties = (tool.parameters as { properties?: Record<string, { type?: string }> })
+    .properties;
+  if (!properties) return args;
+  const normalized = { ...args };
+  for (const [name, definition] of Object.entries(properties)) {
+    const value = normalized[name];
+    if (
+      definition?.type === 'number' &&
+      typeof value === 'string' &&
+      /^-?(?:\d+\.?\d*|\.\d+)$/.test(value.trim())
+    ) {
+      const number = Number(value);
+      if (Number.isFinite(number)) normalized[name] = number;
+    }
+  }
+  return normalized;
+}
+
+function serializeBoundedToolResult(
+  result: unknown,
+  maxBytes: number,
+): { content: string; value: unknown; bytes: number; truncated: boolean } {
+  const serialized = JSON.stringify(result);
+  const bytes = Buffer.byteLength(serialized, 'utf8');
+  if (bytes <= maxBytes) return { content: serialized, value: result, bytes, truncated: false };
+  const previewBytes = Math.max(256, Math.floor(maxBytes / 2));
+  const preview = Buffer.from(serialized, 'utf8').subarray(0, previewBytes).toString('utf8');
+  const value = {
+    truncated: true,
+    originalBytes: bytes,
+    preview,
+  };
+  return {
+    content: JSON.stringify(value),
+    value,
+    bytes,
+    truncated: true,
+  };
+}
+
+function normalizeToolCall(
+  call: { id: string; name: string; arguments: Record<string, unknown> },
+  tools: ProviderToolSchema[],
+): { id: string; name: string; arguments: Record<string, unknown>; requestedName?: string } {
+  const available = new Set(tools.map((tool) => tool.name));
+  let normalized: {
+    id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+    requestedName?: string;
+  } = call;
+  if (call.name === 'workspace' && typeof call.arguments.command === 'string') {
+    if (available.has('workspace.command'))
+      normalized = { ...call, name: 'workspace.command', requestedName: call.name };
+  }
+  if (
+    (call.name === 'mcp__tools_list' || call.name === 'mcp.tools.list') &&
+    available.has('mcp.discover')
+  )
+    normalized = { id: call.id, name: 'mcp.discover', arguments: {}, requestedName: call.name };
+  if (
+    normalized.name === 'github.repo.list' &&
+    normalized.arguments.mode === 'count' &&
+    normalized.arguments.limit === undefined
+  )
+    normalized = {
+      ...normalized,
+      arguments: { ...normalized.arguments, limit: 1000 },
+    };
+  return {
+    ...normalized,
+    arguments: normalizeNumericArguments(
+      normalized.arguments,
+      tools.find((tool) => tool.name === normalized.name),
+    ),
+  };
+}
+
+function requestsExactRepositoryCount(input: string): boolean {
+  return (
+    /\b(?:exact|verified)\b.{0,80}\b(?:count|number)\b/i.test(input) ||
+    /\b(?:count|how many)\b.{0,80}\b(?:github\s+)?(?:repos?|repositories)\b/i.test(input)
+  );
+}
+
+function requestsMemoryMutation(input: string): boolean {
+  return (
+    /\b(?:delete|forget|remove|store|save|update|clear)\b.{0,60}\b(?:memory|memories|remembered)\b/i.test(
+      input,
+    ) ||
+    /\b(?:memory|memories|remembered)\b.{0,60}\b(?:delete|forget|remove|store|save|update|clear)\b/i.test(
+      input,
+    )
+  );
+}
+
 export class AgentRuntime {
   private readonly listeners = new Set<RuntimeListener>();
   private readonly controllers = new Map<string, AbortController>();
+  private readonly runQueue = new SessionRunQueue();
+  private readonly writerOwnerId = randomUUID();
+  private stopping = false;
 
   constructor(private readonly options: RuntimeOptions) {
+    this.options.store.releaseAllRunWriters();
     this.recoverActiveRuns();
   }
 
   private recoverActiveRuns(): void {
     for (const run of this.options.store.listActiveRuns()) {
-      try {
-        const provider = this.options.providers.get(run.provider);
-        this.emit(
-          'run.resumed',
-          { provider: run.provider, model: run.model, reason: 'daemon_restart' },
-          { threadId: run.threadId, runId: run.id, correlationId: run.correlationId },
-        );
-        void this.executeRun(run, provider, {
-          approved: new Set(['read']),
-          capabilities: { filesystem: true, network: true },
-        });
-      } catch (error) {
-        this.options.store.updateRun(run.id, {
-          status: 'failed',
-          output: run.output,
-        });
-        this.emit(
-          'run.failed',
-          { error: error instanceof Error ? error.message : String(error), reason: 'recovery' },
-          { threadId: run.threadId, runId: run.id, correlationId: run.correlationId },
-        );
-      }
+      const output = 'NUAAI run interrupted by daemon restart. Resume manually to continue.';
+      this.options.store.updateRun(run.id, { status: 'failed', output });
+      this.emit(
+        'run.failed',
+        { error: output, reason: 'daemon_restart' },
+        { threadId: run.threadId, runId: run.id, correlationId: run.correlationId },
+      );
     }
   }
 
@@ -85,8 +277,18 @@ export class AgentRuntime {
     for (const listener of this.listeners) listener(event);
   }
 
-  createSession(title?: string): { session: SessionRow; thread: ThreadRow } {
-    const created = this.options.store.createSession(title);
+  createSession(
+    title?: string,
+    sourceKey?: string,
+    id?: string,
+  ): { session: SessionRow; thread: ThreadRow } {
+    const created = this.options.store.createSession(
+      title,
+      Date.now(),
+      this.options.identityContext ?? '',
+      sourceKey,
+      id,
+    );
     this.emit(
       'session.created',
       { title: created.session.title },
@@ -100,8 +302,99 @@ export class AgentRuntime {
     return created;
   }
 
-  listSessions(): SessionRow[] {
-    return this.options.store.listSessions();
+  getOrCreateSession(
+    sourceKey: string,
+    title?: string,
+  ): { session: SessionRow; thread: ThreadRow } {
+    const existing = this.options.store.getSessionBySource(sourceKey);
+    if (existing) {
+      const thread = this.options.store.listThreads(existing.id)[0];
+      if (!thread) throw new Error(`Session has no thread: ${existing.id}`);
+      this.emit('session.resumed', { title: existing.title }, { sessionId: existing.id });
+      return { session: existing, thread };
+    }
+    return this.createSession(title, sourceKey);
+  }
+
+  startNewSession(
+    sourceKey: string,
+    title?: string,
+    idempotencyKey?: string,
+  ): { session: SessionRow; thread: ThreadRow } {
+    const digest = idempotencyKey
+      ? createHash('sha256').update(`${sourceKey}\0${idempotencyKey}`).digest('hex')
+      : undefined;
+    const id = digest
+      ? `${digest.slice(0, 8)}-${digest.slice(8, 12)}-${digest.slice(12, 16)}-${digest.slice(16, 20)}-${digest.slice(20, 32)}`
+      : undefined;
+    return this.options.store.transaction(() => {
+      if (id) {
+        const existing = this.options.store.getSession(id);
+        if (existing) {
+          if (!this.sessionBelongsToSource(sourceKey, existing))
+            throw new Error(`Idempotency key collision: ${idempotencyKey}`);
+          const thread = this.options.store.listThreads(existing.id)[0];
+          if (!thread) throw new Error(`Session has no thread: ${existing.id}`);
+          return { session: existing, thread };
+        }
+      }
+      const existing = this.options.store.getSessionBySource(sourceKey);
+      if (existing) this.archiveSourceBinding(sourceKey, existing);
+      return this.createSession(title ?? 'New session', sourceKey, id);
+    });
+  }
+
+  switchSession(sourceKey: string, sessionId: string): { session: SessionRow; thread: ThreadRow } {
+    const target = this.options.store.getSession(sessionId);
+    if (!target) throw new Error(`Unknown session: ${sessionId}`);
+    if (!this.sessionBelongsToSource(sourceKey, target))
+      throw new Error(`Session ${sessionId} does not belong to this source`);
+    const thread = this.options.store.listThreads(sessionId)[0];
+    if (!thread) throw new Error(`Session has no thread: ${sessionId}`);
+    this.options.store.transaction(() => {
+      const current = this.options.store.getSessionBySource(sourceKey);
+      if (current && current.id !== sessionId) this.archiveSourceBinding(sourceKey, current);
+      this.options.store.setSessionSourceKey(sessionId, sourceKey);
+      const historyPrefix = `${sourceKey}:history:${sessionId}:thread:`;
+      for (const targetThread of this.options.store.listThreads(sessionId)) {
+        if (!targetThread.sourceKey?.startsWith(historyPrefix)) continue;
+        this.options.store.setThreadSourceKey(
+          targetThread.id,
+          `${sourceKey}:${targetThread.sourceKey.slice(historyPrefix.length)}`,
+        );
+      }
+    });
+    const resumed = this.options.store.getSession(sessionId) ?? target;
+    this.emit('session.resumed', { title: resumed.title }, { sessionId: resumed.id });
+    return { session: resumed, thread };
+  }
+
+  listSessionsForSource(sourceKey: string): SessionRow[] {
+    return this.options.store
+      .listSessions()
+      .filter((session) => this.sessionBelongsToSource(sourceKey, session));
+  }
+
+  private sessionBelongsToSource(sourceKey: string, session: SessionRow): boolean {
+    return (
+      session.sourceKey === sourceKey ||
+      session.sourceKey?.startsWith(`${sourceKey}:history:`) === true
+    );
+  }
+
+  private archiveSourceBinding(sourceKey: string, session: SessionRow): void {
+    this.options.store.setSessionSourceKey(session.id, `${sourceKey}:history:${session.id}`);
+    for (const thread of this.options.store.listThreads(session.id)) {
+      if (!thread.sourceKey?.startsWith(`${sourceKey}:`)) continue;
+      this.options.store.setThreadSourceKey(
+        thread.id,
+        `${sourceKey}:history:${session.id}:thread:${thread.sourceKey.slice(sourceKey.length + 1)}`,
+      );
+    }
+  }
+
+  listSessions(includeOrphans = true): SessionRow[] {
+    return this.options.store.listSessions(includeOrphans);
   }
   getSession(id: string): SessionRow | undefined {
     return this.options.store.getSession(id);
@@ -109,23 +402,71 @@ export class AgentRuntime {
   listThreads(sessionId: string): ThreadRow[] {
     return this.options.store.listThreads(sessionId);
   }
-  createThread(sessionId: string, title?: string): ThreadRow {
-    const thread = this.options.store.createThread(sessionId, title);
+  createThread(sessionId: string, title?: string, sourceKey?: string): ThreadRow {
+    const thread = this.options.store.createThread(sessionId, title, Date.now(), sourceKey);
     this.emit('thread.created', { title: thread.title }, { sessionId, threadId: thread.id });
     return thread;
+  }
+  getOrCreateThread(sessionId: string, sourceKey: string, title?: string): ThreadRow {
+    const existing = this.options.store.getThreadBySource(sourceKey);
+    if (existing) return existing;
+    const threads = this.options.store.listThreads(sessionId);
+    if (sourceKey.endsWith(':main') && threads[0] && !threads[0].sourceKey) {
+      this.options.store.setThreadSourceKey(threads[0].id, sourceKey);
+      return this.options.store.getThread(threads[0].id) ?? threads[0];
+    }
+    return this.createThread(sessionId, title ?? 'New thread', sourceKey);
   }
   listMessages(threadId: string) {
     return this.options.store.listMessages(threadId);
   }
 
+  private addRunMessage(
+    run: RunRow,
+    role: string,
+    content: string,
+    provider?: string,
+    model?: string,
+  ): MessageRow {
+    const message = this.options.store.addMessage(run.threadId, role, content, provider, model);
+    this.options.store.storeMessageArtifact(message.id, 'run_link', { runId: run.id });
+    return message;
+  }
+
+  private activeProvider(): { name: string; model: string } {
+    const registry = this.options.providers as ProviderRegistry & {
+      active?: () => { name: string; model: string };
+    };
+    if (registry.active) return registry.active();
+    const name = this.options.config.provider.name;
+    return { name, model: registry.get(name).model };
+  }
+
   startRun(request: RunRequest): RunRow {
+    if (this.stopping) throw new Error('Runtime is shutting down');
     if (!request.input.trim()) throw new Error('Run input is required');
-    const providerName = request.provider ?? this.options.config.provider.name;
+    if (request.idempotencyKey) {
+      const existing = this.options.store.getRunByCorrelationId(request.idempotencyKey);
+      if (existing) {
+        if (existing.threadId !== request.threadId || existing.input !== request.input)
+          throw new Error(`Idempotency key collision: ${request.idempotencyKey}`);
+        return existing;
+      }
+    }
+    const active = this.activeProvider();
+    const providerName = request.provider ?? active.name;
     const provider = this.options.providers.get(providerName);
-    const model = request.model ?? provider.model;
+    const registry = this.options.providers as ProviderRegistry & {
+      selection?: (name: string) => { name: string; model: string };
+    };
+    const model =
+      request.model ??
+      (providerName === active.name
+        ? active.model
+        : (registry.selection?.(providerName).model ?? provider.model));
     const thread = this.options.store.getThread(request.threadId);
     if (!thread) throw new Error(`Unknown thread: ${request.threadId}`);
-    const correlationId = randomUUID();
+    const correlationId = request.idempotencyKey ?? randomUUID();
     const run = this.options.store.createRun(
       thread.id,
       request.input,
@@ -133,21 +474,35 @@ export class AgentRuntime {
       model,
       correlationId,
     );
-    this.options.store.addMessage(thread.id, 'user', request.input, provider.name, model);
+
     this.emit(
       'run.created',
       { input: request.input, provider: provider.name, model },
       { sessionId: thread.sessionId, threadId: thread.id, runId: run.id, correlationId },
     );
-    void this.executeRun(
+    this.emit(
+      'run.queued',
+      { provider: provider.name, model, activeRun: this.runQueue.activeRun(thread.id) },
+      { sessionId: thread.sessionId, threadId: thread.id, runId: run.id, correlationId },
+    );
+    this.enqueueRun(
       run,
       provider,
-      request.permissions ?? {
-        approved: new Set(['read']),
-        capabilities: { filesystem: true, network: true },
-      },
+      request.permissions ?? permissionContextForProfile('read-only'),
+      request.images,
     );
     return run;
+  }
+
+  private enqueueRun(
+    run: RunRow,
+    provider: ProviderAdapter,
+    permissions: PermissionContext,
+    images?: ProviderImage[],
+  ): void {
+    void this.runQueue.enqueue(run.threadId, run.id, () =>
+      this.executeRun(run, provider, permissions, images),
+    );
   }
 
   cancelRun(runId: string): void {
@@ -160,6 +515,29 @@ export class AgentRuntime {
       {},
       { threadId: run.threadId, runId, correlationId: run.correlationId },
     );
+    if (run.status === 'queued') {
+      const output = 'NUAAI run cancelled before execution.';
+      this.options.store.updateRun(runId, { status: 'cancelled', output });
+      this.emit(
+        'run.cancelled',
+        { output, reason: 'cancelled_before_execution' },
+        { threadId: run.threadId, runId, correlationId: run.correlationId },
+      );
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    if (!this.stopping) {
+      this.stopping = true;
+      for (const run of this.options.store.listActiveRuns()) {
+        if (run.status === 'queued') this.cancelRun(run.id);
+        else {
+          this.options.store.requestRunCancel(run.id);
+          this.controllers.get(run.id)?.abort(new Error('Daemon stopping'));
+        }
+      }
+    }
+    await this.runQueue.drain();
   }
 
   resumeRun(runId: string): RunRow {
@@ -195,21 +573,61 @@ export class AgentRuntime {
   async providerHealth() {
     return this.options.providers.health();
   }
-  status(): { activeRuns: number; sessions: number; providers: string[] } {
+  status(): {
+    activeRuns: number;
+    queuedRuns: number;
+    sessions: number;
+    providers: string[];
+    active: { name: string; model: string };
+    capabilities: ReturnType<AgentRuntime['capabilities']>;
+  } {
     return {
       activeRuns: this.controllers.size,
+      queuedRuns: this.runQueue.queuedRuns(),
       sessions: this.options.store.listSessions().length,
       providers: this.options.providers.list(),
+      active: this.activeProvider(),
+      capabilities: this.capabilities(),
     };
+  }
+
+  capabilities(
+    permissions: PermissionContext = permissionContextForProfile('read-only'),
+    input = '',
+  ) {
+    const active = this.activeProvider();
+    const provider = this.options.providers.get(active.name);
+    const dynamicTools = provider.ownsToolLoop
+      ? selectCodexDynamicTools(
+          this.options.tools,
+          this.options.mcp,
+          permissions,
+          this.options.root,
+          this.options.config.limits.toolTimeoutMs,
+        )
+      : [];
+    return buildCapabilityManifest({
+      provider,
+      model: active.model,
+      root: this.options.root,
+      permissions,
+      tools: this.options.tools,
+      dynamicTools,
+      verificationPolicy: classifyVerificationPolicy(input),
+    });
   }
 
   private async executeRun(
     run: RunRow,
     provider: ProviderAdapter,
     permissions: PermissionContext,
+    images?: ProviderImage[],
   ): Promise<void> {
+    const queued = this.options.store.getRun(run.id);
+    if (!queued || ['completed', 'failed', 'cancelled'].includes(queued.status)) return;
     const controller = new AbortController();
     this.controllers.set(run.id, controller);
+    let writerClaimed = false;
     const timeout = setTimeout(
       () => controller.abort(new Error('Run timed out')),
       this.options.config.limits.runTimeoutMs,
@@ -218,7 +636,11 @@ export class AgentRuntime {
       this.options.store.updateRun(run.id, { status: 'running' });
       const thread = this.options.store.getThread(run.threadId);
       if (!thread) throw new Error(`Unknown thread: ${run.threadId}`);
+      writerClaimed = this.options.store.claimRunWriter(thread.id, run.id, this.writerOwnerId);
+      if (!writerClaimed) throw new Error('Run could not claim the active transcript writer');
       const model = run.model;
+      this.options.store.compactThread(thread.id);
+      const inputMessage = this.addRunMessage(run, 'user', run.input, provider.name, model);
       this.emit(
         'run.started',
         { provider: provider.name, model },
@@ -230,15 +652,34 @@ export class AgentRuntime {
         },
       );
       let output = '';
+      let finalResponseAccepted = false;
       let toolCalls = 0;
+      let toolBudgetExhausted = false;
+      let toolBudgetNoticeAdded = false;
+      let toolActivity = false;
+      let verifiedRepositoryCount: number | null = null;
+      let finalizationRequested = false;
+      let recoveryRequested = false;
+      let rejectedCapabilityClaim = false;
+      const unresolvedToolFailures: string[] = [];
+      const repeatedInvalidCalls = new Map<string, number>();
+      const verificationPolicy = classifyVerificationPolicy(run.input);
+      const requiresLiveVerification = verificationRequiresEvidence(verificationPolicy);
+      const isolatedRequest = requiresLiveVerification || requestsMemoryMutation(run.input);
       let memoryContext = '';
-      try {
-        const embedding = await this.options.providers.get('ollama').embed(run.input);
-        const retrieved = this.options.store.searchMemory(embedding, 4);
-        memoryContext = retrieved.map((memory) => `- ${memory.content}`).join('\n');
+      if (isolatedRequest) {
         this.emit(
           'memory.retrieved',
-          { count: retrieved.length },
+          {
+            count: 0,
+            filtered: 0,
+            skipped:
+              verificationPolicy === 'memory_mutation'
+                ? 'memory_mutation'
+                : requiresLiveVerification
+                  ? 'live_verification'
+                  : 'memory_mutation',
+          },
           {
             sessionId: thread.sessionId,
             threadId: thread.id,
@@ -246,36 +687,158 @@ export class AgentRuntime {
             correlationId: run.correlationId,
           },
         );
-      } catch {
-        memoryContext = '';
+      } else {
+        let retrievalMode: 'semantic' | 'lexical' = 'semantic';
+        let retrieved: Array<{ content: string }> = [];
+        try {
+          const embedding = await this.options.providers.get('ollama').embed(run.input);
+          retrieved = this.options.store.searchMemory(embedding, 4);
+        } catch {
+          retrievalMode = 'lexical';
+          retrieved = this.options.store.searchMemoryLexical(run.input, 4);
+        }
+        if (!retrieved.length && retrievalMode === 'semantic') {
+          retrievalMode = 'lexical';
+          retrieved = this.options.store.searchMemoryLexical(run.input, 4);
+        }
+        const usableMemory = retrieved.filter((memory) => !isCapabilityRefusal(memory.content));
+        const memoryEntries = usableMemory.map((memory) => `- ${memory.content}`);
+        let memoryBytes = 0;
+        const boundedMemory: string[] = [];
+        for (const entry of memoryEntries) {
+          const separatorBytes = boundedMemory.length ? 1 : 0;
+          const remaining =
+            this.options.config.limits.maxMemoryContextBytes - memoryBytes - separatorBytes;
+          if (remaining <= 0) break;
+          const entryBytes = Buffer.byteLength(entry, 'utf8');
+          const suffix = '…';
+          const bounded =
+            entryBytes <= remaining
+              ? entry
+              : `${entry.slice(0, Math.max(0, remaining - Buffer.byteLength(suffix, 'utf8')))}${suffix}`;
+          boundedMemory.push(bounded);
+          memoryBytes += separatorBytes + Buffer.byteLength(bounded, 'utf8');
+          if (bounded !== entry) break;
+        }
+        memoryContext = boundedMemory.join('\n');
+        this.emit(
+          'memory.retrieved',
+          {
+            count: usableMemory.length,
+            filtered: retrieved.length - usableMemory.length,
+            mode: retrievalMode,
+          },
+          {
+            sessionId: thread.sessionId,
+            threadId: thread.id,
+            runId: run.id,
+            correlationId: run.correlationId,
+          },
+        );
       }
-      const availableTools = this.options.tools.schemas(permissions);
+      const availableTools = [
+        ...this.options.tools.schemas(permissions),
+        ...(this.options.mcp?.schemas(permissions) ?? []),
+      ];
+      const providerOwnsToolLoop = provider.ownsToolLoop === true;
+      const providerTools = providerOwnsToolLoop
+        ? []
+        : selectProviderTools(run.input, availableTools);
+      const providerDynamicTools = providerOwnsToolLoop
+        ? selectCodexDynamicTools(
+            this.options.tools,
+            this.options.mcp,
+            permissions,
+            this.options.root,
+            this.options.config.limits.toolTimeoutMs,
+            controller.signal,
+          )
+        : [];
+      const skillContext = isolatedRequest
+        ? 'Isolated verification mode: use only the canonical registered tool that matches the request. Do not substitute workspace.command when a dedicated tool is listed above.'
+        : (this.options.skills?.promptContext(
+            run.input,
+            30_000,
+            new Set(availableTools.map((tool) => tool.name)),
+          ) ?? 'No skills are registered.');
+      const selectedContextMessages = selectContextMessages(
+        this.options.store.listContextMessagesThrough(thread.id, inputMessage.id, 400),
+        this.options.config.limits.maxContextBytes,
+      ).filter((message) => message.role !== 'tool');
+      const contextMessages = isolatedRequest
+        ? selectedContextMessages.filter(
+            (message) => message.role === 'user' && message.content === run.input,
+          )
+        : selectedContextMessages;
+      const currentInputMessage = [...contextMessages]
+        .reverse()
+        .find((message) => message.role === 'user' && message.content === run.input);
+      const manifest = buildCapabilityManifest({
+        provider,
+        model,
+        root: this.options.root,
+        permissions,
+        tools: this.options.tools,
+        dynamicTools: providerDynamicTools,
+        verificationPolicy,
+      });
+      const prompt = assembleSystemPrompt({
+        identity: this.options.identityContext,
+        projectContext:
+          thread.sessionId &&
+          this.options.store.getSession(thread.sessionId)?.context !== this.options.identityContext
+            ? this.options.store.getSession(thread.sessionId)?.context
+            : undefined,
+        memory: memoryContext,
+        skills: skillContext,
+        manifest,
+      });
+      this.emit(
+        'capabilities.assembled',
+        {
+          provider: manifest.provider,
+          model: manifest.model,
+          ownsToolLoop: manifest.ownsToolLoop,
+          toolCount: manifest.tools.length,
+          dynamicTools: manifest.dynamicTools,
+          verificationPolicy,
+        },
+        {
+          sessionId: thread.sessionId,
+          threadId: thread.id,
+          runId: run.id,
+          correlationId: run.correlationId,
+        },
+      );
+      this.emit(
+        'prompt.assembled',
+        {
+          bytes: prompt.bytes,
+          sections: prompt.sections.map((section) => section.name),
+          provider: provider.name,
+          model,
+        },
+        {
+          sessionId: thread.sessionId,
+          threadId: thread.id,
+          runId: run.id,
+          correlationId: run.correlationId,
+        },
+      );
       const messages: ProviderMessage[] = [
         {
           role: 'system',
-          content: [
-            'You are NUAAI, a persistent local-first personal agent.',
-            `The active provider is ${provider.name} and the active model is ${model}.`,
-            'You are running an agent loop with real tools.',
-            availableTools.length
-              ? `Available tools:\n${availableTools.map((tool) => `- ${tool.name}: ${tool.description}`).join('\n')}`
-              : 'No tools are available for this run.',
-            'When a user asks for information or an action that an available tool can perform, call that tool instead of claiming the tool is unavailable.',
-            'Only tools listed above are available. Report permission errors honestly.',
-            ...(memoryContext ? [`Relevant persisted memory:\n${memoryContext}`] : []),
-          ].join('\n'),
+          content: prompt.systemPrompt,
         },
-        ...this.options.store
-          .listMessages(thread.id, 200)
-          .filter((message) => message.role !== 'tool')
-          .map((message) => ({
-            role: message.role as ProviderMessage['role'],
-            content: message.content,
-          })),
+        ...contextMessages.map((message) => ({
+          role: message.role as ProviderMessage['role'],
+          content: message.content,
+          ...(message === currentInputMessage && images?.length ? { images } : {}),
+        })),
       ];
       for (let turn = 0; turn < this.options.config.limits.maxTurns; turn += 1) {
         const current = this.options.store.getRun(run.id);
-        if (!current || current.cancelRequested || controller.signal.aborted) {
+        if (!current || current.cancelRequested) {
           this.options.store.updateRun(run.id, { status: 'cancelled', output });
           this.emit(
             'run.cancelled',
@@ -289,13 +852,17 @@ export class AgentRuntime {
           );
           return;
         }
+        if (controller.signal.aborted)
+          throw controller.signal.reason instanceof Error
+            ? controller.signal.reason
+            : new Error('Run aborted');
         const turnOutput = {
           text: '',
           calls: [] as Array<{ id: string; name: string; arguments: Record<string, unknown> }>,
         };
         this.emit(
           'model.started',
-          { turn, provider: provider.name, model },
+          { turn, provider: provider.name, model, tools: providerTools.map((tool) => tool.name) },
           {
             sessionId: thread.sessionId,
             threadId: thread.id,
@@ -303,10 +870,15 @@ export class AgentRuntime {
             correlationId: run.correlationId,
           },
         );
+        const turnProviderTools = toolBudgetExhausted ? [] : providerTools;
         for await (const event of provider.stream({
           model,
           messages,
-          tools: availableTools,
+          tools: turnProviderTools,
+          dynamicTools: providerDynamicTools,
+          systemPrompt: prompt.systemPrompt,
+          reasoning: turnProviderTools.length > 0,
+          conversationId: thread.id,
           signal: controller.signal,
         })) {
           if (event.type === 'delta') {
@@ -317,6 +889,51 @@ export class AgentRuntime {
             this.emit(
               'model.delta',
               { text: event.text, turn },
+              {
+                sessionId: thread.sessionId,
+                threadId: thread.id,
+                runId: run.id,
+                correlationId: run.correlationId,
+              },
+            );
+          } else if (event.type === 'tool_started') {
+            toolActivity = true;
+            this.emit(
+              'tool.started',
+              {
+                id: event.id,
+                name: event.name,
+                arguments: event.arguments,
+                providerOwned: true,
+              },
+              {
+                sessionId: thread.sessionId,
+                threadId: thread.id,
+                runId: run.id,
+                correlationId: run.correlationId,
+              },
+            );
+          } else if (event.type === 'tool_completed') {
+            toolActivity = true;
+            const boundedResult = serializeBoundedToolResult(
+              event.result,
+              this.options.config.limits.maxToolResultBytes,
+            );
+            if (event.isError)
+              unresolvedToolFailures.push(`${event.name}: ${boundedResult.content}`);
+            this.addRunMessage(run, 'tool', boundedResult.content);
+            this.emit(
+              'tool.completed',
+              {
+                id: event.id,
+                name: event.name,
+                arguments: event.arguments,
+                result: boundedResult.value,
+                resultBytes: boundedResult.bytes,
+                resultTruncated: boundedResult.truncated,
+                isError: event.isError,
+                providerOwned: true,
+              },
               {
                 sessionId: thread.sessionId,
                 threadId: thread.id,
@@ -336,7 +953,7 @@ export class AgentRuntime {
           }
         }
         const currentAfterStream = this.options.store.getRun(run.id);
-        if (currentAfterStream?.cancelRequested || controller.signal.aborted) {
+        if (currentAfterStream?.cancelRequested) {
           this.options.store.updateRun(run.id, { status: 'cancelled', output });
           this.emit(
             'run.cancelled',
@@ -350,6 +967,10 @@ export class AgentRuntime {
           );
           return;
         }
+        if (controller.signal.aborted)
+          throw controller.signal.reason instanceof Error
+            ? controller.signal.reason
+            : new Error('Run aborted');
         this.emit(
           'model.completed',
           { text: turnOutput.text, turn },
@@ -360,19 +981,152 @@ export class AgentRuntime {
             correlationId: run.correlationId,
           },
         );
-        if (!turnOutput.calls.length) break;
+        if (!turnOutput.calls.length) {
+          if (providerOwnsToolLoop && unresolvedToolFailures.length) {
+            output = `NUAAI could not verify completion because an action failed: ${unresolvedToolFailures.join('; ')}`;
+            this.addRunMessage(run, 'assistant', output, provider.name, model);
+            this.options.store.updateRun(run.id, { status: 'failed', output });
+            this.emit(
+              'run.failed',
+              { error: output },
+              {
+                sessionId: thread.sessionId,
+                threadId: thread.id,
+                runId: run.id,
+                correlationId: run.correlationId,
+              },
+            );
+            return;
+          }
+          if (providerOwnsToolLoop) {
+            output = turnOutput.text;
+            finalResponseAccepted = Boolean(output.trim());
+            break;
+          }
+          if (unresolvedToolFailures.length) {
+            if (!recoveryRequested) {
+              recoveryRequested = true;
+              messages.push({
+                role: 'user',
+                content:
+                  'A previous tool call failed and remains unresolved. Retry the failed action with corrected arguments, or state plainly that the requested action could not be completed. Do not claim success and do not describe future work without performing it.',
+              });
+              continue;
+            }
+            output = `NUAAI could not verify completion because a tool failed: ${unresolvedToolFailures.join('; ')}`;
+            this.addRunMessage(run, 'assistant', output, provider.name, model);
+            this.options.store.updateRun(run.id, { status: 'failed', output });
+            this.emit(
+              'run.failed',
+              { error: output },
+              {
+                sessionId: thread.sessionId,
+                threadId: thread.id,
+                runId: run.id,
+                correlationId: run.correlationId,
+              },
+            );
+            return;
+          }
+          if (
+            toolActivity &&
+            !finalizationRequested &&
+            (!turnOutput.text.trim() || looksLikeFutureIntent(turnOutput.text))
+          ) {
+            output = '';
+            finalizationRequested = true;
+            messages.push({
+              role: 'user',
+              content:
+                'Tool execution has ended. Provide the final answer now using only verified tool results. Do not describe future work, promise to run another action, or claim success without evidence. If the request was not completed, say so plainly.',
+            });
+            continue;
+          }
+          output = turnOutput.text;
+          if (
+            verificationRequiresEvidence(verificationPolicy) &&
+            !toolActivity &&
+            isCapabilityRefusal(output) &&
+            availableTools.length
+          ) {
+            rejectedCapabilityClaim = true;
+            output = `NUAAI rejected an unverified capability claim. Registered tools for this run: ${availableTools.map((tool) => tool.name).join(', ')}. No tool was executed, so the model's statement about missing access is not evidence.`;
+            finalResponseAccepted = false;
+          } else if (verifiedRepositoryCount !== null && requestsExactRepositoryCount(run.input)) {
+            output = String(verifiedRepositoryCount);
+            finalResponseAccepted = true;
+          } else finalResponseAccepted = Boolean(output.trim()) && !looksLikeFutureIntent(output);
+          break;
+        }
+        const normalizedCalls = turnOutput.calls.map((call) =>
+          normalizeToolCall(call, providerTools),
+        );
         messages.push({
           role: 'assistant',
           content: turnOutput.text,
-          toolCalls: turnOutput.calls,
+          toolCalls: normalizedCalls,
         });
-        for (const call of turnOutput.calls) {
+        const assistantToolMessage = this.addRunMessage(
+          run,
+          'assistant',
+          turnOutput.text,
+          provider.name,
+          model,
+        );
+        this.options.store.storeMessageArtifact(assistantToolMessage.id, 'tool_calls', {
+          calls: normalizedCalls,
+        });
+        for (const [index, call] of turnOutput.calls.entries()) {
+          const normalizedCall = normalizedCalls[index];
+          toolActivity = true;
+          if (toolCalls >= this.options.config.limits.maxToolCalls) {
+            toolBudgetExhausted = true;
+            const message =
+              'The run tool-call budget is exhausted. No action was executed for this call.';
+            const toolContent = JSON.stringify({ error: message });
+            const toolMessage = this.addRunMessage(run, 'tool', toolContent);
+            this.options.store.storeMessageArtifact(toolMessage.id, 'tool_result', {
+              callId: call.id,
+              name: normalizedCall.name,
+              result: { error: message },
+            });
+            messages.push({
+              role: 'tool',
+              content: toolContent,
+              toolCallId: call.id,
+              toolName: normalizedCall.name,
+            });
+            this.emit(
+              'tool.failed',
+              {
+                id: call.id,
+                name: normalizedCall.name,
+                ...(normalizedCall.requestedName
+                  ? { requestedName: normalizedCall.requestedName }
+                  : {}),
+                error: message,
+                reason: 'tool_budget_exhausted',
+              },
+              {
+                sessionId: thread.sessionId,
+                threadId: thread.id,
+                runId: run.id,
+                correlationId: run.correlationId,
+              },
+            );
+            continue;
+          }
           toolCalls += 1;
-          if (toolCalls > this.options.config.limits.maxToolCalls)
-            throw new Error('Run tool-call limit exceeded');
           this.emit(
             'tool.started',
-            { name: call.name, arguments: call.arguments },
+            {
+              id: call.id,
+              name: normalizedCall.name,
+              ...(normalizedCall.requestedName
+                ? { requestedName: normalizedCall.requestedName }
+                : {}),
+              arguments: normalizedCall.arguments,
+            },
             {
               sessionId: thread.sessionId,
               threadId: thread.id,
@@ -381,22 +1135,116 @@ export class AgentRuntime {
             },
           );
           try {
-            const result = await this.options.tools.execute(call.name, call.arguments, {
-              root: this.options.root,
-              permissions,
-              timeoutMs: this.options.config.limits.toolTimeoutMs,
+            if (!providerTools.some((tool) => tool.name === normalizedCall.name)) {
+              const signature = `${normalizedCall.name}:${JSON.stringify(normalizedCall.arguments)}`;
+              const attempts = (repeatedInvalidCalls.get(signature) ?? 0) + 1;
+              repeatedInvalidCalls.set(signature, attempts);
+              const message = `Tool ${normalizedCall.name} is not available for this request.`;
+              unresolvedToolFailures.push(`${normalizedCall.name}: ${message}`);
+              const toolContent = JSON.stringify({ error: message });
+              const toolMessage = this.addRunMessage(run, 'tool', toolContent);
+              this.options.store.storeMessageArtifact(toolMessage.id, 'tool_result', {
+                callId: call.id,
+                name: normalizedCall.name,
+                result: { error: message },
+              });
+              messages.push({
+                role: 'tool',
+                content: toolContent,
+                toolCallId: call.id,
+                toolName: normalizedCall.name,
+              });
+              this.emit(
+                'tool.failed',
+                {
+                  id: call.id,
+                  name: normalizedCall.name,
+                  ...(normalizedCall.requestedName
+                    ? { requestedName: normalizedCall.requestedName }
+                    : {}),
+                  error: message,
+                  reason: 'not_advertised',
+                },
+                {
+                  sessionId: thread.sessionId,
+                  threadId: thread.id,
+                  runId: run.id,
+                  correlationId: run.correlationId,
+                },
+              );
+              if (attempts >= 2) {
+                output = `NUAAI could not verify completion: ${message} Model repeated the same unavailable tool call.`;
+                this.addRunMessage(run, 'assistant', output, provider.name, model);
+                this.options.store.updateRun(run.id, { status: 'failed', output });
+                this.emit(
+                  'run.failed',
+                  { error: output },
+                  {
+                    sessionId: thread.sessionId,
+                    threadId: thread.id,
+                    runId: run.id,
+                    correlationId: run.correlationId,
+                  },
+                );
+                return;
+              }
+              continue;
+            }
+            const result = normalizedCall.name.startsWith('mcp.')
+              ? await this.options.mcp?.execute(
+                  normalizedCall.name,
+                  normalizedCall.arguments,
+                  permissions,
+                  controller.signal,
+                )
+              : await this.options.tools.execute(normalizedCall.name, normalizedCall.arguments, {
+                  root: this.options.root,
+                  permissions,
+                  timeoutMs: this.options.config.limits.toolTimeoutMs,
+                  signal: controller.signal,
+                  threadId: thread.id,
+                  runId: run.id,
+                });
+            if (
+              normalizedCall.name === 'github.repo.list' &&
+              normalizedCall.arguments.mode === 'count' &&
+              typeof result === 'object' &&
+              result !== null &&
+              'count' in result &&
+              typeof result.count === 'number'
+            )
+              verifiedRepositoryCount = result.count;
+            const boundedResult = serializeBoundedToolResult(
+              result,
+              this.options.config.limits.maxToolResultBytes,
+            );
+            const toolContent = boundedResult.content;
+            if (unresolvedToolFailures.length) unresolvedToolFailures.shift();
+            const toolMessage = this.addRunMessage(run, 'tool', toolContent);
+            this.options.store.storeMessageArtifact(toolMessage.id, 'tool_result', {
+              callId: call.id,
+              name: normalizedCall.name,
+              result: boundedResult.value,
+              resultTruncated: boundedResult.truncated,
             });
-            const toolContent = JSON.stringify(result);
-            this.options.store.addMessage(thread.id, 'tool', toolContent);
             messages.push({
               role: 'tool',
               content: toolContent,
               toolCallId: call.id,
-              toolName: call.name,
+              toolName: normalizedCall.name,
             });
             this.emit(
               'tool.completed',
-              { name: call.name, result },
+              {
+                id: call.id,
+                name: normalizedCall.name,
+                ...(normalizedCall.requestedName
+                  ? { requestedName: normalizedCall.requestedName }
+                  : {}),
+                result: boundedResult.value,
+                resultBytes: boundedResult.bytes,
+                resultTruncated: boundedResult.truncated,
+              },
               {
                 sessionId: thread.sessionId,
                 threadId: thread.id,
@@ -404,19 +1252,48 @@ export class AgentRuntime {
                 correlationId: run.correlationId,
               },
             );
+            if (verifiedRepositoryCount !== null && requestsExactRepositoryCount(run.input)) {
+              output = String(verifiedRepositoryCount);
+              this.addRunMessage(run, 'assistant', output, provider.name, model);
+              this.options.store.updateRun(run.id, { status: 'completed', output });
+              this.emit(
+                'run.completed',
+                { output },
+                {
+                  sessionId: thread.sessionId,
+                  threadId: thread.id,
+                  runId: run.id,
+                  correlationId: run.correlationId,
+                },
+              );
+              return;
+            }
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             const toolContent = JSON.stringify({ error: message });
-            this.options.store.addMessage(thread.id, 'tool', toolContent);
+            unresolvedToolFailures.push(`${normalizedCall.name}: ${message}`);
+            const toolMessage = this.addRunMessage(run, 'tool', toolContent);
+            this.options.store.storeMessageArtifact(toolMessage.id, 'tool_result', {
+              callId: call.id,
+              name: normalizedCall.name,
+              result: { error: message },
+            });
             messages.push({
               role: 'tool',
               content: toolContent,
               toolCallId: call.id,
-              toolName: call.name,
+              toolName: normalizedCall.name,
             });
             this.emit(
               'tool.failed',
-              { name: call.name, error: message },
+              {
+                id: call.id,
+                name: normalizedCall.name,
+                ...(normalizedCall.requestedName
+                  ? { requestedName: normalizedCall.requestedName }
+                  : {}),
+                error: message,
+              },
               {
                 sessionId: thread.sessionId,
                 threadId: thread.id,
@@ -426,8 +1303,56 @@ export class AgentRuntime {
             );
           }
         }
+        if (toolBudgetExhausted && !toolBudgetNoticeAdded) {
+          toolBudgetNoticeAdded = true;
+          messages.push({
+            role: 'user',
+            content:
+              'The tool-call budget is exhausted. Do not request more tools. Provide the final answer now using only evidence already returned by completed calls, and state any remaining limitation plainly.',
+          });
+        }
       }
-      this.options.store.addMessage(thread.id, 'assistant', output, provider.name, model);
+      if (!finalResponseAccepted) {
+        const rejectedModelOutput = output.trim();
+        output = rejectedCapabilityClaim
+          ? output
+          : toolActivity
+            ? 'NUAAI could not verify completion: the tool-turn limit was reached before a final response.'
+            : rejectedModelOutput
+              ? `NUAAI rejected the model response because it did not complete a verified action: ${rejectedModelOutput}`
+              : 'NUAAI could not produce a non-empty final response.';
+        this.addRunMessage(run, 'assistant', output, provider.name, model);
+        this.options.store.updateRun(run.id, { status: 'failed', output });
+        this.emit(
+          'run.failed',
+          { error: output },
+          {
+            sessionId: thread.sessionId,
+            threadId: thread.id,
+            runId: run.id,
+            correlationId: run.correlationId,
+          },
+        );
+        return;
+      }
+      if (verificationRequiresEvidence(verificationPolicy) && !toolActivity) {
+        output =
+          'NUAAI did not verify this request because no tool was executed. I will not report model-generated claims as facts.';
+        this.addRunMessage(run, 'assistant', output, provider.name, model);
+        this.options.store.updateRun(run.id, { status: 'failed', output });
+        this.emit(
+          'run.failed',
+          { error: output },
+          {
+            sessionId: thread.sessionId,
+            threadId: thread.id,
+            runId: run.id,
+            correlationId: run.correlationId,
+          },
+        );
+        return;
+      }
+      this.addRunMessage(run, 'assistant', output, provider.name, model);
       this.options.store.updateRun(run.id, { status: 'completed', output });
       this.emit(
         'run.completed',
@@ -439,44 +1364,47 @@ export class AgentRuntime {
           correlationId: run.correlationId,
         },
       );
-      try {
-        const embeddingProvider = this.options.providers.get('ollama');
-        const embedding = await embeddingProvider.embed(output);
-        this.options.store.storeMemory(randomUUID(), output, embedding, {
-          sessionId: thread.sessionId,
-          threadId: thread.id,
-          runId: run.id,
-        });
-        this.emit(
-          'memory.stored',
-          { characters: output.length },
-          {
-            sessionId: thread.sessionId,
-            threadId: thread.id,
-            runId: run.id,
-            correlationId: run.correlationId,
-          },
-        );
-      } catch (error) {
-        this.emit(
-          'provider.unavailable',
-          {
-            provider: 'ollama-embeddings',
-            error: error instanceof Error ? error.message : String(error),
-          },
-          {
-            sessionId: thread.sessionId,
-            threadId: thread.id,
-            runId: run.id,
-            correlationId: run.correlationId,
-          },
-        );
+      if (
+        this.options.skillLearner &&
+        permissions.approved.has('write') &&
+        permissions.capabilities.filesystem
+      ) {
+        try {
+          const learned = await this.options.skillLearner.learnFromRun(run.input);
+          if (learned)
+            this.emit(
+              'skill.learned',
+              { name: learned.name, path: learned.path, triggers: learned.triggers },
+              {
+                sessionId: thread.sessionId,
+                threadId: thread.id,
+                runId: run.id,
+                correlationId: run.correlationId,
+              },
+            );
+        } catch (error) {
+          this.emit(
+            'skill.failed',
+            { error: error instanceof Error ? error.message : String(error) },
+            {
+              sessionId: thread.sessionId,
+              threadId: thread.id,
+              runId: run.id,
+              correlationId: run.correlationId,
+            },
+          );
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const current = this.options.store.getRun(run.id);
-      const status = current?.cancelRequested || controller.signal.aborted ? 'cancelled' : 'failed';
-      this.options.store.updateRun(run.id, { status, output: current?.output ?? '' });
+      const status = current?.cancelRequested ? 'cancelled' : 'failed';
+      const failureOutput =
+        status === 'cancelled'
+          ? current?.output || 'NUAAI run cancelled before completion.'
+          : `NUAAI could not complete the run: ${message}`;
+      this.addRunMessage(run, 'assistant', failureOutput, provider.name, run.model);
+      this.options.store.updateRun(run.id, { status, output: failureOutput });
       this.emit(
         status === 'cancelled' ? 'run.cancelled' : 'run.failed',
         { error: message },
@@ -485,6 +1413,8 @@ export class AgentRuntime {
     } finally {
       clearTimeout(timeout);
       this.controllers.delete(run.id);
+      if (writerClaimed)
+        this.options.store.releaseRunWriter(run.threadId, run.id, this.writerOwnerId);
     }
   }
 }
