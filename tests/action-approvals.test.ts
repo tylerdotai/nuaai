@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import { RunArtifactRegistry } from '../src/artifacts/registry.js';
 import { defaultRuntimeConfig } from '../src/config/index.js';
@@ -696,6 +697,193 @@ describe('runtime approval boundary', () => {
       );
     },
   );
+  it.each([
+    'missing metadata',
+    'wrong qualified name',
+    'duplicate call ID',
+    'missing completion',
+  ] as const)('fails closed when a provider-owned callback has %s', async (scenario) => {
+    const root = await makeRoot();
+    await writeFile(join(root, 'attestation-edge.txt'), 'verified edge', 'utf8');
+    const store = makeStore(root);
+    const provider: ProviderAdapter = {
+      name: `attestation-${scenario}`,
+      model: 'owned-test',
+      ownsToolLoop: true,
+      async *stream(request): AsyncIterable<ProviderStreamEvent> {
+        const qualifiedName = 'nuaai.workspace_read';
+        const dynamic = request.dynamicTools?.find(
+          (tool) => `${tool.namespace}.${tool.name}` === qualifiedName,
+        );
+        if (!dynamic) throw new Error('dynamic read tool missing');
+        const argumentsValue = { path: 'attestation-edge.txt' };
+        yield {
+          type: 'tool_started',
+          id: 'attestation-edge-call',
+          name: qualifiedName,
+          arguments: argumentsValue,
+        };
+        if (scenario === 'missing metadata') {
+          await dynamic.execute(argumentsValue);
+          return;
+        }
+        if (scenario === 'wrong qualified name') {
+          await dynamic.execute(argumentsValue, {
+            callId: 'attestation-edge-call',
+            qualifiedName: 'nuaai.workspace_write',
+          });
+          return;
+        }
+        const result = await dynamic.execute(argumentsValue, {
+          callId: 'attestation-edge-call',
+          qualifiedName,
+        });
+        if (scenario === 'duplicate call ID') {
+          await dynamic.execute(argumentsValue, {
+            callId: 'attestation-edge-call',
+            qualifiedName,
+          });
+          return;
+        }
+        if (scenario === 'missing completion') {
+          yield { type: 'done', text: 'Completion event omitted.' };
+          return;
+        }
+        yield {
+          type: 'tool_completed',
+          id: 'attestation-edge-call',
+          name: qualifiedName,
+          arguments: argumentsValue,
+          result,
+          isError: false,
+        };
+      },
+      async embed() {
+        return [];
+      },
+      async health() {
+        return { name: `attestation-${scenario}`, available: true, detail: 'ready' };
+      },
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap(provider),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Attestation edge');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Read attestation-edge.txt and report the verified contents.',
+      provider: provider.name,
+      permissions: permissions(),
+      permissionSource: 'web',
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({ status: 'failed' });
+    const events = store.listEventsForThread(created.thread.id, 0, 100).events;
+    expect(events.some((event) => event.type === 'tool.failed')).toBe(true);
+    expect(events.some((event) => event.type === 'tool.completed')).toBe(false);
+  });
+
+  it('attests deterministic JSON-safe edge result values from a governed callback', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const tools = new ToolRegistry(root);
+    tools.register({
+      name: 'test.attestation-values',
+      description: 'Return deterministic edge values for attestation hashing',
+      permission: 'read',
+      governance: {
+        owner: 'test',
+        costClass: 'low',
+        authMode: 'none',
+        sideEffects: 'none',
+        approval: 'none',
+        maxCallsPerRun: 1,
+      },
+      parameters: { type: 'object', properties: {} },
+      input: z.object({}),
+      execute: async () => ({
+        finite: 7,
+        notANumber: Number.NaN,
+        positiveInfinity: Number.POSITIVE_INFINITY,
+        negativeInfinity: Number.NEGATIVE_INFINITY,
+        optional: undefined,
+        when: new Date('2026-09-14T00:00:00.000Z'),
+        bytes: new Uint8Array([1, 2, 3]),
+        nested: [true, 'value'],
+      }),
+    });
+    const provider: ProviderAdapter = {
+      name: 'attestation-values',
+      model: 'owned-test',
+      ownsToolLoop: true,
+      async *stream(request): AsyncIterable<ProviderStreamEvent> {
+        const qualifiedName = 'nuaai.test_attestation-values';
+        const dynamic = request.dynamicTools?.find(
+          (tool) => `${tool.namespace}.${tool.name}` === qualifiedName,
+        );
+        if (!dynamic) throw new Error('attestation value tool missing');
+        const argumentsValue = {};
+        yield {
+          type: 'tool_started',
+          id: 'attestation-values-call',
+          name: qualifiedName,
+          arguments: argumentsValue,
+        };
+        const result = await dynamic.execute(argumentsValue, {
+          callId: 'attestation-values-call',
+          qualifiedName,
+        });
+        yield {
+          type: 'tool_completed',
+          id: 'attestation-values-call',
+          name: qualifiedName,
+          arguments: argumentsValue,
+          result,
+          isError: false,
+        };
+        yield { type: 'done', text: 'Attested edge values completed.' };
+      },
+      async embed() {
+        return [];
+      },
+      async health() {
+        return { name: 'attestation-values', available: true, detail: 'ready' };
+      },
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap(provider),
+      tools,
+    });
+    const created = runtime.createSession('Attestation values');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Use the attestation value tool and report completion.',
+      provider: provider.name,
+      permissions: permissions(),
+      permissionSource: 'web',
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Attested edge values completed.',
+    });
+    const completion = store
+      .listEventsForThread(created.thread.id, 0, 100)
+      .events.find((event) => event.type === 'tool.completed');
+    expect(completion?.payload.attestation).toMatchObject({
+      version: 1,
+      status: 'succeeded',
+      payloadHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      resultHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+  });
 });
 
 describe('authenticated API and operator clients', () => {
