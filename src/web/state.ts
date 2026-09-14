@@ -95,6 +95,64 @@ export interface SelectionLoad {
   signal: AbortSignal;
 }
 
+export interface LatestRequestLoad {
+  generation: number;
+  signal: AbortSignal;
+}
+
+export class LatestRequestCoordinator {
+  private generation = 0;
+  private controller: AbortController | null = null;
+  private detachParent: (() => void) | null = null;
+
+  begin(parentSignal?: AbortSignal): LatestRequestLoad {
+    this.detachParent?.();
+    this.detachParent = null;
+    this.controller?.abort();
+    this.controller = new AbortController();
+    this.generation += 1;
+    if (parentSignal) {
+      const abortFromParent = (): void => this.controller?.abort(parentSignal.reason);
+      if (parentSignal.aborted) abortFromParent();
+      else {
+        parentSignal.addEventListener('abort', abortFromParent, { once: true });
+        this.detachParent = () => parentSignal.removeEventListener('abort', abortFromParent);
+      }
+    }
+    return { generation: this.generation, signal: this.controller.signal };
+  }
+
+  isCurrent(load: LatestRequestLoad): boolean {
+    return load.generation === this.generation && !load.signal.aborted;
+  }
+
+  cancel(): void {
+    this.detachParent?.();
+    this.detachParent = null;
+    this.controller?.abort();
+    this.controller = null;
+    this.generation += 1;
+  }
+}
+
+export async function commitLatestLoad<Value>(
+  coordinator: LatestRequestCoordinator,
+  loadValue: (signal: AbortSignal) => Promise<Value>,
+  commit: (value: Value) => void,
+  parentSignal?: AbortSignal,
+): Promise<boolean> {
+  const load = coordinator.begin(parentSignal);
+  try {
+    const value = await loadValue(load.signal);
+    if (!coordinator.isCurrent(load)) return false;
+    commit(value);
+    return true;
+  } catch (error) {
+    if (load.signal.aborted && !coordinator.isCurrent(load)) return false;
+    throw error;
+  }
+}
+
 export class SelectionLoadCoordinator {
   private generation = 0;
   private controller: AbortController | null = null;

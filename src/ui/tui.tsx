@@ -156,6 +156,13 @@ async function loadCatalog(baseUrl: string, token: string): Promise<TuiEvent> {
           payloadHash: string;
           target: string;
           risk: string;
+          preview: {
+            version: 1;
+            kind: string;
+            summary: string;
+            fields: Array<{ label: string; value: string; format?: 'code' }>;
+            context: { source: string; client: string; sessionId?: string };
+          };
           providerOwned: boolean;
           createdAt: number;
           expiresAt: number;
@@ -314,6 +321,8 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
     socket.onopen = () => {
       setStatus('Connected');
       dispatch({ type: 'connection.changed', status: 'connected' });
+      void refresh();
+      socket.send(JSON.stringify({ type: 'subscribe', after: Number.MAX_SAFE_INTEGER, limit: 1 }));
     };
     socket.onmessage = (event) => {
       const value = JSON.parse(String(event.data)) as {
@@ -325,6 +334,10 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
           payload?: Record<string, unknown>;
         };
       };
+      if (value.type === 'approvals.invalidated') {
+        void refresh();
+        return;
+      }
       if (value.type !== 'event' || !value.event) return;
       const tuiEvent = toTuiEvent(value.event);
       if (tuiEvent) dispatch(tuiEvent);
@@ -699,6 +712,17 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
           <Text>
             Target: {approval.target} · Risk: {approval.risk}
           </Text>
+          <Text>
+            Source: {approval.preview.context.client}
+            {approval.preview.context.sessionId
+              ? ` · Session: ${approval.preview.context.sessionId}`
+              : ''}
+          </Text>
+          {approval.preview.fields.map((field) => (
+            <Text key={field.label}>
+              {field.label}: {field.value}
+            </Text>
+          ))}
           <Text>Hash: {approval.payloadHash}</Text>
           <Text>Expires: {new Date(approval.expiresAt).toISOString()}</Text>
         </Box>

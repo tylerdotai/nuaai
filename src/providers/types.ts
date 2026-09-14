@@ -27,9 +27,17 @@ export interface ProviderTool {
   parameters: Record<string, unknown>;
 }
 
+export interface ProviderDynamicToolCallMetadata {
+  callId: string;
+  qualifiedName: string;
+}
+
 export interface ProviderDynamicTool extends ProviderTool {
   namespace: string;
-  execute(input: Record<string, unknown>): Promise<unknown>;
+  execute(
+    input: Record<string, unknown>,
+    metadata?: ProviderDynamicToolCallMetadata,
+  ): Promise<unknown>;
 }
 
 export interface ProviderRequest {

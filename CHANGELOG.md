@@ -13,11 +13,14 @@ All notable NUAAI changes are recorded here.
 - Authenticated artifact list, detail, and byte-range download routes with cross-run 404 isolation, safe attachment headers, mount-relative PWA links, assistant-run artifact cards, distinct citations, and concise TUI visibility.
 - Payload-bound per-action approvals now pause profile-governed tools before side effects, persist a durable one-time SQLite state machine, revalidate current permission and tool authority, and resume the same run only for the exact SHA-256-bound payload.
 - Authenticated approval list/detail/approve/deny APIs, approval lifecycle events, a functional PWA approval inbox, and TUI pending-action visibility.
+- Versioned tool-specific approval previews with allowlisted path/action/coordinate facts, opaque-field size and SHA-256 fingerprints, and safe source/session/client context.
 
 ### Security
 
 - Artifact capture rejects traversal, absolute paths, symlinks, hard links, protected runtime/credential paths, unsupported kind/MIME pairs, oversized content/metadata, and non-HTTPS or credential-bearing URLs. Text checksums cover stored sanitized bytes and are labeled accordingly.
-- Approval records and client events expose only the payload hash plus bounded redacted target/result previews; raw canonical arguments are never stored in the approval table. Decisions must include the hash shown to the operator, and stale hashes, replay, expiry, denial, and concurrent decisions fail closed.
+- Approval records and client events expose only safe allowlisted facts plus opaque-field sizes/fingerprints; raw canonical arguments, command arguments, prompts, typed values, signed URLs, and credential values are never stored in the approval preview or target. Legacy generic previews are scrubbed on reopen without replacing valid versioned previews.
+- Provider-owned tool success now requires an exact callback attestation over the advertised qualified name, call ID, arguments, result, and status. Fabricated, unadvertised, or mismatched lifecycle events cannot satisfy finality or create trusted action evidence.
+- Approval inboxes receive an authenticated payload-free global invalidation while full events remain session-scoped; reconnect/focus refreshes and abortable generation-fenced system loads prevent missed expiries and stale actionable cards.
 
 ## [1.0.1] - 2026-09-14
 
