@@ -103,6 +103,43 @@ describe('approval persistence state machine', () => {
     ).toThrow('already consumed');
   });
 
+  it('returns missing requests and rejects decisions or claims after terminal state', async () => {
+    const { value } = await store();
+    expect(value.getApprovalRequest('missing')).toBeUndefined();
+
+    const { sessionId: _sessionId, ...withoutSession } = input('without-session');
+    expect(value.createApprovalRequest(withoutSession, 1_000).sessionId).toBeNull();
+
+    value.createApprovalRequest(input('denied-claim'), 1_000);
+    value.decideApprovalRequest('denied-claim', 'denied', 1_100);
+    expect(() =>
+      value.claimApprovalExecution(
+        'denied-claim',
+        {
+          runId: 'run-1',
+          toolName: 'workspace.write',
+          canonicalArguments: input().canonicalArguments,
+        },
+        1_200,
+      ),
+    ).toThrow('is not approved');
+
+    value.createApprovalRequest(input('executed-decision'), 1_000);
+    value.decideApprovalRequest('executed-decision', 'approved', 1_100);
+    value.claimApprovalExecution(
+      'executed-decision',
+      {
+        runId: 'run-1',
+        toolName: 'workspace.write',
+        canonicalArguments: input().canonicalArguments,
+      },
+      1_200,
+    );
+    expect(() => value.decideApprovalRequest('executed-decision', 'denied', 1_300)).toThrow(
+      'not pending (status: executed)',
+    );
+  });
+
   it('expires, denies, serializes concurrent decisions, and survives reopen without public secrets', async () => {
     const { root, value } = await store();
     value.createApprovalRequest(input('expired', 1_500), 1_000);
