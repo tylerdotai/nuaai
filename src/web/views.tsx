@@ -101,6 +101,26 @@ export function ApprovalInbox({
               <dd>{approval.risk}</dd>
             </div>
             <div>
+              <dt>Source</dt>
+              <dd>
+                {approval.preview.context.client}
+                {approval.preview.context.sessionId
+                  ? ` · Session ${approval.preview.context.sessionId}`
+                  : ''}
+              </dd>
+            </div>
+            {approval.preview.fields.map((field) => (
+              <div
+                className={field.format === 'code' ? 'approval-preview-wide' : undefined}
+                key={field.label}
+              >
+                <dt>{field.label}</dt>
+                <dd className={field.format === 'code' ? 'approval-preview-code' : undefined}>
+                  {field.value}
+                </dd>
+              </div>
+            ))}
+            <div>
               <dt>Payload hash</dt>
               <dd className="approval-hash">{approval.payloadHash}</dd>
             </div>
