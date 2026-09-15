@@ -146,6 +146,7 @@ h3 {
   height: 32px;
   justify-content: center;
   letter-spacing: -0.05em;
+  position: relative;
   width: 32px;
 }
 
@@ -2295,6 +2296,7 @@ kbd {
   border: 2px solid var(--accent);
   opacity: 0.25;
   animation: brand-pulse 2.5s ease-in-out infinite;
+  pointer-events: none;
 }
 
 @keyframes brand-pulse {
