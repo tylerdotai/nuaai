@@ -9,7 +9,6 @@ import {
   webSocketCloseDisposition,
 } from './auth.js';
 import { AgentComposer } from './components/AgentComposer.js';
-import { ArtifactCards } from './components/ArtifactCards.js';
 import { MarkdownContent } from './components/MarkdownContent.js';
 import { RunStatusSummary } from './components/RunStatusSummary.js';
 import { type ComposerCommand, draftStorageKey, resolveComposerCommand } from './composer.js';
@@ -51,7 +50,6 @@ import {
   type ActiveRunsByThread,
   EventReplayBuffer,
   EventReplayCursor,
-  LatestRequestCoordinator,
   type LiveOutputByRun,
   type QueuedRunsByThread,
   type SelectionIdentity,
@@ -60,7 +58,6 @@ import {
   type ThreadRunState,
   type WebEventRecord,
   activeRunForThread,
-  commitLatestLoad,
   liveOutputSnapshot,
   loadReplaySafeThreadSnapshot,
   projectRunEvents,
@@ -149,7 +146,6 @@ function App(): React.JSX.Element {
   const lastEventId = useRef(0);
   const selectionLoads = useRef(new SelectionLoadCoordinator());
   const backgroundLoads = useRef(new SelectionLoadCoordinator());
-  const systemLoads = useRef(new LatestRequestCoordinator());
   const snapshotEpoch = useRef(0);
   const snapshotEpochByLoad = useRef(new WeakMap<SelectionLoad, number>());
   const pollGeneration = useRef(0);
@@ -269,7 +265,6 @@ function App(): React.JSX.Element {
     () => () => {
       selectionLoads.current.cancel();
       backgroundLoads.current.cancel();
-      systemLoads.current.cancel();
       if (historyFrameRef.current !== null) window.cancelAnimationFrame(historyFrameRef.current);
     },
     [],
@@ -341,66 +336,37 @@ function App(): React.JSX.Element {
   }, [commandPaletteOpen]);
 
   const loadSystem = useCallback(async (signal?: AbortSignal): Promise<void> => {
-    await commitLatestLoad(
-      systemLoads.current,
-      async (loadSignal) => {
-        const [
-          providerResult,
-          scheduleResult,
-          taskResult,
-          memoryResult,
-          skillResult,
-          pluginResult,
-          approvalResult,
-        ] = await Promise.all([
-          request<{
-            active: ActiveProvider;
-            providers: ProviderHealth[];
-            webPermissionProfile?: PermissionProfile;
-          }>('/api/providers', { signal: loadSignal }),
-          request<{ schedules: Schedule[] }>('/api/schedules', { signal: loadSignal }),
-          request<{ tasks: Task[] }>('/api/tasks', { signal: loadSignal }),
-          request<{ memories: MemoryRecord[] }>('/api/memory', { signal: loadSignal }),
-          request<{ skills: SkillRecord[] }>('/api/skills', { signal: loadSignal }),
-          request<{ plugins: PluginRecord[]; health: PluginHealth[] }>('/api/plugins', {
-            signal: loadSignal,
-          }),
-          request<{ approvals: ApprovalRequest[] }>('/api/approvals?status=pending', {
-            signal: loadSignal,
-          }),
-        ]);
-        return {
-          providerResult,
-          scheduleResult,
-          taskResult,
-          memoryResult,
-          skillResult,
-          pluginResult,
-          approvalResult,
-        };
-      },
-      ({
-        providerResult,
-        scheduleResult,
-        taskResult,
-        memoryResult,
-        skillResult,
-        pluginResult,
-        approvalResult,
-      }) => {
-        setWebPermissionProfile(providerResult.webPermissionProfile ?? 'read-only');
-        setProviders(providerResult.providers);
-        setActiveProvider(providerResult.active);
-        setSchedules(scheduleResult.schedules);
-        setTasks(taskResult.tasks);
-        setMemories(memoryResult.memories);
-        setSkills(skillResult.skills);
-        setPlugins(pluginResult.plugins);
-        setPluginHealth(pluginResult.health);
-        setApprovals(approvalResult.approvals);
-      },
-      signal,
-    );
+    const [
+      providerResult,
+      scheduleResult,
+      taskResult,
+      memoryResult,
+      skillResult,
+      pluginResult,
+      approvalResult,
+    ] = await Promise.all([
+      request<{
+        active: ActiveProvider;
+        providers: ProviderHealth[];
+        webPermissionProfile?: PermissionProfile;
+      }>('/api/providers', { signal }),
+      request<{ schedules: Schedule[] }>('/api/schedules', { signal }),
+      request<{ tasks: Task[] }>('/api/tasks', { signal }),
+      request<{ memories: MemoryRecord[] }>('/api/memory', { signal }),
+      request<{ skills: SkillRecord[] }>('/api/skills', { signal }),
+      request<{ plugins: PluginRecord[]; health: PluginHealth[] }>('/api/plugins', { signal }),
+      request<{ approvals: ApprovalRequest[] }>('/api/approvals?status=pending', { signal }),
+    ]);
+    setWebPermissionProfile(providerResult.webPermissionProfile ?? 'read-only');
+    setProviders(providerResult.providers);
+    setActiveProvider(providerResult.active);
+    setSchedules(scheduleResult.schedules);
+    setTasks(taskResult.tasks);
+    setMemories(memoryResult.memories);
+    setSkills(skillResult.skills);
+    setPlugins(pluginResult.plugins);
+    setPluginHealth(pluginResult.health);
+    setApprovals(approvalResult.approvals);
   }, []);
 
   const loadThread = useCallback(
@@ -660,7 +626,6 @@ function App(): React.JSX.Element {
       socket.onopen = () => {
         retry = 0;
         setConnection('connected');
-        void loadSystem().catch(reportBackgroundFailure);
         subscribe(replayCursor.beginReplay());
       };
       socket.onmessage = (message) => {
@@ -671,10 +636,6 @@ function App(): React.JSX.Element {
             nextCursor?: number;
             hasMore?: boolean;
           };
-          if (value.type === 'approvals.invalidated') {
-            void loadSystem().catch(reportBackgroundFailure);
-            return;
-          }
           if (value.type === 'replay.complete') {
             const continuation = replayCursor.completePage(
               value.nextCursor ?? 0,
@@ -691,6 +652,8 @@ function App(): React.JSX.Element {
           if (nextEvent.id !== undefined) replayCursor.observe(nextEvent.id);
           lastEventId.current = Math.max(lastEventId.current, nextEvent.id ?? 0);
           scheduleEvent(nextEvent);
+          if (nextEvent.type.startsWith('approval.'))
+            void loadSystem().catch(reportBackgroundFailure);
           if (
             terminalRunStates.has(nextEvent.type.replace('run.', '')) &&
             nextEvent.threadId === selectedThreadRef.current
@@ -736,18 +699,6 @@ function App(): React.JSX.Element {
   }, [beginBackgroundLoad, eventSubscription, loadSystem, loadThread, reportBackgroundFailure]);
 
   useEffect(() => {
-    const refreshVisibleApprovals = (): void => {
-      if (document.visibilityState === 'visible') void loadSystem().catch(reportBackgroundFailure);
-    };
-    window.addEventListener('focus', refreshVisibleApprovals);
-    document.addEventListener('visibilitychange', refreshVisibleApprovals);
-    return () => {
-      window.removeEventListener('focus', refreshVisibleApprovals);
-      document.removeEventListener('visibilitychange', refreshVisibleApprovals);
-    };
-  }, [loadSystem, reportBackgroundFailure]);
-
-  useEffect(() => {
     if (!activeRunId || !selectedThreadId) return;
     const runId = activeRunId;
     const threadId = selectedThreadId;
@@ -756,7 +707,6 @@ function App(): React.JSX.Element {
     const generation = pollGeneration.current + 1;
     pollGeneration.current = generation;
     const controller = new AbortController();
-    let nextPausedApprovalRefreshAt = 0;
     const ownsPoll = (): boolean =>
       pollGeneration.current === generation &&
       selectedSessionRef.current === sessionId &&
@@ -766,16 +716,7 @@ function App(): React.JSX.Element {
         signal: controller.signal,
       })
         .then((run) => {
-          if (!ownsPoll()) return;
-          if (run.status === 'paused') {
-            const now = Date.now();
-            if (now >= nextPausedApprovalRefreshAt) {
-              nextPausedApprovalRefreshAt = now + 15_000;
-              void loadSystem().catch(reportBackgroundFailure);
-            }
-            return;
-          }
-          if (!terminalRunStates.has(run.status)) return;
+          if (!ownsPoll() || !terminalRunStates.has(run.status)) return;
           setActiveRunsByThread((current) =>
             current[threadId] === runId ? { ...current, [threadId]: null } : current,
           );
@@ -1658,7 +1599,6 @@ function App(): React.JSX.Element {
                             <time>{relativeTime(message.createdAt)}</time>
                           </div>
                           <MarkdownContent markdown={message.markdown} />
-                          <ArtifactCards message={message} resolveUrl={appPath} />
                           {message.role === 'assistant' && (
                             <RunStatusSummary
                               message={message}
