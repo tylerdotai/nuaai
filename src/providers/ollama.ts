@@ -1,3 +1,4 @@
+import { canonicalProviderMessages } from './request.js';
 import type {
   ProviderAdapter,
   ProviderHealth,
@@ -200,6 +201,7 @@ export class OllamaProvider implements ProviderAdapter {
 
   async *stream(request: ProviderRequest): AsyncIterable<ProviderStreamEvent> {
     const requestControl = withAbort(request.signal, this.timeoutMs);
+    const canonical = canonicalProviderMessages(request.systemPrompt, request.messages);
     const toolCalls = new Map<string, CollectedToolCall>();
     let fallbackIndex = 0;
     try {
@@ -213,8 +215,10 @@ export class OllamaProvider implements ProviderAdapter {
           body: JSON.stringify({
             model: request.model || this.model,
             messages: [
-              ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
-              ...request.messages.map(openAiMessage),
+              ...(canonical.systemPrompt
+                ? [{ role: 'system', content: canonical.systemPrompt }]
+                : []),
+              ...canonical.messages.map(openAiMessage),
             ],
             stream: false,
             ...(request.reasoning === undefined
@@ -279,8 +283,10 @@ export class OllamaProvider implements ProviderAdapter {
         body: JSON.stringify({
           model: request.model || this.model,
           messages: [
-            ...(request.systemPrompt ? [{ role: 'system', content: request.systemPrompt }] : []),
-            ...request.messages.map(ollamaMessage),
+            ...(canonical.systemPrompt
+              ? [{ role: 'system', content: canonical.systemPrompt }]
+              : []),
+            ...canonical.messages.map(ollamaMessage),
           ],
           stream: true,
           options: { num_ctx: this.contextWindow },

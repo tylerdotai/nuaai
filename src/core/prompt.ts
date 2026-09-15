@@ -16,6 +16,7 @@ export interface PromptAssemblyInput {
   projectContext?: string;
   memory?: string;
   skills?: string;
+  transcriptSummary?: string;
   manifest: CapabilityManifest;
 }
 
@@ -73,6 +74,9 @@ export function assembleSystemPrompt(input: PromptAssemblyInput): PromptAssembly
         'Provide the final answer after tool execution has ended using only verified results.',
       ].join('\n'),
     },
+    ...(input.transcriptSummary?.trim()
+      ? [{ name: 'transcript_summary', content: input.transcriptSummary.trim() }]
+      : []),
     { name: 'skills', content: input.skills?.trim() || 'No skills are registered.' },
     {
       name: 'project_context',

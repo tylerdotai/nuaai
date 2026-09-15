@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
@@ -7,7 +7,20 @@ import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { load as loadSqliteVec } from 'sqlite-vec';
 
 import { workspaceDirectory } from '../config/index.js';
+import {
+  type ApprovalDecision,
+  type ApprovalRequestInput,
+  type ApprovalRequestRow,
+  ApprovalStateError,
+  approvalPayloadHash,
+  approvalTarget,
+  boundedApprovalPreview,
+  buildApprovalPreview,
+  resultHash,
+} from '../core/approvals.js';
+import { type ContextMessage, estimateMessageTokens, estimateTokens } from '../core/context.js';
 import type { EventRecord } from '../core/events.js';
+import type { ProviderToolCall } from '../providers/types.js';
 import { redactValue } from '../security/redaction.js';
 
 export type MemoryDatabase = Database.Database;
@@ -19,6 +32,10 @@ export interface AppDatabase {
   orm: DrizzleDatabase;
   root: string;
 }
+
+export const threadSummarySourceProvenance = 'sha256:canonical-message-v1' as const;
+export const threadSummarySummarizerVersion = 'deterministic-extractive-v1' as const;
+export const threadSummaryPolicyVersion = 'pinned-important-recent-v1' as const;
 
 export interface MemoryRow {
   id: number;
@@ -66,9 +83,21 @@ export interface ThreadSummaryRow {
   summary: string;
   throughMessageId: string;
   messageCount: number;
+  sourceStartMessageId: string;
+  sourceEndMessageId: string;
+  sourceMessageCount: number;
+  sourceSha256: string;
+  sourceProvenance: typeof threadSummarySourceProvenance;
+  estimatedOriginalTokens: number;
+  estimatedSummaryTokens: number;
+  summaryBudgetTokens: number;
+  summarizerVersion: string;
+  policyVersion: string;
   version: number;
   updatedAt: number;
 }
+
+export type StructuredMessageRow = Omit<MessageRow, 'role'> & ContextMessage;
 
 export interface MessageArtifactRow {
   messageId: string;
@@ -89,6 +118,22 @@ export interface RunRow {
   createdAt: number;
   updatedAt: number;
   correlationId: string;
+}
+
+export interface RunArtifactRow {
+  id: string;
+  runId: string;
+  threadId: string;
+  kind: string;
+  title: string;
+  mimeType: string;
+  byteSize: number;
+  sha256: string;
+  sourceTool: string;
+  metadata: Record<string, unknown>;
+  externalUrl: string | null;
+  storagePath: string | null;
+  createdAt: number;
 }
 
 export interface EventPage {
@@ -167,6 +212,14 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       summary TEXT NOT NULL,
       through_message_id TEXT NOT NULL,
       message_count INTEGER NOT NULL,
+      source_start_message_id TEXT NOT NULL DEFAULT '',
+      source_sha256 TEXT NOT NULL DEFAULT '',
+      source_provenance TEXT NOT NULL DEFAULT 'sha256:canonical-message-v1',
+      estimated_original_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_summary_tokens INTEGER NOT NULL DEFAULT 0,
+      summary_budget_tokens INTEGER NOT NULL DEFAULT -1,
+      summarizer_version TEXT NOT NULL DEFAULT 'legacy',
+      policy_version TEXT NOT NULL DEFAULT 'legacy',
       version INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -183,12 +236,53 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       updated_at INTEGER NOT NULL,
       correlation_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS run_artifacts (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+      thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('file', 'diff', 'test-report', 'screenshot', 'citation', 'deployment-receipt')),
+      title TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+      sha256 TEXT NOT NULL,
+      source_tool TEXT NOT NULL,
+      metadata TEXT NOT NULL DEFAULT '{}',
+      external_url TEXT,
+      storage_path TEXT,
+      created_at INTEGER NOT NULL,
+      CHECK (external_url IS NOT NULL OR storage_path IS NOT NULL)
+    );
     CREATE TABLE IF NOT EXISTS run_writers (
       thread_id TEXT PRIMARY KEY,
       run_id TEXT NOT NULL UNIQUE,
       owner_id TEXT NOT NULL,
       claimed_at INTEGER NOT NULL,
       lease_until INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS approval_requests (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      session_id TEXT,
+      tool_call_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      arguments_preview TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      required_permission TEXT NOT NULL,
+      permission_source TEXT NOT NULL,
+      risk TEXT NOT NULL,
+      target TEXT NOT NULL,
+      provider_owned INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      decided_at INTEGER,
+      execution_started_at INTEGER,
+      execution_completed_at INTEGER,
+      result_hash TEXT,
+      result_preview TEXT,
+      execution_error TEXT,
+      UNIQUE(run_id, tool_call_id, payload_hash)
     );
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,7 +361,11 @@ function createSchema(db: MemoryDatabase, vector = false): void {
     CREATE INDEX IF NOT EXISTS events_run_id_idx ON events(run_id, id);
     CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages(thread_id, created_at);
     CREATE INDEX IF NOT EXISTS runs_thread_idx ON runs(thread_id, created_at);
+    CREATE INDEX IF NOT EXISTS run_artifacts_run_idx ON run_artifacts(run_id, created_at, id);
+    CREATE INDEX IF NOT EXISTS run_artifacts_thread_idx ON run_artifacts(thread_id, created_at, id);
     CREATE UNIQUE INDEX IF NOT EXISTS runs_correlation_id_idx ON runs(correlation_id);
+    CREATE INDEX IF NOT EXISTS approval_requests_status_idx ON approval_requests(status, expires_at);
+    CREATE INDEX IF NOT EXISTS approval_requests_run_idx ON approval_requests(run_id, created_at);
     CREATE TABLE IF NOT EXISTS memory_vector_refs (
       memory_id TEXT PRIMARY KEY,
       vector_rowid INTEGER NOT NULL
@@ -293,7 +391,70 @@ function createSchema(db: MemoryDatabase, vector = false): void {
   ];
   for (const [name, migration] of pluginMigrations)
     if (!pluginColumns.some((column) => column.name === name)) db.exec(migration);
-  db.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
+  const summaryColumns = db.prepare('PRAGMA table_info(thread_summaries)').all() as Array<{
+    name: string;
+  }>;
+  const summaryMigrations: Array<[string, string]> = [
+    [
+      'source_start_message_id',
+      "ALTER TABLE thread_summaries ADD COLUMN source_start_message_id TEXT NOT NULL DEFAULT ''",
+    ],
+    [
+      'source_sha256',
+      "ALTER TABLE thread_summaries ADD COLUMN source_sha256 TEXT NOT NULL DEFAULT ''",
+    ],
+    [
+      'source_provenance',
+      "ALTER TABLE thread_summaries ADD COLUMN source_provenance TEXT NOT NULL DEFAULT 'sha256:canonical-message-v1'",
+    ],
+    [
+      'estimated_original_tokens',
+      'ALTER TABLE thread_summaries ADD COLUMN estimated_original_tokens INTEGER NOT NULL DEFAULT 0',
+    ],
+    [
+      'estimated_summary_tokens',
+      'ALTER TABLE thread_summaries ADD COLUMN estimated_summary_tokens INTEGER NOT NULL DEFAULT 0',
+    ],
+    [
+      'summary_budget_tokens',
+      'ALTER TABLE thread_summaries ADD COLUMN summary_budget_tokens INTEGER NOT NULL DEFAULT -1',
+    ],
+    [
+      'summarizer_version',
+      "ALTER TABLE thread_summaries ADD COLUMN summarizer_version TEXT NOT NULL DEFAULT 'legacy'",
+    ],
+    [
+      'policy_version',
+      "ALTER TABLE thread_summaries ADD COLUMN policy_version TEXT NOT NULL DEFAULT 'legacy'",
+    ],
+  ];
+  for (const [name, migration] of summaryMigrations)
+    if (!summaryColumns.some((column) => column.name === name)) db.exec(migration);
+  const legacyApprovalPreview = JSON.stringify({
+    version: 1,
+    kind: 'legacy',
+    summary: 'Legacy approval preview unavailable',
+    fields: [],
+    context: { source: 'other', client: 'Authenticated runtime client' },
+  });
+  db.prepare(
+    `UPDATE approval_requests
+     SET arguments_preview = ?
+     WHERE CASE
+       WHEN json_valid(arguments_preview) = 0 THEN 1
+       ELSE
+         COALESCE(json_extract(arguments_preview, '$.version'), 0) != 1 OR
+         COALESCE(json_type(arguments_preview, '$.kind'), '') != 'text' OR
+         COALESCE(json_type(arguments_preview, '$.summary'), '') != 'text' OR
+         COALESCE(json_type(arguments_preview, '$.fields'), '') != 'array' OR
+         COALESCE(json_type(arguments_preview, '$.context'), '') != 'object' OR
+         COALESCE(json_type(arguments_preview, '$.context.source'), '') != 'text' OR
+         COALESCE(json_type(arguments_preview, '$.context.client'), '') != 'text'
+       END`,
+  ).run(legacyApprovalPreview);
+  db.prepare(
+    "UPDATE schema_meta SET value = '7' WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 7",
+  ).run();
   if (vector) {
     db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(embedding float[768]);');
   }
@@ -378,6 +539,96 @@ export function listMemories(db: MemoryDatabase): MemoryRow[] {
   return db
     .prepare('SELECT id, content, created_at AS createdAt FROM memories ORDER BY id ASC')
     .all() as MemoryRow[];
+}
+
+function providerToolCalls(value: unknown): ProviderToolCall[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const calls = value.filter(
+    (call): call is ProviderToolCall =>
+      Boolean(call) &&
+      typeof call === 'object' &&
+      typeof (call as ProviderToolCall).id === 'string' &&
+      typeof (call as ProviderToolCall).name === 'string' &&
+      Boolean((call as ProviderToolCall).arguments) &&
+      typeof (call as ProviderToolCall).arguments === 'object' &&
+      !Array.isArray((call as ProviderToolCall).arguments),
+  );
+  return calls.length === value.length && calls.length ? calls : undefined;
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, entry]) => [key, stableValue(entry)]),
+  );
+}
+
+function summarySourceHash(messages: StructuredMessageRow[]): string {
+  const canonical = messages.map((message) =>
+    stableValue({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      provider: message.provider,
+      model: message.model,
+      toolCalls: message.toolCalls,
+      toolCallId: message.toolCallId,
+      toolName: message.toolName,
+      pinned: message.pinned === true,
+    }),
+  );
+  return createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
+}
+
+function extractiveSummary(
+  messages: StructuredMessageRow[],
+  maxTokens: number,
+  previousSummary = '',
+): string {
+  const boundedMax = Math.max(0, Math.trunc(maxTokens));
+  const records = messages.map((message, index) => ({
+    index,
+    important:
+      message.pinned === true ||
+      previousSummary.includes(`[${message.id}] ${message.role}: ${message.content}`) ||
+      /\b(?:always|never|must|remember|constraint|require|required|prefer|fact|do not|don't)\b/iu.test(
+        message.content,
+      ),
+    text: `[${message.id}] ${message.role}: ${message.content}`,
+  }));
+  const selected = new Set<number>();
+  let used = 0;
+  const trySelect = (record: (typeof records)[number]): void => {
+    if (selected.has(record.index)) return;
+    const separator = selected.size ? 1 : 0;
+    const tokens = separator + estimateTokens(record.text);
+    if (used + tokens > boundedMax) return;
+    selected.add(record.index);
+    used += tokens;
+  };
+  for (const record of records) if (record.important) trySelect(record);
+  for (let index = records.length - 1; index >= 0; index -= 1) trySelect(records[index]);
+
+  const omitted = records.length - selected.size;
+  if (omitted) {
+    const marker = `[${omitted} complete source record${omitted === 1 ? '' : 's'} omitted by summary token budget]`;
+    const separator = selected.size ? 1 : 0;
+    const markerTokens = separator + estimateTokens(marker);
+    if (used + markerTokens <= boundedMax) {
+      selected.add(records.length);
+      records.push({ index: records.length, important: false, text: marker });
+    }
+  }
+  const summary = records
+    .filter((record) => selected.has(record.index))
+    .sort((left, right) => left.index - right.index)
+    .map((record) => record.text)
+    .join('\n');
+  if (estimateTokens(summary) <= boundedMax) return summary;
+  throw new Error('Extractive summary exceeded its token budget');
 }
 
 export class DatabaseStore {
@@ -731,51 +982,217 @@ export class DatabaseStore {
   getThreadSummary(threadId: string): ThreadSummaryRow | undefined {
     const row = this.database.raw
       .prepare(
-        'SELECT thread_id AS threadId, summary, through_message_id AS throughMessageId, message_count AS messageCount, version, updated_at AS updatedAt FROM thread_summaries WHERE thread_id = ?',
+        `SELECT thread_id AS threadId, summary,
+          through_message_id AS throughMessageId,
+          through_message_id AS sourceEndMessageId,
+          message_count AS messageCount,
+          message_count AS sourceMessageCount,
+          source_start_message_id AS sourceStartMessageId,
+          source_sha256 AS sourceSha256,
+          source_provenance AS sourceProvenance,
+          estimated_original_tokens AS estimatedOriginalTokens,
+          estimated_summary_tokens AS estimatedSummaryTokens,
+          summary_budget_tokens AS summaryBudgetTokens,
+          summarizer_version AS summarizerVersion,
+          policy_version AS policyVersion,
+          version, updated_at AS updatedAt
+        FROM thread_summaries WHERE thread_id = ?`,
       )
       .get(threadId) as ThreadSummaryRow | undefined;
     return row;
   }
 
-  compactThread(
+  listStructuredMessagesThrough(
     threadId: string,
-    keepMessages = 80,
-    maxSummaryBytes = 12_000,
-  ): ThreadSummaryRow | undefined {
+    throughMessageId: string,
+  ): StructuredMessageRow[] {
     const messages = this.listMessages(threadId, 100_000);
-    if (messages.length <= keepMessages) return this.getThreadSummary(threadId);
-    let split = messages.length - keepMessages;
-    while (split > 0 && messages[split]?.role === 'tool') split -= 1;
-    if (split <= 0) return this.getThreadSummary(threadId);
-    const compacted = messages.slice(0, split);
-    const lines = compacted.map((message) => `${message.role}: ${message.content}`);
-    let summary = lines.join('\n');
-    if (Buffer.byteLength(summary, 'utf8') > maxSummaryBytes) {
-      summary = summary.slice(-Math.max(0, maxSummaryBytes - 48));
-      summary = `[older transcript truncated]\n${summary}`;
+    const throughIndex = messages.findIndex((message) => message.id === throughMessageId);
+    if (throughIndex < 0) throw new Error(`Unknown message: ${throughMessageId}`);
+    const summary = this.getThreadSummary(threadId);
+    const summaryIndex = summary
+      ? messages.findIndex((message) => message.id === summary.sourceEndMessageId)
+      : -1;
+    const source = messages.slice(Math.max(0, summaryIndex + 1), throughIndex + 1);
+    const artifacts = new Map<string, MessageArtifactRow[]>();
+    for (const artifact of this.listThreadArtifacts(threadId)) {
+      const existing = artifacts.get(artifact.messageId) ?? [];
+      existing.push(artifact);
+      artifacts.set(artifact.messageId, existing);
     }
+    return source.map((message) => {
+      const messageArtifacts = artifacts.get(message.id) ?? [];
+      const callsArtifact = messageArtifacts.find((artifact) => artifact.kind === 'tool_calls');
+      const resultArtifact = messageArtifacts.find((artifact) => artifact.kind === 'tool_result');
+      const pinArtifact = messageArtifacts.find((artifact) => artifact.kind === 'context_pin');
+      const toolCalls = providerToolCalls(callsArtifact?.payload.calls);
+      const toolCallId =
+        typeof resultArtifact?.payload.callId === 'string'
+          ? resultArtifact.payload.callId
+          : undefined;
+      const toolName =
+        typeof resultArtifact?.payload.name === 'string' ? resultArtifact.payload.name : undefined;
+      return {
+        ...message,
+        role: message.role as ContextMessage['role'],
+        ...(toolCalls ? { toolCalls } : {}),
+        ...(toolCallId ? { toolCallId } : {}),
+        ...(toolName ? { toolName } : {}),
+        ...(pinArtifact && pinArtifact.payload.pinned !== false ? { pinned: true } : {}),
+      };
+    });
+  }
+
+  compactThreadThrough(
+    threadId: string,
+    throughMessageId: string,
+    maxSummaryTokens = 4_096,
+    now = Date.now(),
+  ): ThreadSummaryRow {
+    const allMessages = this.listMessages(threadId, 100_000);
+    const throughIndex = allMessages.findIndex((message) => message.id === throughMessageId);
+    if (throughIndex < 0) throw new Error(`Unknown message: ${throughMessageId}`);
     const previous = this.getThreadSummary(threadId);
+    const previousIndex = previous
+      ? allMessages.findIndex((message) => message.id === previous.sourceEndMessageId)
+      : -1;
+    const effectiveThroughIndex = Math.max(throughIndex, previousIndex);
+    const effectiveThroughMessageId = allMessages[effectiveThroughIndex].id;
+    const sourceMessages = allMessages.slice(0, effectiveThroughIndex + 1);
+    const artifacts = new Map<string, MessageArtifactRow[]>();
+    for (const artifact of this.listThreadArtifacts(threadId)) {
+      const existing = artifacts.get(artifact.messageId) ?? [];
+      existing.push(artifact);
+      artifacts.set(artifact.messageId, existing);
+    }
+    const structured = sourceMessages.map((message) => {
+      const messageArtifacts = artifacts.get(message.id) ?? [];
+      const calls = providerToolCalls(
+        messageArtifacts.find((artifact) => artifact.kind === 'tool_calls')?.payload.calls,
+      );
+      const result = messageArtifacts.find((artifact) => artifact.kind === 'tool_result');
+      return {
+        ...message,
+        role: message.role as ContextMessage['role'],
+        ...(calls ? { toolCalls: calls } : {}),
+        ...(typeof result?.payload.callId === 'string'
+          ? { toolCallId: result.payload.callId }
+          : {}),
+        ...(typeof result?.payload.name === 'string' ? { toolName: result.payload.name } : {}),
+        ...(messageArtifacts.some(
+          (artifact) => artifact.kind === 'context_pin' && artifact.payload.pinned !== false,
+        )
+          ? { pinned: true }
+          : {}),
+      } satisfies StructuredMessageRow;
+    });
+    const sourceSha256 = summarySourceHash(structured);
+    const boundedSummaryTokens = Math.max(0, Math.trunc(maxSummaryTokens));
+    const previousSummaryEstimate = previous ? estimateTokens(previous.summary) : -1;
+    if (
+      previous &&
+      previous.sourceEndMessageId === effectiveThroughMessageId &&
+      previous.sourceSha256 === sourceSha256 &&
+      previous.sourceProvenance === threadSummarySourceProvenance &&
+      previous.summaryBudgetTokens === boundedSummaryTokens &&
+      previous.summarizerVersion === threadSummarySummarizerVersion &&
+      previous.policyVersion === threadSummaryPolicyVersion &&
+      previous.estimatedSummaryTokens === previousSummaryEstimate &&
+      previousSummaryEstimate <= boundedSummaryTokens
+    )
+      return previous;
+
+    const compatiblePreviousPolicy =
+      previous?.sourceProvenance === threadSummarySourceProvenance &&
+      previous.summarizerVersion === threadSummarySummarizerVersion &&
+      previous.policyVersion === threadSummaryPolicyVersion;
+    const summary = extractiveSummary(
+      structured,
+      boundedSummaryTokens,
+      compatiblePreviousPolicy ? previous.summary : '',
+    );
+    const estimatedSummaryTokens = estimateTokens(summary);
+    if (estimatedSummaryTokens > boundedSummaryTokens)
+      throw new Error('Extractive summary exceeded its current token budget');
     const summaryRow: ThreadSummaryRow = {
       threadId,
       summary,
-      throughMessageId: compacted[compacted.length - 1].id,
-      messageCount: compacted.length,
+      throughMessageId: effectiveThroughMessageId,
+      messageCount: structured.length,
+      sourceStartMessageId: structured[0].id,
+      sourceEndMessageId: effectiveThroughMessageId,
+      sourceMessageCount: structured.length,
+      sourceSha256,
+      sourceProvenance: threadSummarySourceProvenance,
+      estimatedOriginalTokens: structured.reduce(
+        (total, message) => total + estimateMessageTokens(message),
+        0,
+      ),
+      estimatedSummaryTokens,
+      summaryBudgetTokens: boundedSummaryTokens,
+      summarizerVersion: threadSummarySummarizerVersion,
+      policyVersion: threadSummaryPolicyVersion,
       version: (previous?.version ?? 0) + 1,
-      updatedAt: Date.now(),
+      updatedAt: now,
     };
     this.database.raw
       .prepare(
-        'INSERT INTO thread_summaries (thread_id, summary, through_message_id, message_count, version, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET summary = excluded.summary, through_message_id = excluded.through_message_id, message_count = excluded.message_count, version = excluded.version, updated_at = excluded.updated_at',
+        `INSERT INTO thread_summaries
+          (thread_id, summary, through_message_id, message_count, source_start_message_id,
+            source_sha256, source_provenance, estimated_original_tokens,
+            estimated_summary_tokens, summary_budget_tokens, summarizer_version, policy_version,
+            version, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+          summary = excluded.summary,
+          through_message_id = excluded.through_message_id,
+          message_count = excluded.message_count,
+          source_start_message_id = excluded.source_start_message_id,
+          source_sha256 = excluded.source_sha256,
+          source_provenance = excluded.source_provenance,
+          estimated_original_tokens = excluded.estimated_original_tokens,
+          estimated_summary_tokens = excluded.estimated_summary_tokens,
+          summary_budget_tokens = excluded.summary_budget_tokens,
+          summarizer_version = excluded.summarizer_version,
+          policy_version = excluded.policy_version,
+          version = excluded.version,
+          updated_at = excluded.updated_at`,
       )
       .run(
         summaryRow.threadId,
         summaryRow.summary,
-        summaryRow.throughMessageId,
-        summaryRow.messageCount,
+        summaryRow.sourceEndMessageId,
+        summaryRow.sourceMessageCount,
+        summaryRow.sourceStartMessageId,
+        summaryRow.sourceSha256,
+        summaryRow.sourceProvenance,
+        summaryRow.estimatedOriginalTokens,
+        summaryRow.estimatedSummaryTokens,
+        summaryRow.summaryBudgetTokens,
+        summaryRow.summarizerVersion,
+        summaryRow.policyVersion,
         summaryRow.version,
         summaryRow.updatedAt,
       );
     return summaryRow;
+  }
+
+  compactThread(
+    threadId: string,
+    keepMessages = 80,
+    maxSummaryTokens = 4_096,
+  ): ThreadSummaryRow | undefined {
+    const messages = this.listMessages(threadId, 100_000);
+    if (messages.length <= keepMessages) {
+      const previous = this.getThreadSummary(threadId);
+      return previous
+        ? this.compactThreadThrough(threadId, previous.sourceEndMessageId, maxSummaryTokens)
+        : undefined;
+    }
+    let split = messages.length - keepMessages;
+    while (split > 0 && messages[split]?.role === 'tool') split -= 1;
+    if (split <= 0) return this.getThreadSummary(threadId);
+    return this.compactThreadThrough(threadId, messages[split - 1].id, maxSummaryTokens);
   }
 
   listContextMessages(
@@ -847,6 +1264,84 @@ export class DatabaseStore {
     return run;
   }
 
+  createRunArtifact(artifact: RunArtifactRow): RunArtifactRow {
+    const run = this.getRun(artifact.runId);
+    if (!run) throw new Error(`Unknown run: ${artifact.runId}`);
+    if (run.threadId !== artifact.threadId)
+      throw new Error(`Run ${artifact.runId} does not belong to thread ${artifact.threadId}`);
+    this.database.raw
+      .prepare(
+        'INSERT INTO run_artifacts (id, run_id, thread_id, kind, title, mime_type, byte_size, sha256, source_tool, metadata, external_url, storage_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        artifact.id,
+        artifact.runId,
+        artifact.threadId,
+        artifact.kind,
+        artifact.title,
+        artifact.mimeType,
+        artifact.byteSize,
+        artifact.sha256,
+        artifact.sourceTool,
+        JSON.stringify(redactValue(artifact.metadata)),
+        artifact.externalUrl,
+        artifact.storagePath,
+        artifact.createdAt,
+      );
+    return this.getRunArtifact(artifact.id) as RunArtifactRow;
+  }
+
+  getRunArtifact(id: string): RunArtifactRow | undefined {
+    const row = this.database.raw
+      .prepare(
+        'SELECT id, run_id AS runId, thread_id AS threadId, kind, title, mime_type AS mimeType, byte_size AS byteSize, sha256, source_tool AS sourceTool, metadata, external_url AS externalUrl, storage_path AS storagePath, created_at AS createdAt FROM run_artifacts WHERE id = ?',
+      )
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.runArtifactFromRow(row) : undefined;
+  }
+
+  listRunArtifacts(runId: string): RunArtifactRow[] {
+    return (
+      this.database.raw
+        .prepare(
+          'SELECT id, run_id AS runId, thread_id AS threadId, kind, title, mime_type AS mimeType, byte_size AS byteSize, sha256, source_tool AS sourceTool, metadata, external_url AS externalUrl, storage_path AS storagePath, created_at AS createdAt FROM run_artifacts WHERE run_id = ? ORDER BY created_at ASC, rowid ASC',
+        )
+        .all(runId) as Array<Record<string, unknown>>
+    ).map((row) => this.runArtifactFromRow(row));
+  }
+
+  listThreadRunArtifacts(threadId: string): RunArtifactRow[] {
+    return (
+      this.database.raw
+        .prepare(
+          'SELECT id, run_id AS runId, thread_id AS threadId, kind, title, mime_type AS mimeType, byte_size AS byteSize, sha256, source_tool AS sourceTool, metadata, external_url AS externalUrl, storage_path AS storagePath, created_at AS createdAt FROM run_artifacts WHERE thread_id = ? ORDER BY created_at ASC, rowid ASC',
+        )
+        .all(threadId) as Array<Record<string, unknown>>
+    ).map((row) => this.runArtifactFromRow(row));
+  }
+
+  deleteRunArtifact(id: string): boolean {
+    return this.database.raw.prepare('DELETE FROM run_artifacts WHERE id = ?').run(id).changes > 0;
+  }
+
+  private runArtifactFromRow(row: Record<string, unknown>): RunArtifactRow {
+    return {
+      id: String(row.id),
+      runId: String(row.runId),
+      threadId: String(row.threadId),
+      kind: String(row.kind),
+      title: String(row.title),
+      mimeType: String(row.mimeType),
+      byteSize: Number(row.byteSize),
+      sha256: String(row.sha256),
+      sourceTool: String(row.sourceTool),
+      metadata: JSON.parse(String(row.metadata)) as Record<string, unknown>,
+      externalUrl: row.externalUrl === null ? null : String(row.externalUrl),
+      storagePath: row.storagePath === null ? null : String(row.storagePath),
+      createdAt: Number(row.createdAt),
+    };
+  }
+
   getRun(id: string): RunRow | undefined {
     const row = this.database.raw
       .prepare(
@@ -897,7 +1392,9 @@ export class DatabaseStore {
 
   listActiveRuns(): RunRow[] {
     const rows = this.database.raw
-      .prepare("SELECT id FROM runs WHERE status IN ('queued', 'running') ORDER BY created_at")
+      .prepare(
+        "SELECT id FROM runs WHERE status IN ('queued', 'running', 'paused') ORDER BY created_at",
+      )
       .all() as Array<{ id: string }>;
     return rows.map(({ id }) => this.getRun(id)).filter((run): run is RunRow => Boolean(run));
   }
@@ -905,7 +1402,7 @@ export class DatabaseStore {
   listActiveRunsForThread(threadId: string): RunRow[] {
     const rows = this.database.raw
       .prepare(
-        "SELECT id FROM runs WHERE thread_id = ? AND status IN ('queued', 'running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at ASC, rowid ASC",
+        "SELECT id FROM runs WHERE thread_id = ? AND status IN ('queued', 'running', 'paused') ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END, created_at ASC, rowid ASC",
       )
       .all(threadId) as Array<{ id: string }>;
     return rows.map(({ id }) => this.getRun(id)).filter((run): run is RunRow => Boolean(run));
@@ -970,6 +1467,240 @@ export class DatabaseStore {
     this.database.raw
       .prepare('UPDATE runs SET cancel_requested = 1, updated_at = ? WHERE id = ?')
       .run(Date.now(), id);
+  }
+
+  createApprovalRequest(input: ApprovalRequestInput, now = Date.now()): ApprovalRequestRow {
+    const id = input.id ?? randomUUID();
+    if (!input.runId || !input.threadId || !input.toolCallId || !input.toolName)
+      throw new Error('Approval request binding is incomplete');
+    if (input.expiresAt <= now || input.expiresAt > now + 86_400_000)
+      throw new Error('Approval expiry is outside the allowed range');
+    const expectedHash = approvalPayloadHash(input.runId, input.toolName, input.canonicalArguments);
+    if (input.payloadHash !== expectedHash)
+      throw new ApprovalStateError(
+        'Approval payload hash does not match its binding',
+        'approval_payload_mismatch',
+      );
+    const argumentsValue = JSON.parse(input.canonicalArguments) as Record<string, unknown>;
+    const preview = buildApprovalPreview(input.toolName, argumentsValue, {
+      permissionSource: input.permissionSource,
+      sessionId: input.sessionId,
+    });
+    this.database.raw
+      .prepare(
+        `INSERT INTO approval_requests
+          (id, run_id, thread_id, session_id, tool_call_id, tool_name, arguments_preview,
+           payload_hash, required_permission, permission_source, risk, target, provider_owned,
+           status, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      )
+      .run(
+        id,
+        input.runId,
+        input.threadId,
+        input.sessionId ?? null,
+        input.toolCallId,
+        input.toolName,
+        JSON.stringify(preview),
+        input.payloadHash,
+        input.requiredPermission,
+        input.permissionSource,
+        boundedApprovalPreview(input.risk, 120),
+        approvalTarget(input.toolName, argumentsValue),
+        input.providerOwned ? 1 : 0,
+        now,
+        input.expiresAt,
+      );
+    return this.getApprovalRequest(id) as ApprovalRequestRow;
+  }
+
+  getApprovalRequest(id: string): ApprovalRequestRow | undefined {
+    const row = this.database.raw.prepare('SELECT * FROM approval_requests WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.approvalFromRow(row) : undefined;
+  }
+
+  listApprovalRequests(status?: ApprovalRequestRow['status']): ApprovalRequestRow[] {
+    const rows = this.database.raw
+      .prepare(
+        status
+          ? 'SELECT * FROM approval_requests WHERE status = ? ORDER BY created_at DESC, rowid DESC'
+          : 'SELECT * FROM approval_requests ORDER BY created_at DESC, rowid DESC',
+      )
+      .all(...(status ? [status] : [])) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.approvalFromRow(row));
+  }
+
+  decideApprovalRequest(
+    id: string,
+    decision: ApprovalDecision,
+    now = Date.now(),
+    expectedPayloadHash?: string,
+  ): ApprovalRequestRow {
+    const outcome = this.transaction((): ApprovalRequestRow | 'expired' => {
+      const current = this.getApprovalRequest(id);
+      if (!current)
+        throw new ApprovalStateError(`Unknown approval request: ${id}`, 'approval_not_found');
+      if (expectedPayloadHash !== undefined && current.payloadHash !== expectedPayloadHash)
+        throw new ApprovalStateError(
+          `Approval request ${id} payload hash does not match the displayed request`,
+          'approval_payload_mismatch',
+        );
+      if (current.status !== 'pending')
+        throw new ApprovalStateError(
+          `Approval request ${id} is not pending (status: ${current.status})`,
+          current.status === 'executed' ? 'approval_consumed' : 'approval_not_pending',
+        );
+      if (current.expiresAt <= now) {
+        this.database.raw
+          .prepare(
+            "UPDATE approval_requests SET status = 'expired', decided_at = ? WHERE id = ? AND status = 'pending'",
+          )
+          .run(now, id);
+        return 'expired';
+      }
+      const result = this.database.raw
+        .prepare(
+          "UPDATE approval_requests SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending' AND expires_at > ?",
+        )
+        .run(decision, now, id, now);
+      if (result.changes !== 1)
+        throw new ApprovalStateError(
+          `Approval request ${id} was already decided`,
+          'approval_not_pending',
+        );
+      return this.getApprovalRequest(id) as ApprovalRequestRow;
+    });
+    if (outcome === 'expired')
+      throw new ApprovalStateError(`Approval request ${id} expired`, 'approval_expired');
+    return outcome;
+  }
+
+  claimApprovalExecution(
+    id: string,
+    expected: { runId: string; toolName: string; canonicalArguments: string },
+    now = Date.now(),
+  ): ApprovalRequestRow {
+    const outcome = this.transaction((): ApprovalRequestRow | 'expired' => {
+      const current = this.getApprovalRequest(id);
+      if (!current)
+        throw new ApprovalStateError(`Unknown approval request: ${id}`, 'approval_not_found');
+      const expectedHash = approvalPayloadHash(
+        expected.runId,
+        expected.toolName,
+        expected.canonicalArguments,
+      );
+      if (
+        current.runId !== expected.runId ||
+        current.toolName !== expected.toolName ||
+        current.payloadHash !== expectedHash
+      )
+        throw new ApprovalStateError(
+          `Approval request ${id} payload binding does not match`,
+          'approval_payload_mismatch',
+        );
+      if (current.expiresAt <= now) {
+        if (current.status === 'pending' || current.status === 'approved')
+          this.database.raw
+            .prepare(
+              "UPDATE approval_requests SET status = 'expired', execution_error = ? WHERE id = ? AND status IN ('pending', 'approved')",
+            )
+            .run('Approval expired before execution', id);
+        return 'expired';
+      }
+      if (current.status !== 'approved')
+        throw new ApprovalStateError(
+          current.status === 'executed'
+            ? `Approval request ${id} was already consumed`
+            : `Approval request ${id} is not approved (status: ${current.status})`,
+          current.status === 'executed' ? 'approval_consumed' : 'approval_not_pending',
+        );
+      const result = this.database.raw
+        .prepare(
+          "UPDATE approval_requests SET status = 'executed', execution_started_at = ? WHERE id = ? AND status = 'approved' AND expires_at > ?",
+        )
+        .run(now, id, now);
+      if (result.changes !== 1)
+        throw new ApprovalStateError(
+          `Approval request ${id} was already consumed`,
+          'approval_consumed',
+        );
+      return this.getApprovalRequest(id) as ApprovalRequestRow;
+    });
+    if (outcome === 'expired')
+      throw new ApprovalStateError(`Approval request ${id} expired`, 'approval_expired');
+    return outcome;
+  }
+
+  completeApprovalExecution(id: string, result: unknown, now = Date.now()): ApprovalRequestRow {
+    const current = this.getApprovalRequest(id);
+    if (!current)
+      throw new ApprovalStateError(`Unknown approval request: ${id}`, 'approval_not_found');
+    if (current.status !== 'executed')
+      throw new ApprovalStateError(
+        `Approval request ${id} was not claimed`,
+        'approval_not_pending',
+      );
+    this.database.raw
+      .prepare(
+        'UPDATE approval_requests SET execution_completed_at = ?, result_hash = ?, result_preview = ?, execution_error = NULL WHERE id = ?',
+      )
+      .run(now, resultHash(result), boundedApprovalPreview(result), id);
+    return this.getApprovalRequest(id) as ApprovalRequestRow;
+  }
+
+  failApprovalExecution(id: string, error: unknown, now = Date.now()): ApprovalRequestRow {
+    const current = this.getApprovalRequest(id);
+    if (!current)
+      throw new ApprovalStateError(`Unknown approval request: ${id}`, 'approval_not_found');
+    if (current.status !== 'approved' && current.status !== 'executed') return current;
+    this.database.raw
+      .prepare(
+        "UPDATE approval_requests SET status = 'failed', execution_completed_at = ?, execution_error = ? WHERE id = ? AND status IN ('approved', 'executed')",
+      )
+      .run(now, boundedApprovalPreview(error instanceof Error ? error.message : error), id);
+    return this.getApprovalRequest(id) as ApprovalRequestRow;
+  }
+
+  expireApprovalRequest(id: string, now = Date.now()): ApprovalRequestRow | undefined {
+    this.database.raw
+      .prepare(
+        "UPDATE approval_requests SET status = 'expired', decided_at = COALESCE(decided_at, ?) WHERE id = ? AND status IN ('pending', 'approved') AND expires_at <= ?",
+      )
+      .run(now, id, now);
+    return this.getApprovalRequest(id);
+  }
+
+  private approvalFromRow(row: Record<string, unknown>): ApprovalRequestRow {
+    return {
+      id: String(row.id),
+      runId: String(row.run_id),
+      threadId: String(row.thread_id),
+      sessionId: row.session_id === null ? null : String(row.session_id),
+      toolCallId: String(row.tool_call_id),
+      toolName: String(row.tool_name),
+      argumentsPreview: String(row.arguments_preview),
+      payloadHash: String(row.payload_hash),
+      requiredPermission: String(
+        row.required_permission,
+      ) as ApprovalRequestRow['requiredPermission'],
+      permissionSource: String(row.permission_source),
+      risk: String(row.risk),
+      target: String(row.target),
+      providerOwned: Boolean(row.provider_owned),
+      status: String(row.status) as ApprovalRequestRow['status'],
+      createdAt: Number(row.created_at),
+      expiresAt: Number(row.expires_at),
+      decidedAt: row.decided_at === null ? null : Number(row.decided_at),
+      executionStartedAt:
+        row.execution_started_at === null ? null : Number(row.execution_started_at),
+      executionCompletedAt:
+        row.execution_completed_at === null ? null : Number(row.execution_completed_at),
+      resultHash: row.result_hash === null ? null : String(row.result_hash),
+      resultPreview: row.result_preview === null ? null : String(row.result_preview),
+      executionError: row.execution_error === null ? null : String(row.execution_error),
+    };
   }
 
   storeMemory(

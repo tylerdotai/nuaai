@@ -26,6 +26,23 @@ export const messages = sqliteTable('messages', {
   createdAt: integer('created_at').notNull(),
 });
 
+export const threadSummaries = sqliteTable('thread_summaries', {
+  threadId: text('thread_id').primaryKey(),
+  summary: text('summary').notNull(),
+  throughMessageId: text('through_message_id').notNull(),
+  messageCount: integer('message_count').notNull(),
+  sourceStartMessageId: text('source_start_message_id').notNull().default(''),
+  sourceSha256: text('source_sha256').notNull().default(''),
+  sourceProvenance: text('source_provenance').notNull().default('sha256:canonical-message-v1'),
+  estimatedOriginalTokens: integer('estimated_original_tokens').notNull().default(0),
+  estimatedSummaryTokens: integer('estimated_summary_tokens').notNull().default(0),
+  summaryBudgetTokens: integer('summary_budget_tokens').notNull().default(-1),
+  summarizerVersion: text('summarizer_version').notNull().default('legacy'),
+  policyVersion: text('policy_version').notNull().default('legacy'),
+  version: integer('version').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+});
+
 export const events = sqliteTable('events', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   eventId: text('event_id').notNull().unique(),
@@ -53,6 +70,47 @@ export const runs = sqliteTable('runs', {
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
   correlationId: text('correlation_id').notNull(),
+});
+
+export const runArtifacts = sqliteTable('run_artifacts', {
+  id: text('id').primaryKey(),
+  runId: text('run_id').notNull(),
+  threadId: text('thread_id').notNull(),
+  kind: text('kind').notNull(),
+  title: text('title').notNull(),
+  mimeType: text('mime_type').notNull(),
+  byteSize: integer('byte_size').notNull(),
+  sha256: text('sha256').notNull(),
+  sourceTool: text('source_tool').notNull(),
+  metadata: text('metadata').notNull().default('{}'),
+  externalUrl: text('external_url'),
+  storagePath: text('storage_path'),
+  createdAt: integer('created_at').notNull(),
+});
+
+export const approvalRequests = sqliteTable('approval_requests', {
+  id: text('id').primaryKey(),
+  runId: text('run_id').notNull(),
+  threadId: text('thread_id').notNull(),
+  sessionId: text('session_id'),
+  toolCallId: text('tool_call_id').notNull(),
+  toolName: text('tool_name').notNull(),
+  argumentsPreview: text('arguments_preview').notNull(),
+  payloadHash: text('payload_hash').notNull(),
+  requiredPermission: text('required_permission').notNull(),
+  permissionSource: text('permission_source').notNull(),
+  risk: text('risk').notNull(),
+  target: text('target').notNull(),
+  providerOwned: integer('provider_owned', { mode: 'boolean' }).notNull().default(false),
+  status: text('status').notNull(),
+  createdAt: integer('created_at').notNull(),
+  expiresAt: integer('expires_at').notNull(),
+  decidedAt: integer('decided_at'),
+  executionStartedAt: integer('execution_started_at'),
+  executionCompletedAt: integer('execution_completed_at'),
+  resultHash: text('result_hash'),
+  resultPreview: text('result_preview'),
+  executionError: text('execution_error'),
 });
 
 export const memories = sqliteTable('memory_records', {

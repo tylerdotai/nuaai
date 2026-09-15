@@ -52,10 +52,66 @@ export interface AttachmentView {
   size?: number;
 }
 
-export interface ArtifactView {
-  type: 'unsupported';
-  sourceKind: string;
-  label: string;
+export type RunArtifactKind =
+  | 'file'
+  | 'diff'
+  | 'test-report'
+  | 'screenshot'
+  | 'citation'
+  | 'deployment-receipt';
+
+export type ArtifactView =
+  | {
+      type: 'artifact';
+      id: string;
+      runId: string;
+      kind: Exclude<RunArtifactKind, 'citation'>;
+      title: string;
+      mimeType: string;
+      byteSize: number;
+      sha256: string;
+      sourceTool: string;
+      createdAt: number;
+      downloadUrl?: string;
+      externalUrl?: string;
+    }
+  | {
+      type: 'unsupported';
+      sourceKind: string;
+      label: string;
+    };
+
+export interface ApprovalRequest {
+  id: string;
+  runId: string;
+  threadId: string;
+  toolName: string;
+  status: 'pending' | 'approved' | 'denied' | 'expired' | 'executed' | 'failed';
+  payloadHash: string;
+  target: string;
+  risk: string;
+  preview: {
+    version: 1;
+    kind: string;
+    summary: string;
+    fields: Array<{ label: string; value: string; format?: 'code' }>;
+    context: {
+      source: 'web' | 'matrix' | 'scheduler' | 'direct' | 'other';
+      client: string;
+      sessionId?: string;
+    };
+  };
+  providerOwned: boolean;
+  createdAt: number;
+  expiresAt: number;
+  decidedAt?: number;
+  execution?: {
+    startedAt?: number;
+    completedAt?: number;
+    resultHash?: string;
+    resultPreview?: string;
+    error?: string;
+  };
 }
 
 export interface MessageView {

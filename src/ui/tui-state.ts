@@ -22,20 +22,80 @@ export interface TuiThread {
   title: string;
 }
 
+export type TuiConversationArtifact =
+  | {
+      type: 'artifact';
+      kind: string;
+      title: string;
+      downloadUrl?: string;
+      externalUrl?: string;
+    }
+  | { type: 'unsupported'; title: string };
+
 export interface TuiConversationMessage {
   role: string;
   content: string;
+  artifacts?: TuiConversationArtifact[];
+  citations?: Array<{ title: string; url: string }>;
+}
+
+export function tuiArtifactLines(message: TuiConversationMessage): string[] {
+  return [
+    ...(message.artifacts ?? []).map((artifact) =>
+      artifact.type === 'unsupported'
+        ? `Artifact: ${artifact.title}`
+        : `Artifact: ${artifact.title} [${artifact.kind}]${artifact.downloadUrl ? ` · ${artifact.downloadUrl}` : artifact.externalUrl ? ` · ${artifact.externalUrl}` : ''}`,
+    ),
+    ...(message.citations ?? []).map((citation) => `Citation: ${citation.title} · ${citation.url}`),
+  ];
 }
 
 export function tuiMessagesFromPresentation(
-  messages: Array<{ role: string; markdown: string }>,
+  messages: Array<{
+    role: string;
+    markdown: string;
+    artifacts?: Array<{
+      type: string;
+      sourceKind?: string;
+      kind?: string;
+      title?: string;
+      downloadUrl?: string;
+      externalUrl?: string;
+      label?: string;
+    }>;
+    citations?: Array<{ id?: string; title: string; url: string }>;
+  }>,
 ): TuiConversationMessage[] {
   return messages
     .filter(
       (message) =>
         (message.role === 'user' || message.role === 'assistant') && message.markdown.trim(),
     )
-    .map((message) => ({ role: message.role, content: message.markdown }));
+    .map((message) => {
+      const artifacts: TuiConversationArtifact[] = (message.artifacts ?? []).flatMap(
+        (artifact): TuiConversationArtifact[] => {
+          if (artifact.type === 'unsupported')
+            return artifact.label ? [{ type: 'unsupported' as const, title: artifact.label }] : [];
+          if (artifact.type !== 'artifact' || !artifact.kind || !artifact.title) return [];
+          return [
+            {
+              type: 'artifact' as const,
+              kind: artifact.kind,
+              title: artifact.title,
+              ...(artifact.downloadUrl ? { downloadUrl: artifact.downloadUrl } : {}),
+              ...(artifact.externalUrl ? { externalUrl: artifact.externalUrl } : {}),
+            },
+          ];
+        },
+      );
+      const citations = (message.citations ?? []).map(({ title, url }) => ({ title, url }));
+      return {
+        role: message.role,
+        content: message.markdown,
+        ...(artifacts.length ? { artifacts } : {}),
+        ...(citations.length ? { citations } : {}),
+      };
+    });
 }
 
 export interface TuiToolActivity {
@@ -92,6 +152,27 @@ export interface TuiRetryState {
   maxAttempts: number;
 }
 
+export interface TuiApproval {
+  id: string;
+  runId: string;
+  threadId: string;
+  toolName: string;
+  status: string;
+  payloadHash: string;
+  target: string;
+  risk: string;
+  preview: {
+    version: 1;
+    kind: string;
+    summary: string;
+    fields: Array<{ label: string; value: string; format?: 'code' }>;
+    context: { source: string; client: string; sessionId?: string };
+  };
+  providerOwned: boolean;
+  createdAt: number;
+  expiresAt: number;
+}
+
 export interface TuiState {
   connection: TuiConnection;
   error: string | null;
@@ -113,6 +194,7 @@ export interface TuiState {
   tools: TuiToolActivity[];
   lastRunStatus: 'completed' | 'failed' | 'cancelled' | null;
   retry: TuiRetryState | null;
+  approvals: TuiApproval[];
 }
 
 export type TuiEvent =
@@ -127,6 +209,7 @@ export type TuiEvent =
       plugins: TuiPlugin[];
       providers: TuiProviderHealth[];
       secretNames: string[];
+      approvals?: TuiApproval[];
     }
   | { type: 'view.changed'; view: TuiView }
   | { type: 'session.selected'; sessionId: string }
@@ -154,6 +237,12 @@ export function nextSelection(
   return ids[nextIndex] ?? null;
 }
 
+export const tuiApprovalFallbackIntervalMs = 15_000;
+
+export function tuiReconnectDelayMs(attempt: number): number {
+  return Math.min(1_000 * 2 ** Math.max(0, attempt - 1), 10_000);
+}
+
 export const initialTuiState: TuiState = {
   connection: 'connecting',
   error: null,
@@ -175,6 +264,7 @@ export const initialTuiState: TuiState = {
   tools: [],
   lastRunStatus: null,
   retry: null,
+  approvals: [],
 };
 
 export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
@@ -206,6 +296,7 @@ export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
         plugins: event.plugins,
         providers: event.providers,
         secretNames: event.secretNames,
+        approvals: event.approvals ?? state.approvals,
       };
     case 'view.changed':
       return { ...state, view: event.view };

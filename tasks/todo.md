@@ -124,4 +124,26 @@ Production routing now uses direct streaming Responses. The endpoint is fixed, r
 - [x] Treat `model.completed.text` as canonical for the current live attempt.
 - [x] Preserve bounded non-delta lifecycle events so long output cannot erase early action history.
 - [x] Apply promise-only finalization truth to provider-owned loops and grant stale-snapshot replacement only to paths that reset event subscription.
-- [ ] Run the complete gate, obtain fresh independent review, push, redeploy, and repeat production pairing/readback.
+- [x] Run the complete gate, obtain fresh independent review, push, redeploy, and repeat production pairing/readback.
+
+## v1-next daily-use platform
+
+- [x] Release, tag, publish artifacts, and deploy `v1.0.1`; npm registry publication remains credential-blocked.
+- [x] Execute the production dogfood protocol: 20/20 final cases, 20/20 actions, cancellation/resume, and reload/reconnect controls.
+- [ ] Persist payload-bound per-action approval requests; ship approve-once/deny/expiry UI and execution readback.
+  - [ ] Separate mutating media extraction from read-only inspection and require exact approval before ffmpeg writes.
+  - [ ] Keep shell-free read-only workspace commands immediate; require meaningful, secret-safe previews for every consequential tool.
+  - [ ] Preserve run and per-tool budgets across approval restart recovery.
+  - [ ] Preserve TUI thread selection under refresh races and support deliberate exact-hash approve/deny controls.
+- [ ] Replace crude byte compaction with provider-neutral token budgets, durable provenance, pinned constraints, and atomic tool-call/result groups.
+  - [ ] Count current-input images and re-plan the exact request before every provider turn.
+  - [ ] Exclude checkpoints, old messages, and all memory from isolated verification/mutation runs before prompt assembly.
+  - [ ] Keep optional memories whole and fail closed when pinned/protected context exceeds the aggregate budget.
+  - [ ] Represent every dropped complete group in a durable checkpoint; never issue an over-budget provider request.
+- [ ] Persist and present typed run artifacts with authenticated safe downloads, checksums, citations, PWA cards, and TUI visibility.
+  - [ ] Authorize the actual opened source descriptor, not a pathname checked before a parent-directory race.
+  - [ ] Sanitize all text-origin content regardless of MIME and bind workspace-write artifacts to immutable input bytes.
+  - [ ] Keep failure events content-free and make optional capture independent of tool/run success.
+- [ ] Integrate feature lanes, reconcile migrations/contracts, and run focused cross-feature tests.
+- [ ] Run the complete canonical gate and two independent exact-tree reviews on one frozen commit.
+- [ ] Merge through GitHub CI, release `v1.1.0`, deploy only with zero active runs, and verify approvals, compaction, artifacts, reload, and `/nuaai` routing through the paired production PWA.

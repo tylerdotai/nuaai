@@ -1,0 +1,182 @@
+[
+  {
+    "id": "case-01",
+    "category": "workspace",
+    "title": "Package release metadata",
+    "prompt": "Verify the installed NUAAI package version using the canonical workspace.read tool exactly once on package.json. Do not use any substitute tool and do not modify anything. Report the version and include the exact marker CASE-01.",
+    "expectedTools": ["workspace.read"],
+    "requiredOutputTerms": ["1.0.1", "CASE-01"],
+    "minOutputChars": 40
+  },
+  {
+    "id": "case-02",
+    "category": "workspace",
+    "title": "Repository operating rules",
+    "prompt": "Verify the repository's required Node.js version using the canonical workspace.read tool exactly once on AGENTS.md. Do not use any substitute tool and do not modify anything. Report the requirement and include the exact marker CASE-02.",
+    "expectedTools": ["workspace.read"],
+    "requiredOutputTerms": ["Node.js", "22", "CASE-02"],
+    "minOutputChars": 60
+  },
+  {
+    "id": "case-03",
+    "category": "workspace",
+    "title": "Changelog inspection",
+    "prompt": "Verify that CHANGELOG.md is a readable text artifact using the canonical workspace.inspect tool exactly once. Do not use any substitute tool and do not modify anything. Report the inspected path and format and include the exact marker CASE-03.",
+    "expectedTools": ["workspace.inspect"],
+    "requiredOutputTerms": ["CHANGELOG.md", "CASE-03"],
+    "minOutputChars": 50
+  },
+  {
+    "id": "case-04",
+    "category": "workspace",
+    "title": "Workspace structure",
+    "prompt": "Verify the top-level NUAAI workspace structure using the canonical workspace.list tool exactly once. Do not use any substitute tool and do not modify anything. Confirm whether src and tests are present and include the exact marker CASE-04.",
+    "expectedTools": ["workspace.list"],
+    "requiredOutputTerms": ["src", "tests", "CASE-04"],
+    "minOutputChars": 60
+  },
+  {
+    "id": "case-05",
+    "category": "workspace",
+    "title": "Finality classifier location",
+    "prompt": "Verify where looksLikeFutureIntent is implemented using the canonical workspace.search tool exactly once with that symbol as the query. Do not use any substitute tool and do not modify anything. Report the matching source path and include the exact marker CASE-05.",
+    "expectedTools": ["workspace.search"],
+    "requiredOutputTerms": ["src/core/runtime.ts", "CASE-05"],
+    "minOutputChars": 60
+  },
+  {
+    "id": "case-06",
+    "category": "workspace",
+    "title": "Replay index location",
+    "prompt": "Verify where events_run_id_idx is defined using the canonical workspace.search tool exactly once with that index name as the query. Do not use any substitute tool and do not modify anything. Report the matching source path and include the exact marker CASE-06.",
+    "expectedTools": ["workspace.search"],
+    "requiredOutputTerms": ["src/memory/db.ts", "CASE-06"],
+    "minOutputChars": 60
+  },
+  {
+    "id": "case-07",
+    "category": "host",
+    "title": "Runtime working directory",
+    "prompt": "Verify the daemon workspace working directory using the canonical workspace.command tool exactly once with command pwd and no arguments. Do not use any substitute tool and do not modify anything. Report the exact path and include the exact marker CASE-07.",
+    "expectedTools": ["workspace.command"],
+    "requiredOutputTerms": ["/home/tyler/nuai", "CASE-07"],
+    "minOutputChars": 50
+  },
+  {
+    "id": "case-08",
+    "category": "host",
+    "title": "Runtime source line count",
+    "prompt": "Verify the line count of src/core/runtime.ts using the canonical workspace.command tool exactly once with command wc and arguments -l and src/core/runtime.ts. Do not use any substitute tool and do not modify anything. Report the measured line count and include the exact marker CASE-08.",
+    "expectedTools": ["workspace.command"],
+    "requiredOutputTerms": ["src/core/runtime.ts", "CASE-08"],
+    "minOutputChars": 60
+  },
+  {
+    "id": "case-09",
+    "category": "provider",
+    "title": "Active provider health",
+    "prompt": "Verify the active provider, model, and health using the canonical provider.status tool exactly once. Do not use any substitute tool and do not change provider settings. Report the active provider and include the exact marker CASE-09.",
+    "expectedTools": ["provider.status"],
+    "requiredOutputTerms": ["codex", "CASE-09"],
+    "minOutputChars": 60
+  },
+  {
+    "id": "case-10",
+    "category": "provider",
+    "title": "Provider catalog",
+    "prompt": "Verify the configured provider catalog using the canonical provider.list tool exactly once. Do not use any substitute tool and do not change provider settings. Confirm that Codex appears and include the exact marker CASE-10.",
+    "expectedTools": ["provider.list"],
+    "requiredOutputTerms": ["codex", "CASE-10"],
+    "minOutputChars": 60
+  },
+  {
+    "id": "case-11",
+    "category": "history",
+    "title": "Current thread run history",
+    "prompt": "Verify the current conversation's durable run history using the canonical run.history tool exactly once. Do not use any substitute tool and do not modify anything. State how many entries the tool returned and include the exact marker CASE-11.",
+    "expectedTools": ["run.history"],
+    "requiredOutputTerms": ["CASE-11"],
+    "minOutputChars": 50
+  },
+  {
+    "id": "case-12",
+    "category": "scheduler",
+    "title": "Schedule inventory",
+    "prompt": "Verify the current durable schedule inventory using the canonical schedule.list tool exactly once. Do not use any substitute tool and do not create or modify schedules. State the observed count and include the exact marker CASE-12.",
+    "expectedTools": ["schedule.list"],
+    "requiredOutputTerms": ["CASE-12"],
+    "minOutputChars": 50
+  },
+  {
+    "id": "case-13",
+    "category": "scheduler",
+    "title": "Background task inventory",
+    "prompt": "Verify the current durable background task inventory using the canonical task.list tool exactly once. Do not use any substitute tool and do not create or cancel tasks. State the observed count and include the exact marker CASE-13.",
+    "expectedTools": ["task.list"],
+    "requiredOutputTerms": ["CASE-13"],
+    "minOutputChars": 50
+  },
+  {
+    "id": "case-14",
+    "category": "web",
+    "title": "Current Node.js release search",
+    "prompt": "Verify the current Node.js LTS release line using the canonical web.search tool exactly once with a query restricted to official nodejs.org release information. Do not use any substitute tool. Cite the observed release line and include the exact marker CASE-14.",
+    "expectedTools": ["web.search"],
+    "requiredOutputTerms": ["Node.js", "CASE-14"],
+    "minOutputChars": 80
+  },
+  {
+    "id": "case-15",
+    "category": "web",
+    "title": "Official Node.js release page",
+    "prompt": "Verify the official Node.js previous-releases page using the canonical web.fetch tool exactly once with URL https://nodejs.org/en/about/previous-releases. Do not use any substitute tool. Report what page was fetched and include the exact marker CASE-15.",
+    "expectedTools": ["web.fetch"],
+    "requiredOutputTerms": ["Node.js", "CASE-15"],
+    "minOutputChars": 80
+  },
+  {
+    "id": "case-16",
+    "category": "browser",
+    "title": "Production health page",
+    "prompt": "Verify the NUAAI production health page using the canonical browser.open tool exactly once with URL https://clawbox.taila17045.ts.net/nuaai/health. Do not use any substitute tool. Report the observed status without exposing credentials and include the exact marker CASE-16.",
+    "expectedTools": ["browser.open"],
+    "requiredOutputTerms": ["ok", "CASE-16"],
+    "minOutputChars": 60
+  },
+  {
+    "id": "case-17",
+    "category": "github",
+    "title": "GitHub authentication boundary",
+    "prompt": "Verify GitHub CLI authentication using the canonical github.auth tool exactly once. Do not use any substitute tool and do not modify GitHub state. Report only the sanitized authentication result and include the exact marker CASE-17.",
+    "expectedTools": ["github.auth"],
+    "requiredOutputTerms": ["authenticated", "CASE-17"],
+    "minOutputChars": 60
+  },
+  {
+    "id": "case-18",
+    "category": "github",
+    "title": "GitHub repository count",
+    "prompt": "Verify the exact GitHub repository count using the canonical github.repo.list tool exactly once in count mode with limit 1000. Do not use any substitute tool and do not modify GitHub state. Report the exact count and include the exact marker CASE-18.",
+    "expectedTools": ["github.repo.list"],
+    "requiredOutputTerms": ["CASE-18"],
+    "minOutputChars": 50
+  },
+  {
+    "id": "case-19",
+    "category": "memory",
+    "title": "Durable memory search",
+    "prompt": "Verify whether durable memory contains entries relevant to NUAAI using the canonical memory.search tool exactly once with query NUAAI and limit 5. Do not use any substitute tool and do not store or delete memory. Report the observed result count and include the exact marker CASE-19.",
+    "expectedTools": ["memory.search"],
+    "requiredOutputTerms": ["CASE-19"],
+    "minOutputChars": 50
+  },
+  {
+    "id": "case-20",
+    "category": "mcp",
+    "title": "MCP connection status",
+    "prompt": "Verify configured MCP connection status using the canonical mcp.status tool exactly once. Do not use any substitute tool and do not execute remote MCP tools. Report the observed connection count or disabled status and include the exact marker CASE-20.",
+    "expectedTools": ["mcp.status"],
+    "requiredOutputTerms": ["MCP", "CASE-20"],
+    "minOutputChars": 50
+  }
+]

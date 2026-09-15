@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { execa } from 'execa';
 
 import { sanitizedSubprocessEnvironment } from '../security/environment.js';
+import { canonicalProviderMessages } from './request.js';
 import type {
   ProviderAdapter,
   ProviderHealth,
@@ -35,11 +36,14 @@ function extractText(value: unknown): string {
   return '';
 }
 
-function promptFromMessages(messages: ProviderRequest['messages']): string {
-  return messages
-    .filter((message) => message.role !== 'system')
-    .map((message) => `[${message.role}]\n${message.content}`)
-    .join('\n\n');
+function promptFromMessages(
+  messages: ProviderRequest['messages'],
+  systemPrompt: string | undefined,
+): string {
+  return [
+    ...(systemPrompt ? [`[system]\n${systemPrompt}`] : []),
+    ...messages.map((message) => `[${message.role}]\n${message.content}`),
+  ].join('\n\n');
 }
 
 function codexJsonOutput(stdout: string): string {
@@ -105,7 +109,8 @@ export class CodexProvider implements ProviderAdapter {
     const model = request.model || this.model;
     if (model) args.push('--model', model);
     args.push('-');
-    const prompt = promptFromMessages(request.messages);
+    const canonical = canonicalProviderMessages(request.systemPrompt, request.messages);
+    const prompt = promptFromMessages(canonical.messages, canonical.systemPrompt);
     const subprocess = execa(this.executable, args, {
       reject: false,
       timeout: this.timeoutMs,

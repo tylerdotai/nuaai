@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { RunArtifactRegistry } from './artifacts/registry.js';
 import { loadRuntimeConfig, persistProviderSelection, workspaceDirectory } from './config/index.js';
 import { loadSessionIdentity } from './core/identity.js';
 import { AgentRuntime } from './core/runtime.js';
@@ -91,6 +92,7 @@ async function startOwnedDaemon(
   const identity = ensureRuntimeIdentity(resolvedRoot);
   const sessionIdentity = loadSessionIdentity(resolvedRoot);
   const store = new DatabaseStore(openAppDatabase(resolvedRoot));
+  const artifacts = new RunArtifactRegistry(resolvedRoot, store);
   const secrets = new SecretsManager(store, resolvedRoot);
   const providers = new ProviderRegistry({
     root: resolvedRoot,
@@ -192,6 +194,7 @@ async function startOwnedDaemon(
         threadId: created.thread.id,
         input: schedule.agentInput,
         permissions: permissionContextForProfile(effectiveConfig.permissions.scheduler),
+        permissionSource: 'scheduler',
       });
       scheduledRuns.set(taskId, run.id);
       try {
@@ -224,6 +227,15 @@ async function startOwnedDaemon(
     mcp,
     skills,
     skillLearner,
+    artifacts,
+    resolvePermissions: (source) =>
+      permissionContextForProfile(
+        source === 'matrix'
+          ? effectiveConfig.permissions.matrix
+          : source === 'scheduler'
+            ? effectiveConfig.permissions.scheduler
+            : effectiveConfig.permissions.web,
+      ),
   });
   let gateway: GatewayHandle;
   try {
@@ -238,6 +250,7 @@ async function startOwnedDaemon(
       runPermissions: permissionContextForProfile(effectiveConfig.permissions.web),
       runtime,
       store,
+      artifacts,
       providers,
       scheduler,
       skills,
@@ -576,6 +589,7 @@ async function startOwnedDaemon(
             input: [message.body, ...(attachmentContext ?? []), ...transcriptions].join('\n'),
             idempotencyKey: `matrix:${message.eventId}`,
             permissions: permissionContextForProfile(effectiveConfig.permissions.matrix),
+            permissionSource: 'matrix',
             ...(images.length ? { images } : {}),
           });
           runId = run.id;
