@@ -75,7 +75,7 @@ export function ApprovalInbox({
   onApprove(id: string, payloadHash: string): void;
   onDeny(id: string, payloadHash: string): void;
 }): React.JSX.Element | null {
-  if (!approvals.length) return null;
+  if (!approvals?.length) return null;
   return (
     <section className="approval-inbox" aria-label="Action approvals">
       <div className="approval-inbox-heading">
@@ -83,7 +83,7 @@ export function ApprovalInbox({
           <span className="section-label">Approval required</span>
           <h2>Review action</h2>
         </div>
-        <span className="count-chip">{approvals.length} pending</span>
+        <span className="count-chip">{approvals?.length ?? 0} pending</span>
       </div>
       {approvals.map((approval) => (
         <article className="approval-card" key={approval.id} data-status={approval.status}>
