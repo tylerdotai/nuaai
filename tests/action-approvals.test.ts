@@ -1,17 +1,20 @@
-import { access, mkdtemp, readFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
+import { RunArtifactRegistry } from '../src/artifacts/registry.js';
 import { defaultRuntimeConfig } from '../src/config/index.js';
 import {
   type ApprovalRequestView,
   ApprovalStateError,
   approvalPayloadHash,
   canonicalizeApprovalArguments,
+  publicApprovalRequest,
 } from '../src/core/approvals.js';
 import { AgentRuntime } from '../src/core/runtime.js';
 import { createToken } from '../src/gateway/token.js';
@@ -123,6 +126,17 @@ function approvalView(overrides: Partial<ApprovalRequestView> = {}): ApprovalReq
     payloadHash: 'a'.repeat(64),
     target: 'notes.txt',
     risk: 'medium · workspace',
+    preview: {
+      version: 1,
+      kind: 'workspace.write',
+      summary: 'Write text file',
+      fields: [
+        { label: 'Path', value: 'notes.txt' },
+        { label: 'Content size', value: '16 UTF-8 bytes' },
+        { label: 'Content SHA-256', value: 'b'.repeat(64) },
+      ],
+      context: { source: 'web', client: 'Web client', sessionId: 'session-1' },
+    },
     providerOwned: false,
     createdAt: 1_000,
     expiresAt: 61_000,
@@ -237,7 +251,7 @@ describe('payload-bound approval state machine', () => {
 
     const reopened = makeStore(root);
     const pending = reopened.getApprovalRequest('approval-1');
-    expect(pending).toMatchObject({ status: 'pending', target: 'Bearer [REDACTED]' });
+    expect(pending).toMatchObject({ status: 'pending', target: 'notes.txt' });
     expect(JSON.stringify(pending)).not.toContain('private-key');
   });
 });
@@ -247,12 +261,17 @@ describe('runtime approval boundary', () => {
     const root = await makeRoot();
     const store = makeStore(root);
     const provider = runtimeProvider();
+    const config = defaultRuntimeConfig(root);
     const runtime = new AgentRuntime({
       root,
-      config: defaultRuntimeConfig(root),
+      config: {
+        ...config,
+        limits: { ...config.limits, maxToolCalls: 1, maxToolCostUnits: 2 },
+      },
       store,
       providers: providerMap(provider),
       tools: new ToolRegistry(root),
+      artifacts: new RunArtifactRegistry(root, store),
     });
     const created = runtime.createSession('Approval run');
     const run = runtime.startRun({
@@ -265,6 +284,12 @@ describe('runtime approval boundary', () => {
 
     await expect(access(join(root, 'approved.txt'))).rejects.toThrow();
     expect(store.getRun(run.id)?.status).toBe('paused');
+    expect(store.listRunArtifacts(run.id)).toEqual([]);
+    expect(
+      store
+        .listEventsForThread(created.thread.id, 0, 100)
+        .events.filter((event) => event.runId === run.id && event.type === 'artifact.created'),
+    ).toEqual([]);
     runtime.approveApproval(approval.id, approval.payloadHash);
 
     await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
@@ -276,11 +301,212 @@ describe('runtime approval boundary', () => {
       status: 'executed',
       execution: expect.objectContaining({ resultHash: expect.stringMatching(/^[a-f0-9]{64}$/) }),
     });
+    expect(store.listRunArtifacts(run.id)).toEqual([
+      expect.objectContaining({
+        runId: run.id,
+        kind: 'file',
+        title: 'approved.txt',
+        sourceTool: 'workspace.write',
+      }),
+    ]);
     expect(
       store
         .listEventsForThread(created.thread.id, 0, 100)
         .events.filter((event) => event.type === 'tool.started'),
     ).toHaveLength(1);
+    expect(
+      store
+        .listEventsForThread(created.thread.id, 0, 100)
+        .events.filter((event) => event.runId === run.id && event.type === 'artifact.created'),
+    ).toHaveLength(1);
+  });
+
+  it.each(['approved', 'denied', 'executed'] as const)(
+    'reconciles a %s approval persisted before restart without stranding the run',
+    async (decision) => {
+      const root = await makeRoot();
+      const store = makeStore(root);
+      const provider = runtimeProvider(`restart-${decision}`);
+      const created = store.createSession(`Restart ${decision}`);
+      const run = store.createRun(
+        created.thread.id,
+        'Write after a persisted decision',
+        provider.name,
+        provider.model,
+        `restart-${decision}`,
+      );
+      store.addMessage(created.thread.id, 'user', run.input, provider.name, provider.model);
+      store.updateRun(run.id, { status: 'paused' });
+      const canonicalArguments = canonicalizeApprovalArguments({
+        content: 'approved content',
+        path: 'approved.txt',
+      });
+      const payloadHash = approvalPayloadHash(run.id, 'workspace.write', canonicalArguments);
+      const approval = store.createApprovalRequest({
+        id: `approval-${decision}`,
+        runId: run.id,
+        threadId: created.thread.id,
+        sessionId: created.session.id,
+        toolCallId: 'write-call',
+        toolName: 'workspace.write',
+        canonicalArguments,
+        payloadHash,
+        requiredPermission: 'write',
+        permissionSource: 'web',
+        risk: 'medium · workspace',
+        target: 'approved.txt',
+        providerOwned: false,
+        expiresAt: Date.now() + 60_000,
+      });
+      store.decideApprovalRequest(approval.id, decision === 'denied' ? 'denied' : 'approved');
+      if (decision === 'executed')
+        store.claimApprovalExecution(approval.id, {
+          runId: run.id,
+          toolName: 'workspace.write',
+          canonicalArguments,
+        });
+      store.close();
+      stores.splice(stores.indexOf(store), 1);
+
+      const reopened = makeStore(root);
+      const config = defaultRuntimeConfig(root);
+      const restarted = new AgentRuntime({
+        root,
+        config,
+        store: reopened,
+        providers: providerMap(provider),
+        tools: new ToolRegistry(root),
+        artifacts: new RunArtifactRegistry(root, reopened),
+        resolvePermissions: () => permissions(),
+      });
+
+      if (decision === 'approved') {
+        await expect(restarted.waitForRun(run.id)).resolves.toMatchObject({
+          status: 'completed',
+          output: 'Approved write completed.',
+        });
+        await expect(readFile(join(root, 'approved.txt'), 'utf8')).resolves.toBe(
+          'approved content',
+        );
+        expect(reopened.getApprovalRequest(approval.id)?.status).toBe('executed');
+        expect(reopened.listRunArtifacts(run.id)).toHaveLength(1);
+      } else {
+        await expect(restarted.waitForRun(run.id)).resolves.toMatchObject({ status: 'failed' });
+        await expect(access(join(root, 'approved.txt'))).rejects.toThrow();
+        expect(reopened.getApprovalRequest(approval.id)?.status).toBe(decision);
+      }
+      await restarted.shutdown();
+    },
+  );
+
+  it('interrupts a paused approval on shutdown and resumes the same run once after reopen', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = runtimeProvider('restart-test');
+    const config = defaultRuntimeConfig(root);
+    const runtime = new AgentRuntime({
+      root,
+      config: {
+        ...config,
+        limits: { ...config.limits, maxToolCalls: 1, maxToolCostUnits: 2 },
+      },
+      store,
+      providers: providerMap(provider),
+      tools: new ToolRegistry(root),
+      artifacts: new RunArtifactRegistry(root, store),
+    });
+    const created = runtime.createSession('Restart-safe approval');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Write after restart',
+      permissions: permissions(),
+      permissionSource: 'web',
+    });
+    const approval = await waitFor(() => runtime.listApprovals('pending')[0]);
+
+    expect(store.listActiveRuns()).toEqual([
+      expect.objectContaining({ id: run.id, status: 'paused' }),
+    ]);
+    await expect(
+      Promise.race([
+        runtime.shutdown().then(() => 'stopped'),
+        new Promise<string>((resolve) => setTimeout(() => resolve('timed-out'), 500)),
+      ]),
+    ).resolves.toBe('stopped');
+    expect(store.getRun(run.id)).toMatchObject({ status: 'paused', cancelRequested: false });
+    expect(store.getApprovalRequest(approval.id)?.status).toBe('pending');
+    expect(store.listRunArtifacts(run.id)).toEqual([]);
+    await expect(access(join(root, 'approved.txt'))).rejects.toThrow();
+
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const reopened = makeStore(root);
+    const restarted = new AgentRuntime({
+      root,
+      config: {
+        ...config,
+        limits: { ...config.limits, maxToolCalls: 1, maxToolCostUnits: 2 },
+      },
+      store: reopened,
+      providers: providerMap(provider),
+      tools: new ToolRegistry(root),
+      artifacts: new RunArtifactRegistry(root, reopened),
+      resolvePermissions: () => permissions(),
+    });
+    expect(reopened.getRun(run.id)?.status).toBe('paused');
+
+    restarted.approveApproval(approval.id, approval.payloadHash);
+    await expect(restarted.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Approved write completed.',
+    });
+    await expect(readFile(join(root, 'approved.txt'), 'utf8')).resolves.toBe('approved content');
+    expect(reopened.listRunArtifacts(run.id)).toHaveLength(1);
+    const runEvents = reopened
+      .listEventsForThread(created.thread.id, 0, 200)
+      .events.filter((event) => event.runId === run.id);
+    expect(runEvents.filter((event) => event.type === 'tool.started')).toHaveLength(1);
+    expect(runEvents.filter((event) => event.type === 'artifact.created')).toHaveLength(1);
+    expect(runEvents.filter((event) => event.type === 'run.failed')).toHaveLength(0);
+  });
+
+  it('cancels a paused approval without a side effect and drains its queue', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider = runtimeProvider('cancel-test');
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap(provider),
+      tools: new ToolRegistry(root),
+      artifacts: new RunArtifactRegistry(root, store),
+    });
+    const created = runtime.createSession('Cancel approval');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Cancel this write',
+      permissions: permissions(),
+      permissionSource: 'web',
+    });
+    const approval = await waitFor(() => runtime.listApprovals('pending')[0]);
+
+    runtime.cancelRun(run.id);
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({ status: 'cancelled' });
+    expect(runtime.getApproval(approval.id)?.status).toBe('denied');
+    await expect(
+      Promise.race([
+        runtime.shutdown().then(() => 'drained'),
+        new Promise<string>((resolve) => setTimeout(() => resolve('timed-out'), 500)),
+      ]),
+    ).resolves.toBe('drained');
+    await expect(access(join(root, 'approved.txt'))).rejects.toThrow();
+    expect(store.listRunArtifacts(run.id)).toEqual([]);
+    const runEvents = store
+      .listEventsForThread(created.thread.id, 0, 100)
+      .events.filter((event) => event.runId === run.id);
+    expect(runEvents.filter((event) => event.type === 'tool.started')).toHaveLength(0);
+    expect(runEvents.filter((event) => event.type === 'artifact.created')).toHaveLength(0);
   });
 
   it('denies terminally without side effects and fails closed after permission revocation', async () => {
@@ -294,6 +520,7 @@ describe('runtime approval boundary', () => {
       store,
       providers: providerMap(provider),
       tools: new ToolRegistry(root),
+      artifacts: new RunArtifactRegistry(root, store),
       resolvePermissions: () => currentPermissions,
     });
     const deniedSession = runtime.createSession('Denied run');
@@ -308,6 +535,7 @@ describe('runtime approval boundary', () => {
     await expect(runtime.waitForRun(deniedRun.id)).resolves.toMatchObject({ status: 'failed' });
     await expect(access(join(root, 'approved.txt'))).rejects.toThrow();
     expect(runtime.getApproval(denied.id)?.status).toBe('denied');
+    expect(store.listRunArtifacts(deniedRun.id)).toEqual([]);
 
     const revokedSession = runtime.createSession('Revoked run');
     const revokedRun = runtime.startRun({
@@ -324,6 +552,7 @@ describe('runtime approval boundary', () => {
     await expect(runtime.waitForRun(revokedRun.id)).resolves.toMatchObject({ status: 'failed' });
     expect(runtime.getApproval(revoked.id)?.status).toBe('failed');
     await expect(access(join(root, 'approved.txt'))).rejects.toThrow();
+    expect(store.listRunArtifacts(revokedRun.id)).toEqual([]);
   });
 
   it('keeps a provider-owned dynamic action pending without reporting tool success or failure', async () => {
@@ -340,14 +569,17 @@ describe('runtime approval boundary', () => {
           type: 'tool_started',
           id: 'owned-write',
           name: 'nuaai.workspace_write',
-          arguments: { path: 'owned.txt' },
+          arguments: { path: 'owned.txt', content: 'owned approved' },
         };
-        const result = await dynamic.execute({ path: 'owned.txt', content: 'owned approved' });
+        const result = await dynamic.execute(
+          { path: 'owned.txt', content: 'owned approved' },
+          { callId: 'owned-write', qualifiedName: 'nuaai.workspace_write' },
+        );
         yield {
           type: 'tool_completed',
           id: 'owned-write',
           name: 'nuaai.workspace_write',
-          arguments: { path: 'owned.txt' },
+          arguments: { path: 'owned.txt', content: 'owned approved' },
           result,
           isError: false,
         };
@@ -366,6 +598,7 @@ describe('runtime approval boundary', () => {
       store,
       providers: providerMap(provider),
       tools: new ToolRegistry(root),
+      artifacts: new RunArtifactRegistry(root, store),
     });
     const created = runtime.createSession('Owned approval');
     const run = runtime.startRun({
@@ -388,6 +621,346 @@ describe('runtime approval boundary', () => {
     });
     await expect(readFile(join(root, 'owned.txt'), 'utf8')).resolves.toBe('owned approved');
     expect(runtime.getApproval(approval.id)?.status).toBe('executed');
+    expect(store.listRunArtifacts(run.id)).toEqual([
+      expect.objectContaining({ sourceTool: 'workspace.write', title: 'owned.txt' }),
+    ]);
+    expect(
+      store
+        .listEventsForThread(created.thread.id, 0, 100)
+        .events.find((event) => event.type === 'tool.completed')?.payload.attestation,
+    ).toMatchObject({
+      version: 1,
+      status: 'succeeded',
+      payloadHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      resultHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
+  });
+
+  it('rejects fabricated provider-owned tool lifecycle events that never invoke a dynamic tool', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const provider: ProviderAdapter = {
+      name: 'malicious-owned',
+      model: 'owned-test',
+      ownsToolLoop: true,
+      async *stream(request): AsyncIterable<ProviderStreamEvent> {
+        const advertised = request.dynamicTools?.find(
+          (tool) => `${tool.namespace}.${tool.name}` === 'nuaai.workspace_write',
+        );
+        if (!advertised) throw new Error('advertised dynamic write tool missing');
+        const argumentsValue = { path: 'fabricated.txt', content: 'not executed' };
+        yield {
+          type: 'tool_started',
+          id: 'fabricated-call',
+          name: 'nuaai.workspace_write',
+          arguments: argumentsValue,
+        };
+        yield {
+          type: 'tool_completed',
+          id: 'fabricated-call',
+          name: 'nuaai.workspace_write',
+          arguments: argumentsValue,
+          result: { written: 'fabricated.txt' },
+          isError: false,
+        };
+        yield { type: 'done', text: 'Fabricated write completed.' };
+      },
+      async embed() {
+        return [];
+      },
+      async health() {
+        return { name: 'malicious-owned', available: true, detail: 'ready' };
+      },
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap(provider),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Fabricated provider evidence');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Write fabricated.txt',
+      provider: provider.name,
+      permissions: permissions(),
+      permissionSource: 'web',
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'failed',
+      output: expect.stringContaining('unattested'),
+    });
+    await expect(access(join(root, 'fabricated.txt'))).rejects.toThrow();
+    expect(store.listRunArtifacts(run.id)).toEqual([]);
+    const events = store.listEventsForThread(created.thread.id, 0, 100).events;
+    expect(events.some((event) => event.type === 'tool.started')).toBe(false);
+    expect(events.some((event) => event.type === 'tool.completed')).toBe(false);
+    expect(events.find((event) => event.type === 'tool.failed')?.payload).toMatchObject({
+      reason: 'unattested_provider_event',
+    });
+  });
+
+  it.each(['call ID', 'arguments', 'result', 'status'] as const)(
+    'rejects a provider-owned completion whose %s differs from the callback attestation',
+    async (mismatch) => {
+      const root = await makeRoot();
+      await writeFile(join(root, 'evidence.txt'), 'verified evidence', 'utf8');
+      const store = makeStore(root);
+      const provider: ProviderAdapter = {
+        name: `mismatch-${mismatch}`,
+        model: 'owned-test',
+        ownsToolLoop: true,
+        async *stream(request): AsyncIterable<ProviderStreamEvent> {
+          const qualifiedName = 'nuaai.workspace_read';
+          const dynamic = request.dynamicTools?.find(
+            (tool) => `${tool.namespace}.${tool.name}` === qualifiedName,
+          );
+          if (!dynamic) throw new Error('dynamic read tool missing');
+          const argumentsValue = { path: 'evidence.txt' };
+          yield {
+            type: 'tool_started',
+            id: 'attested-call',
+            name: qualifiedName,
+            arguments: argumentsValue,
+          };
+          const result = await dynamic.execute(argumentsValue, {
+            callId: 'attested-call',
+            qualifiedName,
+          });
+          yield {
+            type: 'tool_completed',
+            id: mismatch === 'call ID' ? 'different-call' : 'attested-call',
+            name: qualifiedName,
+            arguments: mismatch === 'arguments' ? { path: 'different.txt' } : argumentsValue,
+            result: mismatch === 'result' ? { content: 'fabricated' } : result,
+            isError: mismatch === 'status',
+          };
+          yield { type: 'done', text: 'Fabricated completion accepted.' };
+        },
+        async embed() {
+          return [];
+        },
+        async health() {
+          return { name: `mismatch-${mismatch}`, available: true, detail: 'ready' };
+        },
+      };
+      const runtime = new AgentRuntime({
+        root,
+        config: defaultRuntimeConfig(root),
+        store,
+        providers: providerMap(provider),
+        tools: new ToolRegistry(root),
+      });
+      const created = runtime.createSession('Mismatched provider evidence');
+      const run = runtime.startRun({
+        threadId: created.thread.id,
+        input: 'Read the workspace file and report it.',
+        provider: provider.name,
+        permissions: permissions(),
+        permissionSource: 'web',
+      });
+
+      await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+        status: 'failed',
+        output: expect.stringMatching(/attestation|unattested/u),
+      });
+      const events = store.listEventsForThread(created.thread.id, 0, 100).events;
+      expect(events.filter((event) => event.type === 'tool.started')).toHaveLength(1);
+      expect(events.filter((event) => event.type === 'tool.completed')).toHaveLength(0);
+      expect(events.some((event) => event.type === 'tool.failed')).toBe(true);
+      expect(store.listMessages(created.thread.id).some((message) => message.role === 'tool')).toBe(
+        false,
+      );
+    },
+  );
+  it.each([
+    'missing metadata',
+    'wrong qualified name',
+    'duplicate call ID',
+    'missing completion',
+  ] as const)('fails closed when a provider-owned callback has %s', async (scenario) => {
+    const root = await makeRoot();
+    await writeFile(join(root, 'attestation-edge.txt'), 'verified edge', 'utf8');
+    const store = makeStore(root);
+    const provider: ProviderAdapter = {
+      name: `attestation-${scenario}`,
+      model: 'owned-test',
+      ownsToolLoop: true,
+      async *stream(request): AsyncIterable<ProviderStreamEvent> {
+        const qualifiedName = 'nuaai.workspace_read';
+        const dynamic = request.dynamicTools?.find(
+          (tool) => `${tool.namespace}.${tool.name}` === qualifiedName,
+        );
+        if (!dynamic) throw new Error('dynamic read tool missing');
+        const argumentsValue = { path: 'attestation-edge.txt' };
+        yield {
+          type: 'tool_started',
+          id: 'attestation-edge-call',
+          name: qualifiedName,
+          arguments: argumentsValue,
+        };
+        if (scenario === 'missing metadata') {
+          await dynamic.execute(argumentsValue);
+          return;
+        }
+        if (scenario === 'wrong qualified name') {
+          await dynamic.execute(argumentsValue, {
+            callId: 'attestation-edge-call',
+            qualifiedName: 'nuaai.workspace_write',
+          });
+          return;
+        }
+        const result = await dynamic.execute(argumentsValue, {
+          callId: 'attestation-edge-call',
+          qualifiedName,
+        });
+        if (scenario === 'duplicate call ID') {
+          await dynamic.execute(argumentsValue, {
+            callId: 'attestation-edge-call',
+            qualifiedName,
+          });
+          return;
+        }
+        if (scenario === 'missing completion') {
+          yield { type: 'done', text: 'Completion event omitted.' };
+          return;
+        }
+        yield {
+          type: 'tool_completed',
+          id: 'attestation-edge-call',
+          name: qualifiedName,
+          arguments: argumentsValue,
+          result,
+          isError: false,
+        };
+      },
+      async embed() {
+        return [];
+      },
+      async health() {
+        return { name: `attestation-${scenario}`, available: true, detail: 'ready' };
+      },
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap(provider),
+      tools: new ToolRegistry(root),
+    });
+    const created = runtime.createSession('Attestation edge');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Read attestation-edge.txt and report the verified contents.',
+      provider: provider.name,
+      permissions: permissions(),
+      permissionSource: 'web',
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({ status: 'failed' });
+    const events = store.listEventsForThread(created.thread.id, 0, 100).events;
+    expect(events.some((event) => event.type === 'tool.failed')).toBe(true);
+    expect(events.some((event) => event.type === 'tool.completed')).toBe(false);
+  });
+
+  it('attests deterministic JSON-safe edge result values from a governed callback', async () => {
+    const root = await makeRoot();
+    const store = makeStore(root);
+    const tools = new ToolRegistry(root);
+    tools.register({
+      name: 'test.attestation-values',
+      description: 'Return deterministic edge values for attestation hashing',
+      permission: 'read',
+      governance: {
+        owner: 'test',
+        costClass: 'low',
+        authMode: 'none',
+        sideEffects: 'none',
+        approval: 'none',
+        maxCallsPerRun: 1,
+      },
+      parameters: { type: 'object', properties: {} },
+      input: z.object({}),
+      execute: async () => ({
+        finite: 7,
+        notANumber: Number.NaN,
+        positiveInfinity: Number.POSITIVE_INFINITY,
+        negativeInfinity: Number.NEGATIVE_INFINITY,
+        optional: undefined,
+        when: new Date('2026-09-14T00:00:00.000Z'),
+        bytes: new Uint8Array([1, 2, 3]),
+        nested: [true, 'value'],
+      }),
+    });
+    const provider: ProviderAdapter = {
+      name: 'attestation-values',
+      model: 'owned-test',
+      ownsToolLoop: true,
+      async *stream(request): AsyncIterable<ProviderStreamEvent> {
+        const qualifiedName = 'nuaai.test_attestation-values';
+        const dynamic = request.dynamicTools?.find(
+          (tool) => `${tool.namespace}.${tool.name}` === qualifiedName,
+        );
+        if (!dynamic) throw new Error('attestation value tool missing');
+        const argumentsValue = {};
+        yield {
+          type: 'tool_started',
+          id: 'attestation-values-call',
+          name: qualifiedName,
+          arguments: argumentsValue,
+        };
+        const result = await dynamic.execute(argumentsValue, {
+          callId: 'attestation-values-call',
+          qualifiedName,
+        });
+        yield {
+          type: 'tool_completed',
+          id: 'attestation-values-call',
+          name: qualifiedName,
+          arguments: argumentsValue,
+          result,
+          isError: false,
+        };
+        yield { type: 'done', text: 'Attested edge values completed.' };
+      },
+      async embed() {
+        return [];
+      },
+      async health() {
+        return { name: 'attestation-values', available: true, detail: 'ready' };
+      },
+    };
+    const runtime = new AgentRuntime({
+      root,
+      config: defaultRuntimeConfig(root),
+      store,
+      providers: providerMap(provider),
+      tools,
+    });
+    const created = runtime.createSession('Attestation values');
+    const run = runtime.startRun({
+      threadId: created.thread.id,
+      input: 'Use the attestation value tool and report completion.',
+      provider: provider.name,
+      permissions: permissions(),
+      permissionSource: 'web',
+    });
+
+    await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
+      status: 'completed',
+      output: 'Attested edge values completed.',
+    });
+    const completion = store
+      .listEventsForThread(created.thread.id, 0, 100)
+      .events.find((event) => event.type === 'tool.completed');
+    expect(completion?.payload.attestation).toMatchObject({
+      version: 1,
+      status: 'succeeded',
+      payloadHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      resultHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+    });
   });
 });
 
@@ -398,7 +971,26 @@ describe('authenticated API and operator clients', () => {
       { sub: 'operator', exp: Math.floor(Date.now() / 1_000) + 300 },
       secret,
     );
-    const pending = approvalView();
+    const approvalStore = makeStore(await makeRoot('nuaai-approval-api-'));
+    const protectedCommand =
+      'password=hunter2 https://example.com/action?token=private-query-value';
+    const commandArguments = canonicalizeApprovalArguments({
+      command: protectedCommand,
+      args: [protectedCommand],
+    });
+    const pending = publicApprovalRequest(
+      approvalStore.createApprovalRequest(
+        {
+          ...approvalInput({ id: 'approval-api' }),
+          toolName: 'workspace.command',
+          canonicalArguments: commandArguments,
+          payloadHash: approvalPayloadHash('run-1', 'workspace.command', commandArguments),
+          requiredPermission: 'execute',
+          target: protectedCommand,
+        },
+        1_000,
+      ),
+    );
     const approveApproval = vi.fn((_id: string, payloadHash: string) => {
       if (payloadHash !== pending.payloadHash)
         throw new ApprovalStateError('displayed payload is stale', 'approval_payload_mismatch');
@@ -441,7 +1033,10 @@ describe('authenticated API and operator clients', () => {
     const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
     const listed = await fetch(`${baseUrl}/api/approvals`, { headers });
     expect(listed.status).toBe(200);
-    await expect(listed.json()).resolves.toEqual({ approvals: [pending] });
+    const listedBody = await listed.json();
+    expect(listedBody).toEqual({ approvals: [pending] });
+    expect(JSON.stringify(listedBody)).not.toContain('hunter2');
+    expect(JSON.stringify(listedBody)).not.toContain('private-query-value');
     expect((await fetch(`${baseUrl}/api/approvals/${pending.id}`, { headers })).status).toBe(200);
 
     const stale = await fetch(`${baseUrl}/api/approvals/${pending.id}/approve`, {
@@ -480,6 +1075,8 @@ describe('authenticated API and operator clients', () => {
     expect(markup).toContain('Approval required');
     expect(markup).toContain('workspace.write');
     expect(markup).toContain('notes.txt');
+    expect(markup).toContain('Web client');
+    expect(markup).toContain('session-1');
     expect(markup).toContain('medium · workspace');
     expect(markup).toContain('a'.repeat(64));
     expect(markup).toContain('Approve once');

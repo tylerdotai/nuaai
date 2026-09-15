@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { RunArtifactRegistry } from './artifacts/registry.js';
 import { loadRuntimeConfig, persistProviderSelection, workspaceDirectory } from './config/index.js';
 import { loadSessionIdentity } from './core/identity.js';
 import { AgentRuntime } from './core/runtime.js';
@@ -91,6 +92,7 @@ async function startOwnedDaemon(
   const identity = ensureRuntimeIdentity(resolvedRoot);
   const sessionIdentity = loadSessionIdentity(resolvedRoot);
   const store = new DatabaseStore(openAppDatabase(resolvedRoot));
+  const artifacts = new RunArtifactRegistry(resolvedRoot, store);
   const secrets = new SecretsManager(store, resolvedRoot);
   const providers = new ProviderRegistry({
     root: resolvedRoot,
@@ -225,6 +227,7 @@ async function startOwnedDaemon(
     mcp,
     skills,
     skillLearner,
+    artifacts,
     resolvePermissions: (source) =>
       permissionContextForProfile(
         source === 'matrix'
@@ -247,6 +250,7 @@ async function startOwnedDaemon(
       runPermissions: permissionContextForProfile(effectiveConfig.permissions.web),
       runtime,
       store,
+      artifacts,
       providers,
       scheduler,
       skills,

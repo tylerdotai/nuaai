@@ -4,9 +4,11 @@ import { displayModel, displayProviderName } from '../src/web/format.js';
 import {
   EventReplayBuffer,
   EventReplayCursor,
+  LatestRequestCoordinator,
   SelectionLoadCoordinator,
   type WebEventRecord,
   activeRunForThread,
+  commitLatestLoad,
   liveOutputSnapshot,
   loadReplaySafeThreadSnapshot,
   projectRunEvents,
@@ -217,6 +219,34 @@ describe('web run event projection', () => {
 });
 
 describe('web selection and thread-owned run state', () => {
+  it('aborts and rejects a late system snapshot after a newer approval refresh commits', async () => {
+    const coordinator = new LatestRequestCoordinator();
+    let resolveOld!: (value: string[]) => void;
+    let oldSignal: AbortSignal | undefined;
+    const commits: string[][] = [];
+    const oldLoad = commitLatestLoad(
+      coordinator,
+      async (signal) => {
+        oldSignal = signal;
+        return new Promise<string[]>((resolve) => {
+          resolveOld = resolve;
+        });
+      },
+      (value) => commits.push(value),
+    );
+    const newLoad = commitLatestLoad(
+      coordinator,
+      async () => [],
+      (value) => commits.push(value),
+    );
+
+    await expect(newLoad).resolves.toBe(true);
+    expect(oldSignal?.aborted).toBe(true);
+    resolveOld(['stale actionable approval']);
+    await expect(oldLoad).resolves.toBe(false);
+    expect(commits).toEqual([[]]);
+  });
+
   it('aborts stale selection loads and rejects their late commits', () => {
     const coordinator = new SelectionLoadCoordinator();
     const first = coordinator.begin({ sessionId: 'session-a', threadId: 'thread-a' });

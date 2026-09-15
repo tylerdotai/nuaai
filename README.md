@@ -103,10 +103,10 @@ The onboarding flow asks which providers and integrations to enable, keeps telem
 
 ### Install a release artifact
 
-Download `nuaai-1.0.0.tgz` from the GitHub Release, then install and onboard it:
+Download `nuaai-1.0.1.tgz` from the GitHub Release, then install and onboard it:
 
 ```bash
-npm install --global ./nuaai-1.0.0.tgz
+npm install --global ./nuaai-1.0.1.tgz
 nuaai onboard
 ```
 
@@ -220,11 +220,11 @@ Matrix admission and delivery policy is daemon-owned, before model execution:
 - Duplicate event IDs are ignored, stale timestamped events from the first sync are dropped, and outbound text is split at `maxMessageLength` without silent truncation.
 - Receipts, typing state, reactions, thread relations, bounded media staging, and voice-message metadata remain Matrix-native.
 - Every turn receives one stable permission-filtered tool catalog. A model call outside that catalog is rejected and never executed; repeated invalid calls fail fast instead of consuming the entire run timeout.
-- Normal conversation context defaults to `1,000,000` bytes and retrieved memory defaults to `64,000` bytes. Automatic recall falls back to lexical ranking when embeddings are unavailable. Live verification and memory mutations run isolated from prior transcript and memory injection.
+- Normal conversation context defaults to a 262,144-token budget with 8,192 tokens reserved for the response; retrieved memory defaults to `64,000` bytes. Automatic recall falls back to lexical ranking when embeddings are unavailable. Live verification and memory mutations run isolated from prior transcript and memory injection.
 - Runs allow 48 tool calls by default. Reaching the budget stops further actions and forces a no-tools finalization turn from evidence already gathered instead of discarding the work as a hard failure.
 - Runs allow 48 ordinary model turns plus one no-tools finalization grace turn. Streamed output is batched, reset at each provider-attempt boundary, and snapshotted durably so reconnects preserve the complete current response without combining discarded drafts.
 - The central tool registry declares owner, cost class, auth mode, side effects, approval policy, and a per-run ceiling for every tool. Registry admission validates permission, input, weighted run cost, and per-tool usage before emitting `tool.started`; `computer.use`, generic MCP execution, and external-agent dispatch are execute-gated high-cost boundaries.
-- Every tool marked with profile approval pauses before its side effect. The PWA exposes a pending-action inbox with the exact tool, redacted target, risk, payload hash, expiry, and payload-bound **Approve once** / **Deny** controls; the TUI shows the same pending facts. Approval revalidates current permissions and tool authority and is consumed once at execution.
+- Every tool marked with profile approval pauses before its side effect. The PWA and TUI show the exact tool, safe allowlisted path/action/coordinate facts, opaque content size and SHA-256 fingerprints, source/session context, risk, payload hash, expiry, and payload-bound **Approve once** / **Deny** controls without storing raw command arguments, prompts, typed values, signed URLs, or credentials. Approval revalidates current permissions and tool authority and is consumed once at execution.
 - When MCP is configured through the registry, models receive stable generic `mcp.discover` and `mcp.execute` tools rather than every discovered remote schema. Discovery stays available without duplicating the executable authority or inflating each provider prompt.
 
 The current bridge does not decrypt encrypted-room events. Use an unencrypted bot room until a real Matrix crypto client is implemented; the bridge does not claim E2EE support.
@@ -324,7 +324,9 @@ The daemon is the source of truth. Clients do not call providers directly or mai
   "limits": {
     "runTimeoutMs": 960000,
     "approvalTtlMs": 900000,
-    "maxContextBytes": 32000,
+    "maxContextTokens": 131072,
+    "contextResponseReserveTokens": 8192,
+    "maxContextSummaryTokens": 4096,
     "maxMemoryContextBytes": 8000
   },
   "matrix": {
@@ -359,6 +361,8 @@ The daemon is the source of truth. Clients do not call providers directly or mai
 ```
 
 The audio paths are local configuration examples only. Do not commit host-specific paths or model assets. `voiceEnabled` and `ttsEnabled` are independent startup defaults; Matrix commands can toggle either feature for the running daemon.
+
+Context selection uses the deterministic `utf8-bytes-per-3-v1` estimator. The configured token ceiling is also capped by the provider context window, and selection reserves the assembled system prompt, advertised tool schemas, the current input, and response headroom before retaining recent complete turns. The current input, project/session constraints, and memories stored with `{ "pinned": true }` remain present even when they put a request over budget. Older complete turns roll into bounded deterministic extractive checkpoints; tool-call assistants and matching tool results are atomic, the full transcript remains in SQLite, and `/api/status` reports the active context limits. Existing `maxContextBytes` configurations are still accepted and migrate to a conservative token budget at three UTF-8 bytes per estimated token.
 
 NUAAI generates distinct high loopback ports for the daemon, Synapse, SearXNG, Crawl4AI, and FlareSolverr during initialization. The generated values are written to `.nuaai/config.json` and the ignored Docker environment file; do not copy fixed service-port examples into production configuration.
 
@@ -404,6 +408,8 @@ git diff --check
 The gate runs Biome, strict TypeScript, 80% per-file coverage across the instrumented runtime/core library scope, fresh Node/web builds, browser E2E, an installed-tarball daemon smoke, version consistency, and a dependency audit that blocks moderate-or-higher advisories. Process entrypoints, React/Ink presentation code, schema declarations, and provider transport shims are verified through integration, build, E2E, and artifact tests rather than included in the percentage claim. The current remaining low advisory is confined to tsup's Windows-only development-server esbuild dependency; NUAAI does not ship or run that server.
 
 The repository includes unit, integration, runtime, and browser tests. Live service smoke tests require Docker and are intentionally separate from deterministic unit tests.
+
+The [`v1.0.1` production dogfood report](docs/dogfood/v1.0.1-report.md) records 20/20 final real-provider cases, 20/20 completed actions, cancellation/resume, and PWA reload/reconnect evidence. The protocol preserves the initial blocked report and every replacement run instead of hiding calibration or model-compliance misses.
 
 ## Roadmap
 

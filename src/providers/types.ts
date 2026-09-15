@@ -27,14 +27,24 @@ export interface ProviderTool {
   parameters: Record<string, unknown>;
 }
 
+export interface ProviderDynamicToolCallMetadata {
+  callId: string;
+  qualifiedName: string;
+}
+
 export interface ProviderDynamicTool extends ProviderTool {
   namespace: string;
-  execute(input: Record<string, unknown>): Promise<unknown>;
+  execute(
+    input: Record<string, unknown>,
+    metadata?: ProviderDynamicToolCallMetadata,
+  ): Promise<unknown>;
 }
 
 export interface ProviderRequest {
   model: string;
+  /** Canonical conversation rows. System instructions travel in systemPrompt. */
   messages: ProviderMessage[];
+  /** Canonical system-instruction transport, serialized once by each adapter. */
   systemPrompt?: string;
   tools?: ProviderTool[];
   dynamicTools?: ProviderDynamicTool[];

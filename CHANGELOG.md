@@ -6,12 +6,32 @@ All notable NUAAI changes are recorded here.
 
 ### Added
 
+- Token-aware provider-neutral context selection now reserves prompt, tool-schema, current-input, and response headroom while preserving current input, project/session constraints, pinned memory, recent complete turns, and atomic structured tool-call/result groups.
+- Durable bounded extractive compaction checkpoints now record canonical SHA-256 provenance, source ranges/counts, token estimates, versions, and update times without deleting the full transcript; context selection and compaction emit content-free metrics and are reported in status diagnostics.
+- First-class durable run artifacts with stable run/thread ownership, supported file/diff/test-report/screenshot/citation/deployment-receipt contracts, bounded redacted provenance, immutable private storage, and verified SHA-256 checksums.
+- Runtime capture for explicit structured tool artifacts, successful `workspace.write` output, and web citations, with independent `artifact.created` / `artifact.failed` events so optional capture cannot turn a successful tool into a failure.
+- Authenticated artifact list, detail, and byte-range download routes with cross-run 404 isolation, safe attachment headers, mount-relative PWA links, assistant-run artifact cards, distinct citations, and concise TUI visibility.
 - Payload-bound per-action approvals now pause profile-governed tools before side effects, persist a durable one-time SQLite state machine, revalidate current permission and tool authority, and resume the same run only for the exact SHA-256-bound payload.
 - Authenticated approval list/detail/approve/deny APIs, approval lifecycle events, a functional PWA approval inbox, and TUI pending-action visibility.
+- Versioned tool-specific approval previews with allowlisted path/action/coordinate facts, opaque-field size and SHA-256 fingerprints, and safe source/session/client context.
+
+### Changed
+
+- Local and OpenAI-compatible runs now default to a 262,144-token context budget with an 8,192-token response reserve and a 600-second provider timeout, matching high-memory local servers instead of compacting or timing out on long prefills.
+
+### Fixed
+
+- Artifact storage now rejects pre-existing artifact-root and run-directory symbolic links, validates physical containment and inode identity before writes, and retains exclusive owner-only immutable copies.
+- Citation and external artifact URLs now reject every query and fragment in addition to URL userinfo, preventing signed URL and credential persistence through artifacts, events, or APIs.
+- Provider requests now carry one canonical system prompt outside conversation rows; Ollama, OpenAI-compatible, and Codex adapters deduplicate legacy system rows, and runtime token metrics account for one transported copy.
+- Compaction schema v7 records summary budget, summarizer version, and policy version; stale, under-budget, changed-policy, and invalid-estimate checkpoints regenerate and remain restart-idempotent under a compatible policy.
 
 ### Security
 
-- Approval records and client events expose only the payload hash plus bounded redacted target/result previews; raw canonical arguments are never stored in the approval table. Decisions must include the hash shown to the operator, and stale hashes, replay, expiry, denial, and concurrent decisions fail closed.
+- Artifact capture rejects traversal, absolute paths, symlinks, hard links, protected runtime/credential paths, unsupported kind/MIME pairs, oversized content/metadata, and non-HTTPS or credential-bearing URLs. Text checksums cover stored sanitized bytes and are labeled accordingly.
+- Approval records and client events expose only safe allowlisted facts plus opaque-field sizes/fingerprints; raw canonical arguments, command arguments, prompts, typed values, signed URLs, and credential values are never stored in the approval preview or target. Legacy generic previews are scrubbed on reopen without replacing valid versioned previews.
+- Provider-owned tool success now requires an exact callback attestation over the advertised qualified name, call ID, arguments, result, and status. Fabricated, unadvertised, or mismatched lifecycle events cannot satisfy finality or create trusted action evidence.
+- Approval inboxes receive an authenticated payload-free global invalidation while full events remain session-scoped; reconnect/focus refreshes and abortable generation-fenced system loads prevent missed expiries and stale actionable cards.
 
 ## [1.0.1] - 2026-09-14
 

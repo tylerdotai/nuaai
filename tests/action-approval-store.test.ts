@@ -103,6 +103,43 @@ describe('approval persistence state machine', () => {
     ).toThrow('already consumed');
   });
 
+  it('returns missing requests and rejects decisions or claims after terminal state', async () => {
+    const { value } = await store();
+    expect(value.getApprovalRequest('missing')).toBeUndefined();
+
+    const { sessionId: _sessionId, ...withoutSession } = input('without-session');
+    expect(value.createApprovalRequest(withoutSession, 1_000).sessionId).toBeNull();
+
+    value.createApprovalRequest(input('denied-claim'), 1_000);
+    value.decideApprovalRequest('denied-claim', 'denied', 1_100);
+    expect(() =>
+      value.claimApprovalExecution(
+        'denied-claim',
+        {
+          runId: 'run-1',
+          toolName: 'workspace.write',
+          canonicalArguments: input().canonicalArguments,
+        },
+        1_200,
+      ),
+    ).toThrow('is not approved');
+
+    value.createApprovalRequest(input('executed-decision'), 1_000);
+    value.decideApprovalRequest('executed-decision', 'approved', 1_100);
+    value.claimApprovalExecution(
+      'executed-decision',
+      {
+        runId: 'run-1',
+        toolName: 'workspace.write',
+        canonicalArguments: input().canonicalArguments,
+      },
+      1_200,
+    );
+    expect(() => value.decideApprovalRequest('executed-decision', 'denied', 1_300)).toThrow(
+      'not pending (status: executed)',
+    );
+  });
+
   it('expires, denies, serializes concurrent decisions, and survives reopen without public secrets', async () => {
     const { root, value } = await store();
     value.createApprovalRequest(input('expired', 1_500), 1_000);
@@ -152,9 +189,221 @@ describe('approval persistence state machine', () => {
     expect(stored).not.toContain('private-password-value');
     expect(stored).not.toContain('private-token');
     const publicValue = publicApprovalRequest(pending);
-    expect(publicValue.target).toBe('Bearer [REDACTED]');
+    expect(publicValue.target).toBe('notes.txt');
     const event = createEvent('approval.requested', { ...publicValue });
     expect(JSON.stringify({ publicValue, event })).not.toContain('private-token-value');
     expect(JSON.stringify({ publicValue, event })).not.toContain('private-password-value');
+  });
+
+  it('persists versioned allowlisted previews for workspace writes and computer actions', async () => {
+    const { value } = await store();
+    const writeArguments = canonicalizeApprovalArguments({
+      path: 'release/notes.txt',
+      content: 'Deploy release\nBearer private-token-value',
+      ignored: 'must-not-be-persisted',
+    });
+    value.createApprovalRequest(
+      {
+        ...input('write-preview'),
+        canonicalArguments: writeArguments,
+        payloadHash: approvalPayloadHash('run-1', 'workspace.write', writeArguments),
+      },
+      1_000,
+    );
+
+    const write = publicApprovalRequest(
+      value.getApprovalRequest('write-preview') as NonNullable<
+        ReturnType<typeof value.getApprovalRequest>
+      >,
+    );
+    expect(write.preview).toMatchObject({
+      version: 1,
+      kind: 'workspace.write',
+      context: { source: 'web', client: 'Web client', sessionId: 'session-1' },
+    });
+    expect(write.preview.fields).toEqual(
+      expect.arrayContaining([
+        { label: 'Path', value: 'release/notes.txt' },
+        { label: 'Content size', value: '41 UTF-8 bytes' },
+        { label: 'Content SHA-256', value: expect.stringMatching(/^[a-f0-9]{64}$/u) },
+      ]),
+    );
+    expect(JSON.stringify(write)).not.toContain('Deploy release');
+
+    const computerArguments = canonicalizeApprovalArguments({
+      action: 'click',
+      arguments: {
+        pid: 42,
+        element: 7,
+        coordinate: [120, 240],
+        password: 'private-password-value',
+        ignored: 'nested-value-must-not-be-persisted',
+      },
+    });
+    value.createApprovalRequest(
+      {
+        ...input('computer-preview'),
+        toolName: 'computer.use',
+        canonicalArguments: computerArguments,
+        payloadHash: approvalPayloadHash('run-1', 'computer.use', computerArguments),
+        requiredPermission: 'execute',
+        risk: 'high · external',
+        target: 'click',
+      },
+      1_000,
+    );
+    const computer = publicApprovalRequest(
+      value.getApprovalRequest('computer-preview') as NonNullable<
+        ReturnType<typeof value.getApprovalRequest>
+      >,
+    );
+    expect(computer.preview).toMatchObject({ version: 1, kind: 'computer.use' });
+    expect(computer.preview.fields).toEqual(
+      expect.arrayContaining([
+        { label: 'Action', value: 'click' },
+        { label: 'Process ID', value: '42' },
+        { label: 'Element', value: '7' },
+        { label: 'Coordinate', value: '(120, 240)' },
+      ]),
+    );
+
+    const stored = JSON.stringify(
+      value.database.raw
+        .prepare(
+          "SELECT arguments_preview FROM approval_requests WHERE id IN ('write-preview', 'computer-preview') ORDER BY id",
+        )
+        .all(),
+    );
+    expect(stored).not.toContain('private-token-value');
+    expect(stored).not.toContain('private-password-value');
+    expect(stored).not.toContain('must-not-be-persisted');
+    expect(stored).not.toContain('nested-value-must-not-be-persisted');
+  });
+
+  it('never stores or publishes credentials from opaque approval text fields', async () => {
+    const { value } = await store();
+    const secrets = {
+      password: 'password=hunter2',
+      apiKey: 'api_key: abc123-not-public',
+      jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.signature',
+      signedUrl: 'https://example.com/file?X-Amz-Credential=private&X-Amz-Signature=secret',
+    };
+    const requests = [
+      {
+        id: 'opaque-write',
+        toolName: 'workspace.write',
+        arguments: { path: 'safe.txt', content: Object.values(secrets).join('\n') },
+      },
+      {
+        id: 'opaque-computer',
+        toolName: 'computer.use',
+        arguments: { action: 'set_value', arguments: { pid: 42, element: 7, value: secrets.jwt } },
+      },
+      {
+        id: 'opaque-command',
+        toolName: 'workspace.command',
+        arguments: {
+          command: `${secrets.password} ${secrets.signedUrl}`,
+          args: [secrets.password, secrets.signedUrl],
+        },
+      },
+      {
+        id: 'opaque-schedule',
+        toolName: 'schedule.create',
+        arguments: {
+          name: 'Nightly task',
+          type: 'cron',
+          expression: '0 0 * * *',
+          agentInput: secrets.apiKey,
+        },
+      },
+      {
+        id: 'opaque-agent',
+        toolName: 'agent.dispatch',
+        arguments: { agent: 'local', prompt: secrets.password },
+      },
+    ];
+    const publicValues = requests.map((request) => {
+      const canonicalArguments = canonicalizeApprovalArguments(request.arguments);
+      value.createApprovalRequest(
+        {
+          ...input(request.id),
+          toolName: request.toolName,
+          canonicalArguments,
+          payloadHash: approvalPayloadHash('run-1', request.toolName, canonicalArguments),
+        },
+        1_000,
+      );
+      return publicApprovalRequest(
+        value.getApprovalRequest(request.id) as NonNullable<
+          ReturnType<typeof value.getApprovalRequest>
+        >,
+      );
+    });
+    const persisted = JSON.stringify(
+      value.database.raw.prepare('SELECT arguments_preview FROM approval_requests').all(),
+    );
+    const exposed = JSON.stringify({
+      approvals: publicValues,
+      events: publicValues.map((approval) => createEvent('approval.requested', { ...approval })),
+    });
+    for (const secret of Object.values(secrets)) {
+      expect(persisted).not.toContain(secret);
+      expect(exposed).not.toContain(secret);
+    }
+    expect(publicValues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          preview: expect.objectContaining({
+            fields: expect.arrayContaining([
+              { label: 'Content size', value: expect.stringContaining('UTF-8 bytes') },
+              { label: 'Content SHA-256', value: expect.stringMatching(/^[a-f0-9]{64}$/u) },
+            ]),
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it('scrubs legacy generic argument previews when an existing database is reopened', async () => {
+    const { root, value } = await store();
+    value.createApprovalRequest(input('legacy-preview'), 1_000);
+    value.createApprovalRequest(input('malformed-preview'), 1_000);
+    value.createApprovalRequest(input('valid-preview'), 1_000);
+    const validBefore = (
+      value.database.raw
+        .prepare('SELECT arguments_preview AS preview FROM approval_requests WHERE id = ?')
+        .get('valid-preview') as { preview: string }
+    ).preview;
+    value.database.raw
+      .prepare('UPDATE approval_requests SET arguments_preview = ? WHERE id = ?')
+      .run('{"content":"password=hunter2","path":"notes.txt"}', 'legacy-preview');
+    value.database.raw
+      .prepare('UPDATE approval_requests SET arguments_preview = ? WHERE id = ?')
+      .run('{"version":1}', 'malformed-preview');
+    value.close();
+    stores.splice(stores.indexOf(value), 1);
+
+    const reopened = new DatabaseStore(openAppDatabase(root));
+    stores.push(reopened);
+    const persisted = JSON.stringify(
+      reopened.database.raw
+        .prepare('SELECT arguments_preview FROM approval_requests WHERE id = ?')
+        .get('legacy-preview'),
+    );
+    expect(persisted).not.toContain('hunter2');
+    expect(
+      publicApprovalRequest(reopened.getApprovalRequest('legacy-preview') as never).preview,
+    ).toEqual(expect.objectContaining({ version: 1, kind: 'legacy', fields: [] }));
+    expect(
+      publicApprovalRequest(reopened.getApprovalRequest('malformed-preview') as never).preview,
+    ).toEqual(expect.objectContaining({ version: 1, kind: 'legacy', fields: [] }));
+    expect(
+      (
+        reopened.database.raw
+          .prepare('SELECT arguments_preview AS preview FROM approval_requests WHERE id = ?')
+          .get('valid-preview') as { preview: string }
+      ).preview,
+    ).toBe(validBefore);
   });
 });

@@ -273,9 +273,42 @@ describe('runtime configuration and security primitives', () => {
 
   it('redacts bearer tokens, API keys, nested values, and permissions', () => {
     expect(redactText('Bearer abc.def and sk-12345678')).toBe('Bearer [REDACTED] and [REDACTED]');
+    const assignmentText = redactText(
+      'password=hunter2 api_key: "private-key" https://example.com/?token=query-secret&ok=1',
+    );
+    expect(assignmentText).not.toContain('hunter2');
+    expect(assignmentText).not.toContain('private-key');
+    expect(assignmentText).not.toContain('query-secret');
+    expect(assignmentText).toContain('password=[REDACTED]');
+    expect(assignmentText).toContain('api_key: [REDACTED]');
+    expect(assignmentText).toContain('?token=[REDACTED]&ok=1');
+    const jsonText = redactText(
+      JSON.stringify({
+        password: 'hunter"2\\tail',
+        access_token: 'abc123',
+        nested: { api_key: 'nested-secret' },
+        safe: 'kept',
+      }),
+    );
+    expect(JSON.parse(jsonText)).toEqual({
+      password: '[REDACTED]',
+      access_token: '[REDACTED]',
+      nested: { api_key: '[REDACTED]' },
+      safe: 'kept',
+    });
+    const deeplyNestedJson = `${'['.repeat(5_000)}{"api_key":"deep-secret"}${']'.repeat(5_000)}`;
+    const deeplyRedacted = redactText(deeplyNestedJson);
+    expect(JSON.parse(deeplyRedacted)).toBe('[REDACTED]');
+    expect(deeplyRedacted).not.toContain('deep-secret');
+    const environmentText = redactText('OPENAI_API_KEY=prefix/SECRET+suffix== SAFE=value');
+    expect(environmentText).toBe('OPENAI_API_KEY=[REDACTED] SAFE=value');
     expect(
       redactValue({ token: 'secret', nested: [{ password: 'hidden' }, 'Bearer abc'] }),
     ).toEqual({ token: '[REDACTED]', nested: [{ password: '[REDACTED]' }, 'Bearer [REDACTED]'] });
+    expect(redactValue({ accessToken: 123_456, authorization: 42 })).toEqual({
+      accessToken: '[REDACTED]',
+      authorization: '[REDACTED]',
+    });
     assertPermission(permissive, 'read');
     expect(() =>
       assertPermission({ approved: new Set(['read']), capabilities: {} }, 'write'),
@@ -432,7 +465,7 @@ describe('SQLite persistence and vector memory', () => {
           value: string;
         }
       ).value,
-    ).toBe('4');
+    ).toBe('7');
     const legacyRoot = await makeRoot();
     await mkdir(workspaceDirectory(legacyRoot), { recursive: true });
     const legacyDb = new Database(join(workspaceDirectory(legacyRoot), 'memory.db'));
@@ -456,7 +489,7 @@ describe('SQLite persistence and vector memory', () => {
           .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
           .get() as { value: string }
       ).value,
-    ).toBe('4');
+    ).toBe('7');
     expect(
       (upgraded.raw.prepare('PRAGMA table_info(plugins)').all() as Array<{ name: string }>).map(
         (column) => column.name,
@@ -1511,7 +1544,10 @@ describe('providers and scheduler', () => {
       const events: ProviderStreamEvent[] = [];
       for await (const event of provider.stream({
         model: '',
-        messages: [{ role: 'user', content: 'hi' }],
+        messages: [
+          { role: 'system', content: 'Follow verified policy' },
+          { role: 'user', content: 'hi' },
+        ],
         systemPrompt: 'Follow verified policy',
       }))
         events.push(event);
@@ -1520,10 +1556,15 @@ describe('providers and scheduler', () => {
         { type: 'delta', text: 'world' },
         { type: 'done', text: 'Hello world' },
       ]);
-      expect(nativeRequestBody?.messages).toEqual([
-        { role: 'system', content: 'Follow verified policy' },
-        { role: 'user', content: 'hi' },
-      ]);
+      expect(nativeRequestBody).toEqual({
+        model: 'chat-model',
+        messages: [
+          { role: 'system', content: 'Follow verified policy' },
+          { role: 'user', content: 'hi' },
+        ],
+        stream: true,
+        options: { num_ctx: 262_144 },
+      });
       expect(await provider.embed('hi')).toEqual([1, 2, 3]);
       expect(await provider.health()).toMatchObject({ available: true, models: ['test-model'] });
       expect(calls).toContain('http://ollama.local/api/chat');
@@ -1600,7 +1641,11 @@ describe('providers and scheduler', () => {
       const events: ProviderStreamEvent[] = [];
       for await (const event of provider.stream({
         model: '',
-        messages: [{ role: 'user', content: 'inspect files' }],
+        messages: [
+          { role: 'system', content: 'Follow verified policy' },
+          { role: 'user', content: 'inspect files' },
+        ],
+        systemPrompt: 'Follow verified policy',
         tools: [
           {
             name: 'workspace.list',
@@ -1620,17 +1665,24 @@ describe('providers and scheduler', () => {
         },
         { type: 'done', text: 'Local answer' },
       ]);
-      expect(requestBody).toMatchObject({ model: 'local-model', stream: false });
-      expect(requestBody?.tools).toEqual([
-        {
-          type: 'function',
-          function: {
-            name: 'workspace_list',
-            description: 'List files',
-            parameters: { type: 'object', properties: {} },
+      expect(requestBody).toEqual({
+        model: 'local-model',
+        messages: [
+          { role: 'system', content: 'Follow verified policy' },
+          { role: 'user', content: 'inspect files' },
+        ],
+        stream: false,
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'workspace_list',
+              description: 'List files',
+              parameters: { type: 'object', properties: {} },
+            },
           },
-        },
-      ]);
+        ],
+      });
       expect(await provider.embed('hi')).toEqual([6, 7, 8]);
       expect(await provider.health()).toMatchObject({ available: true, models: ['local-model'] });
       expect(calls).toEqual(
@@ -1902,6 +1954,7 @@ else {
         { role: 'system', content: 'private runtime catalog' },
         { role: 'user', content: 'hello' },
       ],
+      systemPrompt: 'private runtime catalog',
     }))
       events.push(event);
     expect(events).toEqual([
@@ -1919,7 +1972,9 @@ else {
     expect(explicitArgs).toContain('model');
     expect(explicitArgs.join(' ')).not.toContain('private runtime catalog');
     expect(explicitArgs.join(' ')).not.toContain('hello');
-    expect(await readFile(stdinPath, 'utf8')).toBe('[user]\nhello');
+    expect(await readFile(stdinPath, 'utf8')).toBe(
+      '[system]\nprivate runtime catalog\n\n[user]\nhello',
+    );
     const defaultProvider = new CodexProvider({
       executable,
       model: '',
@@ -2353,7 +2408,7 @@ describe('agent runtime orchestration', () => {
     unsubscribe();
   });
 
-  it('projects provider-owned tool events without re-executing them in NUAAI', async () => {
+  it('rejects unadvertised provider-owned tool events without treating them as evidence', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
     let registryExecutions = 0;
@@ -2399,8 +2454,8 @@ describe('agent runtime orchestration', () => {
       permissions: permissive,
     });
     await expect(runtime.waitForRun(run.id)).resolves.toMatchObject({
-      status: 'completed',
-      output: 'Codex completed the command.',
+      status: 'failed',
+      output: expect.stringContaining('unadvertised'),
     });
     expect(registryExecutions).toBe(0);
     expect(
@@ -2408,7 +2463,12 @@ describe('agent runtime orchestration', () => {
         .listEvents()
         .filter((event) => event.runId === run.id)
         .map((event) => event.type),
-    ).toEqual(expect.arrayContaining(['tool.started', 'tool.completed', 'run.completed']));
+    ).toEqual(expect.arrayContaining(['tool.failed', 'run.failed']));
+    expect(
+      store
+        .listEvents()
+        .filter((event) => event.runId === run.id && event.type === 'tool.completed'),
+    ).toHaveLength(0);
   });
 
   it('requests finalization when a provider-owned loop returns a polite promise only', async () => {
@@ -3504,8 +3564,8 @@ describe('agent runtime orchestration', () => {
     });
     expect(requests).toHaveLength(3);
     expect(requests[2]?.messages.at(-1)).toMatchObject({ role: 'user' });
-    expect(requests[2]?.messages.filter((message) => message.role === 'system')).toHaveLength(1);
-    expect(requests[2]?.messages[0]).toMatchObject({ role: 'system' });
+    expect(requests[2]?.messages.filter((message) => message.role === 'system')).toHaveLength(0);
+    expect(requests[2]?.systemPrompt).toContain('## runtime');
   });
 
   it('accepts a substantive final answer that quotes unfinished-promise examples', async () => {

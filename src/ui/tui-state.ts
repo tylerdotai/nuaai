@@ -22,20 +22,80 @@ export interface TuiThread {
   title: string;
 }
 
+export type TuiConversationArtifact =
+  | {
+      type: 'artifact';
+      kind: string;
+      title: string;
+      downloadUrl?: string;
+      externalUrl?: string;
+    }
+  | { type: 'unsupported'; title: string };
+
 export interface TuiConversationMessage {
   role: string;
   content: string;
+  artifacts?: TuiConversationArtifact[];
+  citations?: Array<{ title: string; url: string }>;
+}
+
+export function tuiArtifactLines(message: TuiConversationMessage): string[] {
+  return [
+    ...(message.artifacts ?? []).map((artifact) =>
+      artifact.type === 'unsupported'
+        ? `Artifact: ${artifact.title}`
+        : `Artifact: ${artifact.title} [${artifact.kind}]${artifact.downloadUrl ? ` · ${artifact.downloadUrl}` : artifact.externalUrl ? ` · ${artifact.externalUrl}` : ''}`,
+    ),
+    ...(message.citations ?? []).map((citation) => `Citation: ${citation.title} · ${citation.url}`),
+  ];
 }
 
 export function tuiMessagesFromPresentation(
-  messages: Array<{ role: string; markdown: string }>,
+  messages: Array<{
+    role: string;
+    markdown: string;
+    artifacts?: Array<{
+      type: string;
+      sourceKind?: string;
+      kind?: string;
+      title?: string;
+      downloadUrl?: string;
+      externalUrl?: string;
+      label?: string;
+    }>;
+    citations?: Array<{ id?: string; title: string; url: string }>;
+  }>,
 ): TuiConversationMessage[] {
   return messages
     .filter(
       (message) =>
         (message.role === 'user' || message.role === 'assistant') && message.markdown.trim(),
     )
-    .map((message) => ({ role: message.role, content: message.markdown }));
+    .map((message) => {
+      const artifacts: TuiConversationArtifact[] = (message.artifacts ?? []).flatMap(
+        (artifact): TuiConversationArtifact[] => {
+          if (artifact.type === 'unsupported')
+            return artifact.label ? [{ type: 'unsupported' as const, title: artifact.label }] : [];
+          if (artifact.type !== 'artifact' || !artifact.kind || !artifact.title) return [];
+          return [
+            {
+              type: 'artifact' as const,
+              kind: artifact.kind,
+              title: artifact.title,
+              ...(artifact.downloadUrl ? { downloadUrl: artifact.downloadUrl } : {}),
+              ...(artifact.externalUrl ? { externalUrl: artifact.externalUrl } : {}),
+            },
+          ];
+        },
+      );
+      const citations = (message.citations ?? []).map(({ title, url }) => ({ title, url }));
+      return {
+        role: message.role,
+        content: message.markdown,
+        ...(artifacts.length ? { artifacts } : {}),
+        ...(citations.length ? { citations } : {}),
+      };
+    });
 }
 
 export interface TuiToolActivity {
@@ -101,6 +161,13 @@ export interface TuiApproval {
   payloadHash: string;
   target: string;
   risk: string;
+  preview: {
+    version: 1;
+    kind: string;
+    summary: string;
+    fields: Array<{ label: string; value: string; format?: 'code' }>;
+    context: { source: string; client: string; sessionId?: string };
+  };
   providerOwned: boolean;
   createdAt: number;
   expiresAt: number;
@@ -168,6 +235,12 @@ export function nextSelection(
   const index = current ? ids.indexOf(current) : -1;
   const nextIndex = index === -1 ? 0 : (index + direction + ids.length) % ids.length;
   return ids[nextIndex] ?? null;
+}
+
+export const tuiApprovalFallbackIntervalMs = 15_000;
+
+export function tuiReconnectDelayMs(attempt: number): number {
+  return Math.min(1_000 * 2 ** Math.max(0, attempt - 1), 10_000);
 }
 
 export const initialTuiState: TuiState = {
