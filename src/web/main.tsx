@@ -1358,7 +1358,7 @@ function App(): React.JSX.Element {
           <span aria-hidden="true">☰</span>
         </button>
         <div className="brand">
-          <span className="brand-mark" aria-hidden="true">
+          <span className="brand-mark" aria-hidden="true" data-connection={connection}>
             N
           </span>
           <div>

@@ -27,6 +27,8 @@
   --warning: #f2b46d;
   --error: #ff7b87;
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
   --safe-area-top: env(safe-area-inset-top, 0px);
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
 }
@@ -2170,4 +2172,396 @@ kbd {
     --text-secondary: #cbd2dc;
     --text-muted: #a8b2c0;
   }
+}
+
+/* ─── Enhanced easing variables ──────────────────────────────────────── */
+/* See animations.dev / easings.co for tuning reference */
+
+/* ─── Message entrance animations ───────────────────────────────────── */
+@keyframes message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes message-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* Respect prefers-reduced-motion */
+@media (prefers-reduced-motion: no-preference) {
+  .message {
+    animation: message-enter 220ms var(--ease-out) both;
+  }
+
+  /* Stagger consecutive messages — delay compounds per message index */
+  .message:nth-child(1)  { animation-delay: 0ms; }
+  .message:nth-child(2)  { animation-delay: 40ms; }
+  .message:nth-child(3)  { animation-delay: 80ms; }
+  .message:nth-child(4)  { animation-delay: 120ms; }
+  .message:nth-child(5)  { animation-delay: 160ms; }
+  .message:nth-child(n+6) { animation-delay: 200ms; }
+
+  /* Live/streaming message — just fade, no translate (already in position) */
+  .message[data-live] {
+    animation: message-fade-in 160ms ease-out both;
+  }
+
+  /* Approval card entrance */
+  .approval-card {
+    animation: message-enter 200ms var(--ease-out) both;
+  }
+}
+
+/* ─── Session row micro-interactions ───────────────────────────────── */
+@media (hover: hover) and (pointer: fine) {
+  .session-row {
+    transition:
+      background-color 150ms ease,
+      transform 120ms var(--ease-out);
+  }
+
+  .session-row:hover {
+    background: var(--surface-hover);
+    transform: translateX(2px);
+  }
+
+  .session-row:active {
+    transform: scale(0.97) translateX(0);
+  }
+}
+
+/* ─── Approval inbox — preview fields ──────────────────────────────── */
+.approval-preview-wide {
+  grid-column: 1 / -1;
+}
+
+.approval-preview-code {
+  background: #0b0e13;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  max-height: 160px;
+  overflow-x: auto;
+  overflow-y: auto;
+  padding: 0.6rem 0.75rem;
+  scrollbar-color: var(--border-strong) transparent;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ─── Inline code refinement ───────────────────────────────────────── */
+.markdown-content :not(pre) > code {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 0.82em;
+  padding: 0.1em 0.35em;
+}
+
+/* ─── Brand mark — connection indicator ────────────────────────────── */
+.brand-mark[data-connection="connected"] {
+  box-shadow: 0 0 0 2px rgba(125, 211, 176, 0.4);
+}
+
+.brand-mark[data-connection="connected"]::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 10px;
+  border: 2px solid var(--accent);
+  opacity: 0.25;
+  animation: brand-pulse 2.5s ease-in-out infinite;
+}
+
+@keyframes brand-pulse {
+  0%, 100% { opacity: 0.15; transform: scale(1); }
+  50%       { opacity: 0.3;  transform: scale(1.05); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-mark[data-connection="connected"]::after {
+    animation: none;
+    opacity: 0.2;
+  }
+}
+
+/* ─── Conversation empty state ─────────────────────────────────────── */
+.conversation-empty {
+  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  justify-content: center;
+  padding: 3rem 2rem;
+  text-align: center;
+}
+
+.conversation-empty .empty-mark {
+  font-size: 2rem;
+  height: 56px;
+  width: 56px;
+}
+
+.conversation-empty h2 {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin-top: 0.25rem;
+}
+
+.conversation-empty p {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.6;
+  max-width: 360px;
+}
+
+/* ─── Scrollbar polish ────────────────────────────────────────────── */
+.messages,
+.markdown-content,
+.code-block pre,
+.run-output {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.messages::-webkit-scrollbar,
+.code-block pre::-webkit-scrollbar {
+  height: 4px;
+  width: 4px;
+}
+
+.messages::-webkit-scrollbar-thumb,
+.code-block pre::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 2px;
+}
+
+/* ─── Primary button polish ────────────────────────────────────────── */
+.primary-button {
+  background: var(--accent);
+  border: 0;
+  border-radius: 8px;
+  color: #07120f;
+  font-size: 0.82rem;
+  font-weight: 750;
+  min-height: 38px;
+  padding: 0.55rem 1.2rem;
+  transition:
+    background-color 150ms ease,
+    box-shadow 150ms ease,
+    transform 120ms var(--ease-out);
+}
+
+.primary-button:hover {
+  background: color-mix(in srgb, var(--accent) 88%, white);
+  box-shadow: 0 4px 16px rgba(125, 211, 176, 0.25);
+}
+
+.primary-button:active {
+  transform: scale(0.97);
+  box-shadow: none;
+}
+
+/* ─── Danger / deny button polish ─────────────────────────────────── */
+.danger-text {
+  color: var(--error);
+  font-size: 0.72rem;
+  font-weight: 600;
+  min-height: 34px;
+  padding: 0.35rem 0.7rem;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease,
+    transform 120ms var(--ease-out);
+}
+
+.danger-text:hover {
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+}
+
+.danger-text:active {
+  transform: scale(0.97);
+}
+
+/* ─── Focus ring — custom, not browser default ────────────────────── */
+*:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ─── Approval badge — subtle shimmer for pending ─────────────────── */
+.count-chip {
+  background: color-mix(in srgb, var(--warning) 15%, var(--surface-raised));
+  border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
+  color: var(--warning);
+  position: relative;
+  overflow: hidden;
+}
+
+.count-chip::after {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.06) 50%,
+    transparent 100%
+  );
+  content: '';
+  height: 100%;
+  left: -100%;
+  position: absolute;
+  top: 0;
+  width: 60%;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .count-chip::after {
+    animation: shimmer 2.5s ease-in-out infinite;
+  }
+}
+
+@keyframes shimmer {
+  0%   { left: -100%; }
+  60%  { left: 150%; }
+  100% { left: 150%; }
+}
+
+/* ─── Tool / code header — language badge ─────────────────────────── */
+.code-block[data-language]::before {
+  background: var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  content: attr(data-language);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.06em;
+  padding: 0.15rem 0.4rem;
+  position: absolute;
+  right: 0.45rem;
+  text-transform: uppercase;
+  top: 0.3rem;
+}
+
+.code-block[data-language] {
+  position: relative;
+  padding-top: 2.1rem;
+}
+
+/* ─── Markdown table polish ────────────────────────────────────────── */
+.markdown-content table {
+  border-collapse: collapse;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  display: table;
+  font-size: 0.82rem;
+  overflow: hidden;
+  width: auto;
+}
+
+.markdown-content th {
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.markdown-content th,
+.markdown-content td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.45rem 0.8rem;
+  text-align: left;
+}
+
+.markdown-content tr:last-child td {
+  border-bottom: 0;
+}
+
+.markdown-content tr:hover td {
+  background: var(--surface-hover);
+}
+
+/* ─── Composer textarea ─────────────────────────────────────────────── */
+.composer textarea {
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  min-height: 52px;
+  resize: none;
+  width: 100%;
+}
+
+.composer textarea::placeholder {
+  color: var(--text-muted);
+}
+
+/* ─── Connection badge pulse ───────────────────────────────────────── */
+.connection-connected::before {
+  animation: connection-pulse 3s ease-in-out infinite;
+}
+
+@keyframes connection-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.5; }
+}
+
+/* ─── Dialog / modal polish ───────────────────────────────────────── */
+.dialog-backdrop {
+  background: rgba(2, 4, 7, 0.75);
+  backdrop-filter: blur(4px);
+  inset: 0;
+  position: fixed;
+  z-index: 50;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dialog-backdrop {
+    backdrop-filter: none;
+  }
+}
+
+/* ─── Command palette ──────────────────────────────────────────────── */
+.command-palette {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset,
+    0 24px 80px rgba(0, 0, 0, 0.6);
+  max-height: min(78dvh, 620px);
+  overflow-y: auto;
+  width: min(90vw, 580px);
+}
+
+.command-palette > section {
+  padding: 0.5rem;
+}
+
+.command-palette section + section {
+  border-top: 1px solid var(--border);
+}
+
+/* ─── Stagger session group sections ──────────────────────────────── */
+@media (prefers-reduced-motion: no-preference) {
+  .session-group {
+    animation: message-enter 180ms var(--ease-out) both;
+  }
+
+  .session-group:nth-child(1) { animation-delay: 0ms; }
+  .session-group:nth-child(2) { animation-delay: 60ms; }
+  .session-group:nth-child(3) { animation-delay: 120ms; }
 }
