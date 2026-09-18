@@ -1540,11 +1540,32 @@ function App(): React.JSX.Element {
           aria-label="Conversations"
           aria-modal={sessionDrawerOpen ? true : undefined}
           role={sessionDrawerOpen ? 'dialog' : undefined}
-          onClick={() => {
-            if (sessionRailCollapsed) setSessionRailCollapsed(false);
-          }}
         >
-          {!sessionRailCollapsed && (
+          {sessionRailCollapsed ? (
+            <div className="collapsed-rail">
+              <button
+                type="button"
+                className="collapsed-rail-btn"
+                onClick={() => setSessionRailCollapsed(false)}
+                title="Expand sidebar"
+              >
+                ☰
+              </button>
+              {sessions.slice(0, 8).map((session) => (
+                <button
+                  type="button"
+                  key={session.id}
+                  className={`collapsed-session-btn ${selectedSessionId === session.id ? 'selected' : ''}`}
+                  onClick={() => {
+                    void chooseSession(session.id);
+                  }}
+                  title={session.title}
+                >
+                  {session.title.charAt(0).toUpperCase()}
+                </button>
+              ))}
+            </div>
+          ) : (
             <>
               <div className="rail-heading">
                 <button
@@ -1682,32 +1703,6 @@ function App(): React.JSX.Element {
             </>
           )}
         </aside>
-        {sessionRailCollapsed && (
-          <div className="collapsed-rail">
-            <button
-              type="button"
-              className="collapsed-rail-btn"
-              onClick={() => setSessionRailCollapsed(false)}
-              title="Conversations"
-            >
-              ☰
-            </button>
-            {sessions.slice(0, 8).map((session) => (
-              <button
-                type="button"
-                key={session.id}
-                className={`collapsed-session-btn ${selectedSessionId === session.id ? 'selected' : ''}`}
-                onClick={() => {
-                  void chooseSession(session.id);
-                  setSessionRailCollapsed(true);
-                }}
-                title={session.title}
-              >
-                {session.title.charAt(0).toUpperCase()}
-              </button>
-            ))}
-          </div>
-        )}
         {sessionContextMenu && (
           <div
             className="context-menu"
