@@ -6,7 +6,6 @@ import {
   isRequestAbort,
   pairingFailureMessage,
   parseApiResponse,
-  webSocketCloseDisposition,
 } from './auth.js';
 import { AgentComposer } from './components/AgentComposer.js';
 import { ArtifactCards } from './components/ArtifactCards.js';
@@ -50,8 +49,6 @@ import {
 } from './scroll.js';
 import {
   type ActiveRunsByThread,
-  EventReplayBuffer,
-  EventReplayCursor,
   type LiveOutputByRun,
   type QueuedRunsByThread,
   type SelectionIdentity,
@@ -577,19 +574,15 @@ function App(): React.JSX.Element {
 
   useEffect(() => {
     if (!eventSubscription) return;
-    const subscribedSessionId = eventSubscription.sessionId;
-    let stopped = false;
-    let socket: WebSocket | undefined;
-    let reconnectTimer: number | undefined;
-    let eventFrame: number | undefined;
-    const eventBuffer = new EventReplayBuffer();
-    const replayCursor = new EventReplayCursor(eventSubscription.after);
-    let retry = 0;
-    lastEventId.current = eventSubscription.after;
+    const sessionId = eventSubscription.sessionId;
 
-    const flushEvents = (): void => {
+    let eventSource: EventSource | undefined;
+    let eventFrame: number | undefined;
+    const pendingEvents: WebEventRecord[] = [];
+
+    const processEvents = (): void => {
       eventFrame = undefined;
-      const batch = eventBuffer.drain();
+      const batch = pendingEvents.splice(0);
       if (!batch.length) return;
       setActiveRunsByThread((current) => batch.reduce(reduceActiveRunsByThread, current));
       setLiveOutputByRun((current) => batch.reduce(reduceLiveOutputByRun, current));
@@ -625,97 +618,125 @@ function App(): React.JSX.Element {
     };
 
     const scheduleEvent = (event: WebEventRecord): void => {
-      if (!eventBuffer.add(event)) return;
-      if (!replayCursor.isReplaying()) eventFrame ??= window.requestAnimationFrame(flushEvents);
+      pendingEvents.push(event);
+      eventFrame ??= window.requestAnimationFrame(processEvents);
     };
 
-    const subscribe = (after: number): void => {
-      socket?.send(
-        JSON.stringify({
-          type: 'subscribe',
-          sessionId: subscribedSessionId,
-          after,
-          limit: 250,
-        }),
-      );
+    const handleSSEEvent = (event: MessageEvent): void => {
+      try {
+        const data = JSON.parse(event.data) as {
+          type: string;
+          content?: string;
+          name?: string;
+          args?: Record<string, unknown>;
+          result?: unknown;
+          error?: string;
+          message?: string;
+          full_response?: string;
+          label?: string;
+          id?: number;
+        };
+        if (data.id) lastEventId.current = data.id;
+
+        if (data.type === 'token' && data.content !== undefined) {
+          scheduleEvent({
+            eventId: crypto.randomUUID(),
+            schemaVersion: 1,
+            type: 'model.delta',
+            source: 'sse',
+            correlationId: '',
+            createdAt: Date.now(),
+            sessionId: sessionId ?? undefined,
+            payload: { text: data.content },
+          } as WebEventRecord);
+        } else if (data.type === 'tool_start' && data.name) {
+          scheduleEvent({
+            eventId: crypto.randomUUID(),
+            schemaVersion: 1,
+            type: 'tool.started',
+            source: 'sse',
+            correlationId: '',
+            createdAt: Date.now(),
+            sessionId: sessionId ?? undefined,
+            payload: { name: data.name, arguments: data.args ?? {} },
+          } as WebEventRecord);
+        } else if (data.type === 'tool_end' && data.name) {
+          const payload: Record<string, unknown> = { name: data.name };
+          if ('result' in data) payload.result = data.result;
+          if ('error' in data) payload.error = data.error;
+          scheduleEvent({
+            eventId: crypto.randomUUID(),
+            schemaVersion: 1,
+            type: data.error ? 'tool.failed' : 'tool.completed',
+            source: 'sse',
+            correlationId: '',
+            createdAt: Date.now(),
+            sessionId: sessionId ?? undefined,
+            payload,
+          } as WebEventRecord);
+        } else if (data.type === 'done' && data.full_response !== undefined) {
+          scheduleEvent({
+            eventId: crypto.randomUUID(),
+            schemaVersion: 1,
+            type: 'model.completed',
+            source: 'sse',
+            correlationId: '',
+            createdAt: Date.now(),
+            sessionId: sessionId ?? undefined,
+            payload: { text: data.full_response },
+          } as WebEventRecord);
+        } else if (data.type === 'error' && data.message) {
+          scheduleEvent({
+            eventId: crypto.randomUUID(),
+            schemaVersion: 1,
+            type: 'run.failed',
+            source: 'sse',
+            correlationId: '',
+            createdAt: Date.now(),
+            sessionId: sessionId ?? undefined,
+            payload: { error: data.message },
+          } as WebEventRecord);
+        } else if (data.type === 'status' && data.label) {
+          // Status updates like "Thinking..." - can be shown in UI but not stored as events
+        }
+
+        if (data.type === 'tool_end' || data.type === 'done' || data.type === 'error') {
+          const threadId = selectedThreadRef.current;
+          const sessId = selectedSessionRef.current;
+          if (sessId && threadId) {
+            const expectedSelection = { sessionId: sessId, threadId };
+            const load = beginBackgroundLoad(expectedSelection);
+            void loadThread(threadId, load, backgroundLoads.current, expectedSelection).catch(
+              reportBackgroundFailure,
+            );
+          }
+          void loadSystem().catch(reportBackgroundFailure);
+        }
+      } catch {
+        setError('NUAAI received an invalid live event.');
+      }
     };
 
     const connect = (): void => {
-      if (stopped) return;
-      const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-      socket = new WebSocket(`${protocol}://${location.host}${appPath('/ws')}`);
-      socket.onopen = () => {
-        retry = 0;
-        setConnection('connected');
-        subscribe(replayCursor.beginReplay());
-      };
-      socket.onmessage = (message) => {
-        try {
-          const value = JSON.parse(String(message.data)) as {
-            type: string;
-            event?: WebEventRecord;
-            nextCursor?: number;
-            hasMore?: boolean;
-          };
-          if (value.type === 'replay.complete') {
-            const continuation = replayCursor.completePage(
-              value.nextCursor ?? 0,
-              value.hasMore === true,
-            );
-            lastEventId.current = Math.max(lastEventId.current, replayCursor.highWater());
-            if (continuation !== null) subscribe(continuation);
-            else if (eventBuffer.size) eventFrame ??= window.requestAnimationFrame(flushEvents);
-            return;
-          }
-          if (value.type !== 'event' || !value.event) return;
-          const nextEvent = value.event;
-          if (nextEvent.sessionId && nextEvent.sessionId !== subscribedSessionId) return;
-          if (nextEvent.id !== undefined) replayCursor.observe(nextEvent.id);
-          lastEventId.current = Math.max(lastEventId.current, nextEvent.id ?? 0);
-          scheduleEvent(nextEvent);
-          if (nextEvent.type.startsWith('approval.'))
-            void loadSystem().catch(reportBackgroundFailure);
-          if (
-            terminalRunStates.has(nextEvent.type.replace('run.', '')) &&
-            nextEvent.threadId === selectedThreadRef.current
-          ) {
-            const sessionId = selectedSessionRef.current;
-            const threadId = selectedThreadRef.current;
-            if (sessionId && threadId) {
-              const expectedSelection = { sessionId, threadId };
-              const load = beginBackgroundLoad(expectedSelection);
-              void loadThread(threadId, load, backgroundLoads.current, expectedSelection).catch(
-                reportBackgroundFailure,
-              );
-            }
-            if (sessionId) void loadSystem().catch(reportBackgroundFailure);
-          }
-        } catch {
-          setError('NUAAI received an invalid live event. Refresh the runtime state.');
-        }
-      };
-      socket.onerror = () => socket?.close();
-      socket.onclose = (event) => {
-        if (stopped) return;
-        const disposition = webSocketCloseDisposition(event.code, event.reason);
-        if (!disposition.reconnect) {
-          stopped = true;
-          setConnection('offline');
-          setError(disposition.message ?? 'Pair this device to continue.');
-          return;
-        }
-        retry += 1;
-        setConnection(retry >= 6 ? 'offline' : 'reconnecting');
-        reconnectTimer = window.setTimeout(connect, Math.min(1_000 * 2 ** (retry - 1), 10_000));
+      const url = new URL(appPath('/api/agent/stream'), location.href);
+      url.searchParams.set('session_id', sessionId ?? '');
+      if (lastEventId.current > 0) {
+        url.searchParams.set('Last-Event-ID', String(lastEventId.current));
+      }
+      eventSource = new EventSource(url.toString());
+      eventSource.onopen = () => setConnection('connected');
+      eventSource.onmessage = handleSSEEvent;
+      eventSource.onerror = () => {
+        eventSource?.close();
+        setConnection('reconnecting');
+        setTimeout(connect, 2000);
       };
     };
 
     connect();
     return () => {
-      stopped = true;
-      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      eventSource?.close();
       if (eventFrame) window.cancelAnimationFrame(eventFrame);
-      socket?.close();
     };
   }, [beginBackgroundLoad, eventSubscription, loadSystem, loadThread, reportBackgroundFailure]);
 
@@ -884,7 +905,12 @@ function App(): React.JSX.Element {
     [activeRunId, messages],
   );
   const liveMessage = useMemo<MessageView | null>(() => {
-    if (!runProjection || terminalRunStates.has(runProjection.status)) return null;
+    if (!runProjection) return null;
+    const isTerminal = terminalRunStates.has(runProjection.status);
+    const completedMessageExists = messages.some(
+      (m) => m.role === 'assistant' && m.runId === runProjection.runId,
+    );
+    if (isTerminal && completedMessageExists) return null;
     const startedAt =
       threadEvents.find(
         (event) => event.runId === runProjection.runId && event.type === 'run.started',
@@ -896,17 +922,18 @@ function App(): React.JSX.Element {
       markdown: liveOutputByRun[runProjection.runId] ?? runProjection.liveOutput,
       createdAt: startedAt,
       ...(activeProvider ? { provider: activeProvider } : {}),
-      status: 'streaming',
+      status: isTerminal ? 'completed' : 'streaming',
       activities: [
         {
           runId: runProjection.runId,
-          status: 'streaming',
+          status: isTerminal ? 'completed' : 'streaming',
           startedAt,
           items: runProjection.tools.map((tool) => ({
             id: tool.id,
             name: tool.name,
             status: tool.status,
             startedAt: tool.createdAt,
+            ...(tool.arguments ? { arguments: tool.arguments } : {}),
           })),
         },
       ],
@@ -914,7 +941,7 @@ function App(): React.JSX.Element {
       attachments: [],
       artifacts: [],
     };
-  }, [activeProvider, liveOutputByRun, runProjection, threadEvents]);
+  }, [activeProvider, liveOutputByRun, messages, runProjection, threadEvents]);
 
   const createSession = async (): Promise<void> => {
     followNextOutput();
@@ -1964,7 +1991,7 @@ function App(): React.JSX.Element {
                         Start a conversation
                       </button>
                     </div>
-                  ) : transcript.length === 0 && !runProjection?.liveOutput ? (
+                  ) : transcript.length === 0 && !runProjection ? (
                     <div className="conversation-empty">
                       <span className="empty-mark" aria-hidden="true">
                         N

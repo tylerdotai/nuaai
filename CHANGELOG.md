@@ -14,10 +14,16 @@ All notable NUAAI changes are recorded here.
 - Payload-bound per-action approvals now pause profile-governed tools before side effects, persist a durable one-time SQLite state machine, revalidate current permission and tool authority, and resume the same run only for the exact SHA-256-bound payload.
 - Authenticated approval list/detail/approve/deny APIs, approval lifecycle events, a functional PWA approval inbox, and TUI pending-action visibility.
 - Versioned tool-specific approval previews with allowlisted path/action/coordinate facts, opaque-field size and SHA-256 fingerprints, and safe source/session/client context.
+- Authenticated Server-Sent Events stream at `GET /api/agent/stream` with semantic event types (`status`, `token`, `tool_start`, `tool_end`, `error`, `done`), 15-second heartbeat, `Last-Event-ID` reconnection replay over a 100-event ring buffer, optional `session_id` filtering, and the original runtime event preserved in the payload alongside the mapped SSE shape.
 
 ### Changed
 
 - Local and OpenAI-compatible runs now default to a 262,144-token context budget with an 8,192-token response reserve and a 600-second provider timeout, matching high-memory local servers instead of compacting or timing out on long prefills.
+- Replaced the authenticated WebSocket event stream with the new Server-Sent Events endpoint. The web PWA and Ink TUI now consume SSE with browser `EventSource` reconnect and Node `fetch` streaming respectively; the `ws` npm package and `@types/ws` are no longer required.
+
+### Removed
+
+- `EventReplayBuffer` and `EventReplayCursor` helpers, the legacy `webSocketCloseDisposition` recovery helper, and the dedicated `ws` dependency have been retired along with the WebSocket transport.
 
 ### Fixed
 

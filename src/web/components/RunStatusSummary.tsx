@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import type { ActivityGroup, ActivityItem, MessageView } from '../contracts.js';
 
@@ -14,6 +14,11 @@ function formatDuration(milliseconds: number): string {
 }
 
 export function formatActivitySummary(group: ActivityGroup): string {
+  const runningTool = group.items.find((item) => item.status === 'running');
+  if (runningTool) {
+    const base = runningTool.name.replace('workspace.', '');
+    return `Using ${base}`;
+  }
   const reads = group.items.filter((item) => item.name === 'workspace.read').length;
   const searches = group.items.filter((item) => item.name.includes('search')).length;
   const commands = group.items.filter((item) => item.name === 'workspace.command').length;
@@ -62,23 +67,33 @@ export function ToolTimeline({ group }: { group: ActivityGroup }): React.JSX.Ele
 export function RunStatusSummary({
   message,
   active = false,
-  defaultExpanded = false,
   onStop,
   onRetry,
 }: {
   message: MessageView;
   active?: boolean;
-  defaultExpanded?: boolean;
   onStop?: () => void;
   onRetry?: () => void;
 }): React.JSX.Element | null {
   const group = message.activities[0];
-  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  useEffect(() => {
+    if (message.status !== 'streaming' || !group?.startedAt) {
+      setElapsedMs(0);
+      return;
+    }
+    setElapsedMs(Date.now() - group.startedAt);
+    const interval = setInterval(() => {
+      setElapsedMs(Date.now() - group.startedAt);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [message.status, group?.startedAt]);
   if (message.status === 'completed' && (!group || group.items.length === 0)) return null;
   const activitySummary = group ? formatActivitySummary(group) : 'Preparing response';
+  const elapsedDisplay = elapsedMs > 0 ? ` · ${formatDuration(elapsedMs)}` : '';
   const summary =
     message.status === 'streaming'
-      ? `Working · ${activitySummary}`
+      ? `Working${elapsedDisplay} · ${activitySummary}`
       : message.status === 'failed'
         ? `Failed · ${activitySummary}`
         : message.status === 'cancelled'
@@ -98,16 +113,6 @@ export function RunStatusSummary({
               Retry
             </button>
           )}
-          {group?.items.length ? (
-            <button
-              type="button"
-              aria-label="Inspect run activity"
-              aria-expanded={expanded}
-              onClick={() => setExpanded((current) => !current)}
-            >
-              Inspect
-            </button>
-          ) : null}
           {active && message.status === 'streaming' && onStop && (
             <button type="button" className="danger-text" onClick={onStop}>
               Stop
@@ -116,7 +121,7 @@ export function RunStatusSummary({
         </div>
       </div>
       {message.error && <p className="run-status-error">{message.error.message}</p>}
-      {expanded && group && <ToolTimeline group={group} />}
+      {group && <ToolTimeline group={group} />}
     </section>
   );
 }

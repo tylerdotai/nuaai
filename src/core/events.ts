@@ -20,6 +20,7 @@ export const eventTypes = [
   'model.started',
   'model.delta',
   'model.completed',
+  'model.usage',
   'capabilities.assembled',
   'prompt.assembled',
   'context.compacted',

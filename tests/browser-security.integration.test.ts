@@ -1,8 +1,9 @@
-import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
+import { type IncomingMessage, createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import type { Duplex } from 'node:stream';
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { WebSocketServer } from 'ws';
 
 import { BrowserAutomationClient } from '../src/integrations/search.js';
 
@@ -22,6 +23,46 @@ async function listen(server: {
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Test server address unavailable');
   return address.port;
+}
+
+function acceptWebSocket(socket: Duplex, key: string): void {
+  const accept = createHash('sha1')
+    .update(key)
+    .update('258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+    .digest('base64');
+  socket.write(
+    `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+  );
+}
+
+function startMinimalWebSocketServer(handler: (socket: Duplex) => void): Promise<{
+  close(callback: (error?: Error) => void): void;
+  port: number;
+}> {
+  const server = createServer();
+  server.on('upgrade', (request: IncomingMessage, socket: Duplex, _head: Buffer) => {
+    if (request.headers.upgrade?.toLowerCase() !== 'websocket') {
+      socket.destroy();
+      return;
+    }
+    const key = request.headers['sec-websocket-key'];
+    if (!key) {
+      socket.destroy();
+      return;
+    }
+    acceptWebSocket(socket, key);
+    handler(socket);
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('WebSocket test server address unavailable');
+      }
+      servers.push(server);
+      resolve({ close: server.close.bind(server), port: address.port });
+    });
+  });
 }
 
 function allowOnly(origin: string) {
@@ -73,18 +114,12 @@ describe('real browser network confinement', () => {
 
   it('does not allow a page to connect to a private WebSocket', async () => {
     let acceptedConnections = 0;
-    const websocketServer = new WebSocketServer({ host: '127.0.0.1', port: 0 });
-    websocketServer.on('connection', (socket) => {
+    const websocketServer = await startMinimalWebSocketServer((socket) => {
       acceptedConnections += 1;
-      socket.send('private data');
-      socket.close();
+      socket.write('private data');
+      socket.end();
     });
-    await new Promise<void>((resolve) => websocketServer.once('listening', resolve));
-    servers.push(websocketServer);
-    const websocketAddress = websocketServer.address();
-    if (!websocketAddress || typeof websocketAddress === 'string')
-      throw new Error('WebSocket test server address unavailable');
-    const websocketPort = websocketAddress.port;
+    const websocketPort = websocketServer.port;
     const publicServer = createServer((_request, response) => {
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       response.end(

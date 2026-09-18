@@ -10,7 +10,6 @@ import {
   isRequestAbort,
   pairingFailureMessage,
   parseApiResponse,
-  webSocketCloseDisposition,
 } from '../src/web/auth.js';
 import { ErrorToast } from '../src/web/views.js';
 
@@ -27,17 +26,6 @@ describe('PWA authentication recovery', () => {
     await expect(parseApiResponse(response)).rejects.toEqual(
       new ApiRequestError('Session expired — pair this device again.', 401, 'AUTH_EXPIRED'),
     );
-  });
-
-  it('stops reconnecting when the gateway closes an expired WebSocket session', () => {
-    expect(webSocketCloseDisposition(1008, 'AUTH_EXPIRED')).toEqual({
-      reconnect: false,
-      message: 'Session expired — pair this device again.',
-    });
-  });
-
-  it('keeps exponential reconnect behavior for an ordinary network closure', () => {
-    expect(webSocketCloseDisposition(1006, '')).toEqual({ reconnect: true });
   });
 
   it('suppresses only expected request aborts from superseded selection loads', () => {

@@ -1415,6 +1415,34 @@ kbd {
   overflow-wrap: anywhere;
 }
 
+.tool-args-toggle {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.66rem;
+  margin-top: 0.2rem;
+  padding: 0;
+}
+
+.tool-args-toggle:hover {
+  text-decoration: underline;
+}
+
+.tool-arguments {
+  background: var(--bg-secondary);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  margin-top: 0.3rem;
+  max-height: 200px;
+  overflow: auto;
+  padding: 0.4rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .message-live {
   opacity: 0.92;
 }

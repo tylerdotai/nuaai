@@ -84,6 +84,41 @@ export interface ToolAdmission {
   input: unknown;
 }
 
+export interface ToolDescription {
+  name: string;
+  description: string;
+  permission: 'read' | 'write' | 'execute';
+  governance: ToolGovernance;
+  parameters: Record<string, unknown>;
+  category:
+    | 'workspace'
+    | 'web'
+    | 'memory'
+    | 'system'
+    | 'provider'
+    | 'media'
+    | 'schedule'
+    | 'github'
+    | 'codex'
+    | 'mcp'
+    | 'agent'
+    | 'other';
+}
+
+function toolCategory(name: string): ToolDescription['category'] {
+  if (name.startsWith('workspace.')) return 'workspace';
+  if (name.startsWith('web.')) return 'web';
+  if (name.startsWith('memory.')) return 'memory';
+  if (name.startsWith('schedule.')) return 'schedule';
+  if (name.startsWith('github.')) return 'github';
+  if (name.startsWith('codex.')) return 'codex';
+  if (name.startsWith('provider.')) return 'provider';
+  if (name.startsWith('media.')) return 'media';
+  if (name.startsWith('mcp.')) return 'mcp';
+  if (name.startsWith('agent.')) return 'agent';
+  return 'other';
+}
+
 const empty = z.object({});
 const githubCommands = new Set(['gh']);
 const toolCostUnits: Record<ToolCostClass, number> = { low: 1, medium: 2, high: 4 };
@@ -1030,5 +1065,40 @@ export class ToolRegistry {
     const result = await tool.execute(parsed, context);
     context.signal?.throwIfAborted();
     return result;
+  }
+
+  listTools(): ToolDescription[] {
+    return [...this.tools.values()].map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      permission: tool.permission,
+      governance: tool.governance,
+      parameters: tool.parameters,
+      category: toolCategory(tool.name),
+    }));
+  }
+
+  getTool(name: string): ToolDescription | null {
+    const tool = this.tools.get(name);
+    if (!tool) return null;
+    return {
+      name: tool.name,
+      description: tool.description,
+      permission: tool.permission,
+      governance: tool.governance,
+      parameters: tool.parameters,
+      category: toolCategory(tool.name),
+    };
+  }
+
+  getToolSchema(name: string): Record<string, unknown> | null {
+    const tool = this.tools.get(name);
+    if (!tool) return null;
+    return {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+      input: tool.input.description || 'unknown',
+    };
   }
 }
