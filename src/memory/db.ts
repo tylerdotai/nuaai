@@ -381,6 +381,14 @@ function createSchema(db: MemoryDatabase, vector = false): void {
   }>;
   if (!scheduleColumns.some((column) => column.name === 'policy'))
     db.exec("ALTER TABLE schedules ADD COLUMN policy TEXT NOT NULL DEFAULT '{}'");
+  const messageColumns = db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>;
+  if (!messageColumns.some((column) => column.name === 'thread_id'))
+    db.exec("ALTER TABLE messages ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''");
+  const messageArtifactColumns = db.prepare('PRAGMA table_info(message_artifacts)').all() as Array<{
+    name: string;
+  }>;
+  if (!messageArtifactColumns.some((column) => column.name === 'thread_id'))
+    db.exec("ALTER TABLE message_artifacts ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''");
   const pluginColumns = db.prepare('PRAGMA table_info(plugins)').all() as Array<{ name: string }>;
   const pluginMigrations: Array<[string, string]> = [
     ['api_version', "ALTER TABLE plugins ADD COLUMN api_version TEXT NOT NULL DEFAULT '1'"],
@@ -1863,6 +1871,44 @@ export class DatabaseStore {
         this.database.raw.prepare('DELETE FROM memory_vector_refs WHERE memory_id = ?').run(id);
       }
       const result = this.database.raw.prepare('DELETE FROM memory_records WHERE id = ?').run(id);
+      return result.changes > 0;
+    });
+    return Boolean(transaction());
+  }
+
+  updateMemory(id: string, content: string, embedding: number[] | null, now = Date.now()): boolean {
+    const buffer = embedding ? Buffer.from(new Float32Array(embedding).buffer) : null;
+    const transaction = this.database.raw.transaction(() => {
+      const existing = this.database.raw
+        .prepare('SELECT id FROM memory_records WHERE id = ?')
+        .get(id);
+      if (!existing) return false;
+
+      if (embedding?.length === 768) {
+        const vectorRef = this.database.raw
+          .prepare('SELECT vector_rowid FROM memory_vector_refs WHERE memory_id = ?')
+          .get(id) as { vector_rowid: number } | undefined;
+        if (vectorRef) {
+          this.database.raw
+            .prepare('DELETE FROM memory_vectors WHERE rowid = ?')
+            .run(vectorRef.vector_rowid);
+          this.database.raw.prepare('DELETE FROM memory_vector_refs WHERE memory_id = ?').run(id);
+        }
+        const vector = this.database.raw
+          .prepare('INSERT INTO memory_vectors (embedding) VALUES (?)')
+          .run(new Float32Array(embedding));
+        this.database.raw
+          .prepare(
+            'INSERT OR REPLACE INTO memory_vector_refs (memory_id, vector_rowid) VALUES (?, ?)',
+          )
+          .run(id, Number(vector.lastInsertRowid));
+      }
+
+      const result = this.database.raw
+        .prepare(
+          'UPDATE memory_records SET content = ?, embedding = ?, embedding_dimensions = ?, created_at = ? WHERE id = ?',
+        )
+        .run(content, buffer, embedding?.length ?? null, now, id);
       return result.changes > 0;
     });
     return Boolean(transaction());

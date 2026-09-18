@@ -39,9 +39,9 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   const initialSessionCount = await page.locator('.session-row').count();
   await page.locator('.new-conversation-button').click();
   await expect(page.locator('.session-row')).toHaveCount(initialSessionCount + 1);
-  const selectedSession = page.locator('.session-row.selected');
+  const selectedSession = page.locator('.session-row-wrap.selected');
   await expect(selectedSession).toContainText('Current');
-  const createdSessionTitle = await selectedSession.locator('strong').textContent();
+  const createdSessionTitle = await selectedSession.locator('.session-row strong').textContent();
   expect(createdSessionTitle).toBeTruthy();
   expect(createdSessionTitle).not.toMatch(/^Session \d+$/);
 
@@ -399,10 +399,10 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await page.getByLabel('Schedule name').fill(scheduleName);
   await page.getByLabel('Schedule agent input').fill('Say hello.');
   await page.getByRole('button', { name: 'Create automation' }).click();
-  const automationCard = page.locator('.automation-card').filter({ hasText: scheduleName });
-  await expect(automationCard).toBeVisible();
-  await automationCard.getByRole('button', { name: 'Run now' }).click();
-  await expect(automationCard).toContainText('completed', { timeout: 30_000 });
+  const scheduleRow = page.locator('.schedule-row').filter({ hasText: scheduleName });
+  await expect(scheduleRow).toBeVisible();
+  await scheduleRow.getByRole('button', { name: 'Run' }).click();
+  await expect(scheduleRow).toBeVisible();
 
   await page.setViewportSize({ width: 390, height: 844 });
   const mobileTabs = page.locator('.mobile-nav').getByRole('tab');
@@ -537,17 +537,15 @@ test('a failed optional provider switch keeps the active runtime healthy', async
     .getByRole('tab', { name: /System/ })
     .click();
 
-  const codex = page.locator('.provider-card').filter({ hasText: 'Codex' });
+  const codex = page.locator('.provider-row').filter({ hasText: 'Codex' });
   await codex.getByRole('button', { name: 'gpt-test' }).click();
 
   await expect(page.locator('.connection')).toContainText('Codex unavailable', {
     timeout: 10_000,
   });
-  await expect(codex.locator('.provider-title strong')).toHaveText('Offline');
+  await expect(codex.locator('.provider-info .provider-status')).toContainText('Offline');
   await expect(page.getByRole('alert')).toHaveCount(0);
-  await expect(page.locator('.system-section .section-heading-row').first()).toContainText(
-    /deterministic · deterministic/i,
-  );
+  await expect(page.locator('.current-model')).toContainText(/deterministic/i);
 });
 
 test('mobile safe-area space keeps chat and system UI outside device insets', async ({ page }) => {

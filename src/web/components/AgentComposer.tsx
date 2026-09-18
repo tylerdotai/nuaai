@@ -12,6 +12,15 @@ import type {
   PermissionProfile,
   ProviderHealth,
 } from '../contracts.js';
+import { appPath } from '../utils.js';
+
+interface UploadedFile {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  url: string;
+}
 
 const slashCommands: Array<{ command: string; id: ComposerCommand; label: string }> = [
   { command: '/new', id: 'new-session', label: 'New conversation' },
@@ -51,7 +60,7 @@ export function AgentComposer({
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   onInput: (value: string) => void;
   onExpanded: (expanded: boolean) => void;
-  onSubmit: (mode: 'next' | 'interrupt') => void;
+  onSubmit: (mode: 'next' | 'interrupt', attachments?: UploadedFile[]) => void;
   onStop: () => void;
   onSwitchProvider: (provider: string, model: string) => void;
   onCommand: (command: ComposerCommand) => void;
@@ -59,8 +68,73 @@ export function AgentComposer({
   const [focused, setFocused] = useState(false);
   const [followupMode, setFollowupMode] = useState<'next' | 'interrupt'>('next');
   const [attachments, setAttachments] = useState<Array<File & { id: string }>>([]);
+  const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const action = composerAction({ input, activeRunId });
+  const commandSuggestions = input.trim().startsWith('/')
+    ? slashCommands.filter(({ command }) => command.startsWith(input.trim().toLowerCase()))
+    : [];
+
+  const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+  const ALLOWED_TYPES = ['image/', 'text/', 'application/pdf', 'application/json'];
+
+  const validateFile = (file: File): string | null => {
+    if (file.size > MAX_FILE_SIZE) return `${file.name} exceeds 50MB limit`;
+    const allowed = ALLOWED_TYPES.some((type) => file.type.startsWith(type) || file.type === type);
+    if (!allowed) return `${file.name} has unsupported type: ${file.type}`;
+    return null;
+  };
+
+  const addFiles = (files: FileList | File[]) => {
+    const fileArray = Array.from(files);
+    const validFiles: Array<File & { id: string }> = [];
+    for (const file of fileArray) {
+      const error = validateFile(file);
+      if (error) {
+        console.warn(error);
+        continue;
+      }
+      validFiles.push(Object.assign(file, { id: crypto.randomUUID() }));
+    }
+    if (validFiles.length) {
+      setAttachments((current) => [...current, ...validFiles]);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+    if (e.dataTransfer.files?.length) {
+      addFiles(e.dataTransfer.files);
+    }
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imageItems = Array.from(items).filter(
+      (item) => item.kind === 'file' && item.type.startsWith('image/'),
+    );
+    if (imageItems.length) {
+      e.preventDefault();
+      const files = imageItems.map((item) => item.getAsFile()).filter(Boolean) as File[];
+      addFiles(files);
+    }
+  };
+
   const capabilities = capabilitySummary(permissionProfile);
   const modelOptions = useMemo(() => {
     const options = providers.flatMap((provider) =>
@@ -69,24 +143,36 @@ export function AgentComposer({
         provider: provider.name,
         model,
         available: provider.available,
+        detail: provider.detail,
       })),
     );
     if (activeProvider) {
       const activeValue = `${activeProvider.name}:${activeProvider.model}`;
+      const activeHealth = providers.find((provider) => provider.name === activeProvider.name);
       if (!options.some((option) => option.value === activeValue))
         options.unshift({
           value: activeValue,
           provider: activeProvider.name,
           model: activeProvider.model,
-          available:
-            providers.find((provider) => provider.name === activeProvider.name)?.available ?? true,
+          available: activeHealth?.available ?? true,
+          detail: activeHealth?.detail ?? 'unknown',
         });
     }
     return options;
   }, [activeProvider, providers]);
-  const commandSuggestions = input.trim().startsWith('/')
-    ? slashCommands.filter(({ command }) => command.startsWith(input.trim().toLowerCase()))
-    : [];
+
+  const _getHealthDot = (detail: string, available: boolean): string => {
+    if (!available) return '●';
+    if (detail === 'ready') return '●';
+    if (detail.startsWith('error') || detail.startsWith('failed')) return '○';
+    return '○';
+  };
+
+  const getHealthTitle = (detail: string, available: boolean): string => {
+    if (!available) return `Unavailable: ${detail}`;
+    if (detail === 'ready') return 'Ready';
+    return detail || 'Unknown';
+  };
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -100,22 +186,47 @@ export function AgentComposer({
     if (!activeRunId) setFollowupMode('next');
   }, [activeRunId]);
 
-  const submit = (): void => {
+  const submit = async (): Promise<void> => {
     if (action === 'stop') {
       onStop();
       return;
     }
-    if (action === 'send') onSubmit('next');
-    else if (action === 'queue') onSubmit(followupMode);
+    let uploadedFiles: UploadedFile[] | undefined;
+    const hasAttachments = attachments.length > 0;
+    if (hasAttachments) {
+      const formData = new FormData();
+      for (const file of attachments) {
+        formData.append('files', file);
+      }
+      try {
+        const response = await fetch(appPath('/api/uploads'), {
+          method: 'POST',
+          body: formData,
+        });
+        if (response.ok) {
+          const result = (await response.json()) as { files: UploadedFile[] };
+          uploadedFiles = result.files;
+        }
+      } catch {
+        // Upload failed, continue without attachments
+      }
+    }
+    if (action === 'send') {
+      onSubmit('next', uploadedFiles);
+      if (hasAttachments) setAttachments([]);
+    } else if (action === 'queue') onSubmit(followupMode, uploadedFiles);
   };
 
   return (
     <form
-      className={`composer ${expanded ? 'composer-expanded' : ''}`}
+      className={`composer ${expanded ? 'composer-expanded' : ''} ${isDragOver ? 'composer-drag-over' : ''}`}
       onSubmit={(event) => {
         event.preventDefault();
-        submit();
+        void submit();
       }}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
     >
       {queuedItems.length > 0 && (
         <div className="composer-queue" aria-label="Queued follow-ups">
@@ -198,6 +309,7 @@ export function AgentComposer({
               event.preventDefault();
               if (input.trim()) submit();
             }}
+            onPaste={handlePaste}
           />
         </label>
         <button
@@ -241,23 +353,36 @@ export function AgentComposer({
 
       <div className="composer-toolbar">
         <div className="composer-controls">
-          <select
-            aria-label="Model"
-            value={activeProvider ? `${activeProvider.name}:${activeProvider.model}` : ''}
-            disabled={!modelOptions.length}
-            onChange={(event) => {
-              const option = modelOptions.find(
-                (candidate) => candidate.value === event.target.value,
-              );
-              if (option) onSwitchProvider(option.provider, option.model);
-            }}
-          >
-            {modelOptions.map((option) => (
-              <option key={option.value} value={option.value} disabled={!option.available}>
-                {option.provider} · {option.model}
-              </option>
-            ))}
-          </select>
+          <div className="model-selector">
+            {activeProvider &&
+              (() => {
+                const health = providers.find((p) => p.name === activeProvider.name);
+                return (
+                  <span
+                    className={`health-dot ${health?.available ? 'available' : 'unavailable'}`}
+                    title={getHealthTitle(health?.detail ?? '', health?.available ?? false)}
+                    aria-label={getHealthTitle(health?.detail ?? '', health?.available ?? false)}
+                  />
+                );
+              })()}
+            <select
+              aria-label="Model"
+              value={activeProvider ? `${activeProvider.name}:${activeProvider.model}` : ''}
+              disabled={!modelOptions.length}
+              onChange={(event) => {
+                const option = modelOptions.find(
+                  (candidate) => candidate.value === event.target.value,
+                );
+                if (option) onSwitchProvider(option.provider, option.model);
+              }}
+            >
+              {modelOptions.map((option) => (
+                <option key={option.value} value={option.value} disabled={!option.available}>
+                  {option.provider} · {option.model}
+                </option>
+              ))}
+            </select>
+          </div>
           <details className="composer-popover">
             <summary>{capabilities.label}</summary>
             <div>

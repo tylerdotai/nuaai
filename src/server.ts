@@ -1,6 +1,7 @@
-import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Hono } from 'hono';
@@ -413,14 +414,20 @@ export function createApp(services: GatewayServices): Hono {
       input?: string;
       provider?: string;
       model?: string;
+      attachments?: Array<{ id: string; name: string; type: string; size: number; url: string }>;
     };
     if (!body.threadId || !body.input)
       return context.json({ error: 'threadId and input are required' }, 400);
+    let input = body.input;
+    if (body.attachments && body.attachments.length > 0) {
+      const fileList = body.attachments.map((a) => `[${a.name}]`).join(', ');
+      input = `${input}\n\nAttachments: ${fileList}`;
+    }
     try {
       return context.json(
         services.runtime.startRun({
           threadId: body.threadId,
-          input: body.input,
+          input,
           provider: body.provider,
           model: body.model,
           permissions: runPermissions,
@@ -429,6 +436,60 @@ export function createApp(services: GatewayServices): Hono {
       );
     } catch (error) {
       return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+  const uploadRegistry = new Map<string, { name: string; type: string }>();
+  app.post('/api/uploads', async (context) => {
+    try {
+      const formData = await context.req.raw.formData();
+      const files: Array<{ id: string; name: string; type: string; size: number; url: string }> =
+        [];
+      const uploadDir = resolve(services.root, '.nuaai', 'uploads');
+      await mkdir(uploadDir, { recursive: true });
+      const entries: [string, File][] = [];
+      formData.forEach((value, key) => {
+        if (value instanceof File) entries.push([key, value]);
+      });
+      for (const [_name, value] of entries) {
+        const id = randomUUID();
+        const filepath = join(uploadDir, id);
+        const buffer = Buffer.from(await value.arrayBuffer());
+        await writeFile(filepath, buffer);
+        uploadRegistry.set(id, {
+          name: value.name,
+          type: value.type || 'application/octet-stream',
+        });
+        files.push({
+          id,
+          name: value.name,
+          type: value.type || 'application/octet-stream',
+          size: buffer.length,
+          url: `api/uploads/${id}`,
+        });
+      }
+      return context.json({ files });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+  app.get('/api/uploads/:id', async (context) => {
+    const id = context.req.param('id');
+    const uploadDir = resolve(services.root, '.nuaai', 'uploads');
+    const file = join(uploadDir, id);
+    const meta = uploadRegistry.get(id);
+    if (meta) {
+      context.header('Content-Type', meta.type);
+      context.header('Content-Disposition', `inline; filename="${meta.name}"`);
+    }
+    try {
+      const fileContent = await readFile(file);
+      return new Response(fileContent, {
+        headers: {
+          'Content-Type': meta?.type || 'application/octet-stream',
+        },
+      });
+    } catch {
+      return context.json({ error: 'File not found' }, 404);
     }
   });
   app.post('/api/runs/:id/resume', (context) => {
@@ -592,6 +653,29 @@ export function createApp(services: GatewayServices): Hono {
     try {
       const deleted = services.store.deleteMemory(context.req.param('id'));
       return deleted ? context.json({ ok: true }) : context.json({ error: 'Not found' }, 404);
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+  app.put('/api/memory/:id', async (context) => {
+    try {
+      const { content } = await context.req.json();
+      if (typeof content !== 'string' || !content.trim()) {
+        return context.json({ error: 'content is required' }, 400);
+      }
+      const id = context.req.param('id');
+      let embedding: number[] | null = null;
+      try {
+        embedding = services.providers
+          ? await services.providers.get('ollama').embed(content)
+          : null;
+      } catch {
+        // embedding unavailable - store lexically only
+      }
+      const updated = services.store.updateMemory(id, content.trim(), embedding);
+      return updated
+        ? context.json({ ok: true, hasEmbedding: Boolean(embedding) })
+        : context.json({ error: 'Not found' }, 404);
     } catch (error) {
       return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
     }
