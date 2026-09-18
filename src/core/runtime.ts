@@ -1242,6 +1242,11 @@ export class AgentRuntime {
   getTool(name: string): ToolDescription | null {
     return this.options.tools.getTool(name);
   }
+
+  getToolSchema(name: string): Record<string, unknown> | null {
+    return this.options.tools.getToolSchema(name);
+  }
+
   status(): {
     activeRuns: number;
     queuedRuns: number;
