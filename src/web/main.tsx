@@ -12,6 +12,7 @@ import { AgentComposer } from './components/AgentComposer.js';
 import { ArtifactCards } from './components/ArtifactCards.js';
 import { MarkdownContent } from './components/MarkdownContent.js';
 import { RunStatusSummary } from './components/RunStatusSummary.js';
+import { ToastContainer } from './components/Toast.js';
 import { type ComposerCommand, draftStorageKey, resolveComposerCommand } from './composer.js';
 import type {
   ActiveProvider,
@@ -72,8 +73,10 @@ import {
 import {
   ApprovalInbox,
   AutomationsView,
+  BottomPanel,
   CommandPalette,
   ErrorToast,
+  KeyboardShortcutsOverlay,
   MemoryView,
   NavigationTabs,
   SystemView,
@@ -102,6 +105,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 function App(): React.JSX.Element {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageView[]>([]);
@@ -110,8 +114,9 @@ function App(): React.JSX.Element {
   const [activeProvider, setActiveProvider] = useState<ActiveProvider | null>(null);
   const [webPermissionProfile, setWebPermissionProfile] = useState<PermissionProfile>('read-only');
   const [schedules, setSchedules] = useState<Schedule[]>([]);
-  const [tasks, setTasks] = useState<Task[]>([]);
+  const [_tasks, setTasks] = useState<Task[]>([]);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
+  const [isLoadingMemories, setIsLoadingMemories] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [plugins, setPlugins] = useState<PluginRecord[]>([]);
@@ -132,14 +137,26 @@ function App(): React.JSX.Element {
   } | null>(null);
   const [scheduleName, setScheduleName] = useState('');
   const [scheduleInput, setScheduleInput] = useState('');
+  const [scheduleType, setScheduleType] = useState<'manual' | 'interval' | 'cron'>('manual');
+  const [scheduleExpression, setScheduleExpression] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<
+    Array<{
+      id: string;
+      variant: 'info' | 'success' | 'warning' | 'error';
+      title?: string;
+      message: string;
+    }>
+  >([]);
   const [showNewResponse, setShowNewResponse] = useState(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [loadingEarlierMessages, setLoadingEarlierMessages] = useState(false);
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [shortcutsOverlayOpen, setShortcutsOverlayOpen] = useState(false);
+  const [bottomPanelOpen, setBottomPanelOpen] = useState(false);
   const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState('');
 
@@ -338,6 +355,7 @@ function App(): React.JSX.Element {
   }, [commandPaletteOpen]);
 
   const loadSystem = useCallback(async (signal?: AbortSignal): Promise<void> => {
+    setIsLoadingMemories(true);
     const [
       providerResult,
       scheduleResult,
@@ -369,6 +387,7 @@ function App(): React.JSX.Element {
     setPlugins(pluginResult.plugins);
     setPluginHealth(pluginResult.health);
     setApprovals(approvalResult.approvals);
+    setIsLoadingMemories(false);
   }, []);
 
   const loadThread = useCallback(
@@ -812,8 +831,17 @@ function App(): React.JSX.Element {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
         setCommandPaletteOpen(true);
+      } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') {
+        event.preventDefault();
+        setBottomPanelOpen((prev) => !prev);
+      } else if (event.key === '?' || (event.shiftKey && event.key === '/')) {
+        event.preventDefault();
+        setShortcutsOverlayOpen((prev) => !prev);
       } else if (event.key === 'Escape') {
+        setSelectedSessionIds(new Set());
         setCommandPaletteOpen(false);
+        setShortcutsOverlayOpen(false);
+        setBottomPanelOpen(false);
         setSessionDrawerOpen(false);
       }
     };
@@ -1048,7 +1076,10 @@ function App(): React.JSX.Element {
     else setView('system');
   };
 
-  const send = async (mode: 'next' | 'interrupt' = 'next'): Promise<void> => {
+  const send = async (
+    mode: 'next' | 'interrupt' = 'next',
+    attachments?: Array<{ id: string; name: string; type: string; size: number; url: string }>,
+  ): Promise<void> => {
     const value = input.trim();
     const command = resolveComposerCommand(value);
     if (command) {
@@ -1072,7 +1103,7 @@ function App(): React.JSX.Element {
         );
       const run = await request<{ id: string }>('/api/runs', {
         method: 'POST',
-        body: JSON.stringify({ threadId, input: value }),
+        body: JSON.stringify({ threadId, input: value, attachments }),
       });
       runAccepted = true;
       const stillSelected = selectionIdentityMatches(expectedSelection, {
@@ -1253,20 +1284,27 @@ function App(): React.JSX.Element {
 
   const createSchedule = async (): Promise<void> => {
     if (!scheduleName.trim() || !scheduleInput.trim()) return;
+    const type = scheduleType;
+    const expression = type === 'manual' ? '' : scheduleExpression;
     try {
       await request('/api/schedules', {
         method: 'POST',
         body: JSON.stringify({
           name: scheduleName.trim(),
-          type: 'manual',
-          expression: '',
+          type,
+          expression,
           agentInput: scheduleInput.trim(),
         }),
       });
       setScheduleName('');
       setScheduleInput('');
+      setScheduleExpression('');
+      setScheduleType('manual');
       await loadSystem();
-      setNotice('Automation created');
+      setToasts((t) => [
+        ...t,
+        { id: `toast-${Date.now()}`, variant: 'success', message: 'Automation created' },
+      ]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -1293,14 +1331,34 @@ function App(): React.JSX.Element {
     try {
       await request(`/api/memory/${encodeURIComponent(id)}`, { method: 'DELETE' });
       setMemories((current) => current.filter((m) => m.id !== id));
-      setNotice('Memory deleted');
+      setToasts((t) => [
+        ...t,
+        { id: `toast-${Date.now()}`, variant: 'info', message: 'Memory deleted' },
+      ]);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const updateMemory = async (id: string, content: string): Promise<void> => {
+    try {
+      await request(`/api/memory/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ content }),
+      });
+      setMemories((current) => current.map((m) => (m.id === id ? { ...m, content } : m)));
+      setNotice('Memory updated');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   };
 
   const [sessionRailCollapsed, setSessionRailCollapsed] = useState(false);
-  const [sessionContextMenu, setSessionContextMenu] = useState<{ x: number; y: number; sessionId: string } | null>(null);
+  const [sessionContextMenu, setSessionContextMenu] = useState<{
+    x: number;
+    y: number;
+    sessionId: string;
+  } | null>(null);
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingSessionTitle, setEditingSessionTitle] = useState('');
 
@@ -1320,7 +1378,28 @@ function App(): React.JSX.Element {
 
   const deleteSession = async (id: string): Promise<void> => {
     try {
-      await request(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const response = await fetch(appPath(`/api/sessions/${encodeURIComponent(id)}`), {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+      });
+      if (response.status === 404) {
+        setSessions((current) => {
+          const next = current.filter((s) => s.id !== id);
+          if (selectedSessionId === id && next.length > 0) {
+            void chooseSession(next[0].id);
+          }
+          return next;
+        });
+        setSessionContextMenu(null);
+        setToasts((t) => [
+          ...t,
+          { id: `toast-${Date.now()}`, variant: 'info', message: 'Session already deleted' },
+        ]);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(`Delete failed: ${response.status}`);
+      }
       setSessions((current) => {
         const next = current.filter((s) => s.id !== id);
         if (selectedSessionId === id && next.length > 0) {
@@ -1329,10 +1408,22 @@ function App(): React.JSX.Element {
         return next;
       });
       setSessionContextMenu(null);
-      setNotice('Session deleted');
+      setToasts((t) => [
+        ...t,
+        { id: `toast-${Date.now()}`, variant: 'success', message: 'Session deleted' },
+      ]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
+  };
+
+  const deleteSelectedSessions = async (): Promise<void> => {
+    const ids = Array.from(selectedSessionIds);
+    if (ids.length === 0) return;
+    for (const id of ids) {
+      await deleteSession(id);
+    }
+    setSelectedSessionIds(new Set());
   };
 
   const scheduleAction = async (
@@ -1551,6 +1642,17 @@ function App(): React.JSX.Element {
               >
                 ☰
               </button>
+              <button
+                type="button"
+                className="collapsed-rail-btn"
+                onClick={() => {
+                  setSessionRailCollapsed(false);
+                  setSessionSearch('');
+                }}
+                title="Search sessions"
+              >
+                ⌕
+              </button>
               {sessions.slice(0, 8).map((session) => (
                 <button
                   type="button"
@@ -1558,6 +1660,7 @@ function App(): React.JSX.Element {
                   className={`collapsed-session-btn ${selectedSessionId === session.id ? 'selected' : ''}`}
                   onClick={() => {
                     void chooseSession(session.id);
+                    setSessionRailCollapsed(false);
                   }}
                   title={session.title}
                 >
@@ -1606,7 +1709,11 @@ function App(): React.JSX.Element {
                             key={session.id}
                             onContextMenu={(e) => {
                               e.preventDefault();
-                              setSessionContextMenu({ x: e.clientX, y: e.clientY, sessionId: session.id });
+                              setSessionContextMenu({
+                                x: e.clientX,
+                                y: e.clientY,
+                                sessionId: session.id,
+                              });
                             }}
                           >
                             {isEditing ? (
@@ -1614,12 +1721,12 @@ function App(): React.JSX.Element {
                                 className="session-edit-form"
                                 onSubmit={(e) => {
                                   e.preventDefault();
-                                  if (editingSessionTitle.trim()) renameSession(session.id, editingSessionTitle.trim());
+                                  if (editingSessionTitle.trim())
+                                    renameSession(session.id, editingSessionTitle.trim());
                                   else setEditingSessionId(null);
                                 }}
                               >
                                 <input
-                                  autoFocus
                                   value={editingSessionTitle}
                                   onChange={(e) => setEditingSessionTitle(e.target.value)}
                                   onKeyDown={(e) => {
@@ -1632,7 +1739,19 @@ function App(): React.JSX.Element {
                                 type="button"
                                 className="session-row"
                                 aria-current={selectedSessionId === session.id ? 'page' : undefined}
-                                onClick={() => void chooseSession(session.id)}
+                                onClick={(e) => {
+                                  if (e.shiftKey || e.metaKey || e.ctrlKey) {
+                                    e.preventDefault();
+                                    setSelectedSessionIds((prev) => {
+                                      const next = new Set(prev);
+                                      if (next.has(session.id)) next.delete(session.id);
+                                      else next.add(session.id);
+                                      return next;
+                                    });
+                                  } else {
+                                    void chooseSession(session.id);
+                                  }
+                                }}
                                 onDoubleClick={() => {
                                   setEditingSessionId(session.id);
                                   setEditingSessionTitle(session.title);
@@ -1641,7 +1760,9 @@ function App(): React.JSX.Element {
                                 <span className="session-glyph" aria-hidden="true" />
                                 <span>
                                   <strong>{session.title}</strong>
-                                  <small>{selectedSessionId === session.id ? 'Current' : 'Saved'}</small>
+                                  <small>
+                                    {selectedSessionId === session.id ? 'Current' : 'Saved'}
+                                  </small>
                                 </span>
                               </button>
                             )}
@@ -1664,7 +1785,7 @@ function App(): React.JSX.Element {
                                 title="Delete"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  if (confirm(`Delete "${session.title}"?`)) deleteSession(session.id);
+                                  deleteSession(session.id);
                                 }}
                               >
                                 ×
@@ -1728,8 +1849,7 @@ function App(): React.JSX.Element {
               role="menuitem"
               className="danger"
               onClick={() => {
-                const session = sessions.find((s) => s.id === sessionContextMenu.sessionId);
-                if (session && confirm(`Delete "${session.title}"?`)) deleteSession(session.id);
+                deleteSession(sessionContextMenu.sessionId);
                 setSessionContextMenu(null);
               }}
             >
@@ -1868,7 +1988,13 @@ function App(): React.JSX.Element {
                       {transcript.map((message) => (
                         <article className={`message message-${message.role}`} key={message.id}>
                           <div className="message-meta">
-                            <span>{message.role === 'user' ? 'You' : 'NUAAI'}</span>
+                            <span>
+                              {message.role === 'user'
+                                ? 'You'
+                                : message.provider
+                                  ? `${message.provider.name} · ${message.provider.model}`
+                                  : 'NUAAI'}
+                            </span>
                             <time>{relativeTime(message.createdAt)}</time>
                           </div>
                           <MarkdownContent markdown={message.markdown} />
@@ -1886,7 +2012,11 @@ function App(): React.JSX.Element {
                       {liveMessage && (
                         <article className="message message-assistant message-live">
                           <div className="message-meta">
-                            <span>NUAAI</span>
+                            <span>
+                              {liveMessage.provider
+                                ? `${liveMessage.provider.name} · ${liveMessage.provider.model}`
+                                : 'NUAAI'}
+                            </span>
                             <span>{runLabel(runProjection?.status)}</span>
                           </div>
                           <div className="message-live-body">
@@ -1927,10 +2057,17 @@ function App(): React.JSX.Element {
                   textareaRef={composerRef}
                   onInput={setInput}
                   onExpanded={setComposerExpanded}
-                  onSubmit={(mode) => void send(mode)}
+                  onSubmit={(mode, attachments) => void send(mode, attachments)}
                   onStop={() => void cancel()}
                   onSwitchProvider={(provider, model) => void switchProvider(provider, model)}
                   onCommand={(command) => void executeComposerCommand(command)}
+                />
+                <BottomPanel
+                  isOpen={bottomPanelOpen}
+                  onToggle={() => setBottomPanelOpen((prev) => !prev)}
+                  activeRunId={activeRunId}
+                  runProjection={runProjection ?? null}
+                  liveOutput={liveMessage?.markdown ?? null}
                 />
               </div>
             </section>
@@ -1940,8 +2077,10 @@ function App(): React.JSX.Element {
             <MemoryView
               memories={memories}
               onDelete={deleteMemory}
+              onUpdate={updateMemory}
               saveMemory={saveMemory}
               saveStatus={saveStatus}
+              isLoading={isLoadingMemories}
             />
           )}
 
@@ -1950,8 +2089,12 @@ function App(): React.JSX.Element {
               schedules={schedules}
               scheduleName={scheduleName}
               scheduleInput={scheduleInput}
+              scheduleType={scheduleType}
+              scheduleExpression={scheduleExpression}
               onScheduleName={setScheduleName}
               onScheduleInput={setScheduleInput}
+              onScheduleType={setScheduleType}
+              onScheduleExpression={setScheduleExpression}
               onCreate={() => void createSchedule()}
               onAction={(id, action) => void scheduleAction(id, action)}
               onDelete={deleteSchedule}
@@ -2006,6 +2149,39 @@ function App(): React.JSX.Element {
           onClose={() => setCommandPaletteOpen(false)}
         />
       )}
+
+      {shortcutsOverlayOpen && (
+        <KeyboardShortcutsOverlay onClose={() => setShortcutsOverlayOpen(false)} />
+      )}
+
+      {selectedSessionIds.size > 0 && (
+        <div
+          className="floating-action-bar"
+          style={{ bottom: 24, left: '50%', transform: 'translateX(-50%)' }}
+        >
+          <span className="fab-count">{selectedSessionIds.size} selected</span>
+          <button
+            type="button"
+            className="fab-delete-btn"
+            onClick={() => void deleteSelectedSessions()}
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            className="fab-cancel-btn"
+            onClick={() => setSelectedSessionIds(new Set())}
+            aria-label="Cancel selection"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      <ToastContainer
+        toasts={toasts}
+        onDismiss={(id) => setToasts((t) => t.filter((toast) => toast.id !== id))}
+      />
     </div>
   );
 }

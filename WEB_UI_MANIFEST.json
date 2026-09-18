@@ -1,0 +1,262 @@
+{
+  "name": "NUAAI Web UI MVP Implementation Manifest",
+  "version": "1.0.0",
+  "description": "Implementation plan for all 10 NUAAI Web UI areas",
+  "lastUpdated": "2026-09-18",
+  "decisions": {
+    "syntaxHighlighting": "shiki",
+    "fileStorage": ".nuaai/artifacts/",
+    "lightMode": "implementFully",
+    "toastPosition": "bottomCenter",
+    "tasksLocation": "integratedInAutomations"
+  },
+  "areas": {
+    "1-conversation-view": {
+      "name": "Conversation View - Message Rendering, Tool Results, Streaming, Code Blocks",
+      "status": "pending",
+      "gaps": [
+        "Syntax highlighting for code blocks",
+        "Provider/model attribution in messages",
+        "Tool result JSON expansion modal",
+        "Image rendering in markdown",
+        "Streaming code progressive reveal",
+        "Live cursor animation fix"
+      ],
+      "files": {
+        "new": ["src/web/components/ToolResultModal.tsx"],
+        "modify": [
+          "src/web/components/MarkdownContent.tsx",
+          "src/web/main.tsx",
+          "src/web/components/RunStatusSummary.tsx",
+          "src/web/styles.css"
+        ]
+      }
+    },
+    "2-composer": {
+      "name": "Composer - Input Area, Attachments, Submit Behavior",
+      "status": "pending",
+      "gaps": [
+        "CRITICAL: File attachments collected but never sent to API",
+        "Drag-and-drop zone",
+        "File validation (type/size)",
+        "Upload progress indicator",
+        "Paste image support"
+      ],
+      "files": {
+        "new": [],
+        "modify": [
+          "src/server.ts",
+          "src/web/main.tsx",
+          "src/web/components/AgentComposer.tsx",
+          "src/web/styles.css"
+        ]
+      }
+    },
+    "3-provider-switcher": {
+      "name": "Provider/Model Switcher UI",
+      "status": "pending",
+      "gaps": [
+        "Health badges in composer toolbar",
+        "Provider health refresh",
+        "Model capability tooltips"
+      ],
+      "files": {
+        "new": ["src/web/components/ProviderSwitcher.tsx"],
+        "modify": [
+          "src/web/main.tsx",
+          "src/web/components/AgentComposer.tsx",
+          "src/web/views.tsx",
+          "src/web/styles.css"
+        ]
+      }
+    },
+    "4-settings": {
+      "name": "Settings/Preferences",
+      "status": "pending",
+      "gaps": [
+        "No settings view exists",
+        "No theme toggle (dark mode only)",
+        "No keyboard shortcut customization"
+      ],
+      "files": {
+        "new": [],
+        "modify": [
+          "src/web/views.tsx",
+          "src/web/main.tsx",
+          "src/web/styles.css",
+          "src/web/contracts.ts",
+          "src/web/format.ts"
+        ]
+      }
+    },
+    "5-empty-states": {
+      "name": "Empty States",
+      "status": "pending",
+      "gaps": [
+        "Skills empty state uses plain text instead of component",
+        "Plugins empty state uses plain text instead of component",
+        "No threads state"
+      ],
+      "files": {
+        "new": [],
+        "modify": ["src/web/views.tsx", "src/web/main.tsx"]
+      }
+    },
+    "6-loading-skeletons": {
+      "name": "Loading Skeletons",
+      "status": "pending",
+      "gaps": [
+        "CRITICAL: Memory skeleton isLoading prop never passed",
+        "No session/thread list skeleton",
+        "No conversation messages skeleton",
+        "No prefers-reduced-motion support"
+      ],
+      "files": {
+        "new": ["src/web/components/SessionRailSkeleton.tsx"],
+        "modify": ["src/web/main.tsx", "src/web/views.tsx", "src/web/styles.css"]
+      }
+    },
+    "7-toast-system": {
+      "name": "Toast/Notice System",
+      "status": "pending",
+      "gaps": [
+        "No real toast component (notices just text in header)",
+        "No toast stacking",
+        "No toast animation/transition",
+        "No toast variants (success, warning, info)"
+      ],
+      "files": {
+        "new": ["src/web/components/ToastContainer.tsx", "src/web/components/Toast.tsx"],
+        "modify": ["src/web/main.tsx", "src/web/styles.css"]
+      }
+    },
+    "8-memory-management": {
+      "name": "Memory Management UI",
+      "status": "pending",
+      "gaps": ["No memory search", "No memory filtering", "No memory sorting", "No bulk delete"],
+      "files": {
+        "new": [],
+        "modify": ["src/web/views.tsx", "src/web/styles.css"]
+      }
+    },
+    "9-skills-ui": {
+      "name": "Skills UI",
+      "status": "pending",
+      "gaps": [
+        "No dedicated SkillsView/tab",
+        "Trigger words not displayed",
+        "No skill detail expansion",
+        "No manual skill trigger/test"
+      ],
+      "files": {
+        "new": [],
+        "modify": [
+          "src/web/views.tsx",
+          "src/web/main.tsx",
+          "src/web/contracts.ts",
+          "src/web/format.ts",
+          "src/web/styles.css"
+        ]
+      }
+    },
+    "10-schedules-tasks": {
+      "name": "Schedules/Tasks UI",
+      "status": "pending",
+      "gaps": [
+        "Schedule type selector missing (hardcoded to manual)",
+        "No cron expression editor",
+        "No interval editor",
+        "Tasks state fetched but never rendered"
+      ],
+      "files": {
+        "new": [],
+        "modify": [
+          "src/web/views.tsx",
+          "src/web/main.tsx",
+          "src/web/contracts.ts",
+          "src/web/format.ts",
+          "src/web/styles.css"
+        ]
+      }
+    }
+  },
+  "implementationOrder": [
+    "6-loading-skeletons",
+    "2-composer",
+    "7-toast-system",
+    "1-conversation-view",
+    "5-empty-states",
+    "8-memory-management",
+    "4-settings",
+    "3-provider-switcher",
+    "9-skills-ui",
+    "10-schedules-tasks"
+  ],
+  "testingChecklist": {
+    "conversationView": [
+      "Code blocks render with Shiki syntax highlighting",
+      "Provider name shows on assistant messages",
+      "Tool result click opens expansion modal",
+      "Live cursor animates during streaming",
+      "Images render in markdown"
+    ],
+    "composer": [
+      "File attached and uploaded to server",
+      "Drag-drop files onto composer works",
+      "Invalid file type shows error",
+      "Oversized file shows error",
+      "Upload progress shows during send",
+      "Paste image into composer works"
+    ],
+    "providerSwitcher": [
+      "Provider dropdown shows health dots",
+      "Switching provider updates active provider",
+      "Health dot in composer reflects status",
+      "Tooltip shows on hover"
+    ],
+    "settings": [
+      "Settings tab appears in navigation",
+      "Theme toggle switches dark/light",
+      "Light theme applies correct colors",
+      "Keyboard shortcuts displayed"
+    ],
+    "emptyStates": [
+      "Skills section shows proper empty state",
+      "Plugins section shows proper empty state",
+      "No-threads state displays correctly"
+    ],
+    "loadingSkeletons": [
+      "Memory skeleton appears when loading",
+      "Session rail shows skeletons during navigation",
+      "Skeletons respect reduced-motion"
+    ],
+    "toastSystem": [
+      "Toasts appear in bottom center",
+      "Multiple toasts stack properly",
+      "Toasts animate in/out",
+      "Success toasts show green styling",
+      "Auto-dismiss works",
+      "Manual dismiss via × works"
+    ],
+    "memoryManagement": [
+      "Search filters memories in real-time",
+      "Filter chips show correct subset",
+      "Sort changes memory order"
+    ],
+    "skillsUI": [
+      "Skills tab appears in navigation",
+      "Skills list displays all loaded skills",
+      "Trigger words show as tags",
+      "Click expands skill detail",
+      "Enable/disable works"
+    ],
+    "schedulesTasks": [
+      "Can create interval schedule",
+      "Can create cron schedule",
+      "Tasks integrated in Automations tab",
+      "Task status displays correctly",
+      "Cancel task works",
+      "Retry task works"
+    ]
+  }
+}

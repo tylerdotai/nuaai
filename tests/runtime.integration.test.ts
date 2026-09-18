@@ -628,6 +628,10 @@ describe('SQLite persistence and vector memory', () => {
       token: '[REDACTED]',
     });
 
+    expect(store.updateMemory('memory-b', 'updated content', null)).toBe(true);
+    expect(store.updateMemory('memory-b', 'updated with vector', vector)).toBe(true);
+    expect(store.updateMemory('nonexistent', 'does not exist', null)).toBe(false);
+
     store.putSecret('API_TOKEN', 'v1.encrypted', 106);
     expect(store.hasSecret('API_TOKEN')).toBe(true);
     expect(store.getSecretCiphertext('API_TOKEN')).toBe('v1.encrypted');

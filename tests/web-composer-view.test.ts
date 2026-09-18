@@ -43,7 +43,7 @@ describe('AgentComposer', () => {
     expect(markup).toContain('aria-label="Send next"');
   });
 
-  it('shows real model, capability, and separate context controls without a fake attachment', () => {
+  it('shows real model, capability, and separate context controls with attachment support', () => {
     const markup = render('', null);
 
     expect(markup).toContain('gpt-test');
@@ -52,7 +52,7 @@ describe('AgentComposer', () => {
     expect(markup).toContain('Run approved commands');
     expect(markup).toContain('Thread history');
     expect(markup).toContain('Automatic memory');
-    expect(markup).not.toContain('Attach');
+    expect(markup).toContain('Attach');
   });
 
   it('keeps the authoritative active model selectable when health omits a model catalog', () => {
