@@ -68,6 +68,7 @@ function activityForRun(run: RunRow, events: Array<EventRecord & { id: number }>
     if (event.type === 'tool.started') {
       const id = boundedText(event.payload.id ?? `event-${event.id}-${fallbackId++}`, 160);
       const previous = tools.get(id);
+      const argumentsValue = event.payload.arguments;
       tools.set(id, {
         id,
         name: boundedText(event.payload.name ?? previous?.name ?? 'Action', 160),
@@ -77,6 +78,11 @@ function activityForRun(run: RunRow, events: Array<EventRecord & { id: number }>
         ...(previous?.completedAt ? { completedAt: previous.completedAt } : {}),
         ...(previous?.durationMs !== undefined ? { durationMs: previous.durationMs } : {}),
         ...(previous?.detail ? { detail: previous.detail } : {}),
+        ...(argumentsValue && typeof argumentsValue === 'object' && !Array.isArray(argumentsValue)
+          ? { arguments: argumentsValue as Record<string, unknown> }
+          : previous?.arguments
+            ? { arguments: previous.arguments }
+            : {}),
       });
       continue;
     }
@@ -102,6 +108,7 @@ function activityForRun(run: RunRow, events: Array<EventRecord & { id: number }>
         startedAt: itemStartedAt,
         completedAt: event.createdAt,
         durationMs: Math.max(0, event.createdAt - itemStartedAt),
+        ...(previous?.arguments ? { arguments: previous.arguments } : {}),
       });
       continue;
     }

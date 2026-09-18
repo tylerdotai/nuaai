@@ -907,6 +907,7 @@ function App(): React.JSX.Element {
             name: tool.name,
             status: tool.status,
             startedAt: tool.createdAt,
+            ...(tool.arguments ? { arguments: tool.arguments } : {}),
           })),
         },
       ],

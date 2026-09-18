@@ -45,6 +45,7 @@ export interface WebToolActivity {
   name: string;
   status: 'running' | 'completed' | 'failed';
   createdAt: number;
+  arguments?: Record<string, unknown>;
 }
 
 export interface WebRunProjection {
@@ -53,6 +54,7 @@ export interface WebRunProjection {
   liveOutput: string;
   tools: WebToolActivity[];
   error?: string;
+  startedAt?: number;
 }
 
 export interface WebRunSnapshotRecord {
@@ -347,14 +349,18 @@ export function projectRunEvents(
   let status: WebRunStatus = 'queued';
   let liveOutput = '';
   let error: string | undefined;
+  let startedAt: number | undefined;
   const tools = new Map<string, WebToolActivity>();
   for (const event of events) {
     if (event.runId !== selectedRunId) continue;
     if (event.type === 'run.created' || event.type === 'run.queued') status = 'queued';
-    else if (event.type === 'run.started') status = 'running';
-    else if (event.type === 'model.started') {
+    else if (event.type === 'run.started') {
+      status = 'running';
+      startedAt = startedAt ?? event.createdAt;
+    } else if (event.type === 'model.started') {
       status = 'running';
       liveOutput = '';
+      startedAt = startedAt ?? event.createdAt;
     } else if (event.type === 'model.delta') {
       status = 'running';
       liveOutput += String(event.payload.text ?? '');
@@ -369,6 +375,9 @@ export function projectRunEvents(
         name: String(event.payload.name ?? 'Action'),
         status: 'running',
         createdAt: event.createdAt,
+        ...(event.payload.arguments && typeof event.payload.arguments === 'object'
+          ? { arguments: event.payload.arguments as Record<string, unknown> }
+          : {}),
       });
     } else if (event.type === 'tool.completed' || event.type === 'tool.failed') {
       status = 'running';
@@ -384,6 +393,7 @@ export function projectRunEvents(
         status:
           event.type === 'tool.failed' || event.payload.isError === true ? 'failed' : 'completed',
         createdAt: event.createdAt,
+        ...(previous?.arguments ? { arguments: previous.arguments } : {}),
       });
     }
 
@@ -413,5 +423,6 @@ export function projectRunEvents(
     liveOutput,
     tools: [...tools.values()],
     ...(error ? { error } : {}),
+    ...(startedAt ? { startedAt } : {}),
   };
 }

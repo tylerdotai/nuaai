@@ -29,6 +29,7 @@ export interface ActivityItem {
   startedAt: number;
   completedAt?: number;
   durationMs?: number;
+  arguments?: Record<string, unknown>;
 }
 
 export interface ActivityGroup {

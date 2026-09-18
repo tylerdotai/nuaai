@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import type { ActivityGroup, ActivityItem, MessageView } from '../contracts.js';
 
@@ -35,6 +35,15 @@ function statusLabel(status: ActivityItem['status']): string {
 }
 
 export function ToolTimeline({ group }: { group: ActivityGroup }): React.JSX.Element {
+  const [expandedArgs, setExpandedArgs] = useState<Set<string>>(new Set());
+  const toggleArgs = (id: string): void => {
+    setExpandedArgs((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
   return (
     <ol className="tool-timeline" aria-label="Run actions">
       {group.items.map((item) => (
@@ -46,6 +55,19 @@ export function ToolTimeline({ group }: { group: ActivityGroup }): React.JSX.Ele
               <span>{statusLabel(item.status)}</span>
             </div>
             {item.target && <code>{item.target}</code>}
+            {item.arguments && Object.keys(item.arguments).length > 0 && (
+              <button
+                type="button"
+                className="tool-args-toggle"
+                aria-expanded={expandedArgs.has(item.id)}
+                onClick={() => toggleArgs(item.id)}
+              >
+                {expandedArgs.has(item.id) ? 'Hide args' : 'Show args'}
+              </button>
+            )}
+            {item.arguments && expandedArgs.has(item.id) && (
+              <pre className="tool-arguments">{JSON.stringify(item.arguments, null, 2)}</pre>
+            )}
             {item.detail && <p>{item.detail}</p>}
           </div>
           {item.durationMs !== undefined && (
@@ -74,11 +96,24 @@ export function RunStatusSummary({
 }): React.JSX.Element | null {
   const group = message.activities[0];
   const [expanded, setExpanded] = useState(defaultExpanded);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  useEffect(() => {
+    if (message.status !== 'streaming' || !group?.startedAt) {
+      setElapsedMs(0);
+      return;
+    }
+    setElapsedMs(Date.now() - group.startedAt);
+    const interval = setInterval(() => {
+      setElapsedMs(Date.now() - group.startedAt);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [message.status, group?.startedAt]);
   if (message.status === 'completed' && (!group || group.items.length === 0)) return null;
   const activitySummary = group ? formatActivitySummary(group) : 'Preparing response';
+  const elapsedDisplay = elapsedMs > 0 ? ` · ${formatDuration(elapsedMs)}` : '';
   const summary =
     message.status === 'streaming'
-      ? `Working · ${activitySummary}`
+      ? `Working${elapsedDisplay} · ${activitySummary}`
       : message.status === 'failed'
         ? `Failed · ${activitySummary}`
         : message.status === 'cancelled'

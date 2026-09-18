@@ -1567,6 +1567,7 @@ export class AgentRuntime {
                   id: callId,
                   name: qualifiedName,
                   providerOwned: true,
+                  arguments: input,
                   attestation: { version: 1, payloadHash, status: 'running' },
                 },
                 {
