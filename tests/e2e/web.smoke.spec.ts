@@ -197,7 +197,6 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await expect(writeResponse).toContainText('NUAAI deterministic test response', {
     timeout: 30_000,
   });
-  await writeResponse.getByRole('button', { name: 'Inspect run activity' }).click();
   await expect(writeResponse).toContainText('workspace.write');
   await expect(writeResponse.getByRole('region', { name: 'Run artifacts' })).toContainText(
     'work-sample-output.txt',
@@ -369,9 +368,6 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await expect(page.locator('[data-status="failed"]')).toContainText(
     'Deterministic browser failure',
   );
-  const inspectButtons = page.getByRole('button', { name: 'Inspect run activity' });
-  await expect(inspectButtons).toHaveCount(2);
-  await inspectButtons.first().click();
   await expect(page.getByText('workspace.list', { exact: true })).toBeVisible();
 
   await page
