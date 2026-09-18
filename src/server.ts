@@ -358,6 +358,16 @@ export function createApp(services: GatewayServices): Hono {
     return `${lines.join('\n')}\n\n`;
   }
 
+  function mapEventType(type: string): string {
+    if (type === 'model.delta') return 'token';
+    if (type === 'tool.started') return 'tool_start';
+    if (type === 'tool.completed' || type === 'tool.failed') return 'tool_end';
+    if (type === 'model.completed') return 'done';
+    if (type === 'run.started' || type === 'run.completed') return 'status';
+    if (type === 'run.failed') return 'error';
+    return type;
+  }
+
   function getAuthToken(request: Request): string | null {
     const url = new URL(request.url);
     const token = url.searchParams.get('token');
@@ -389,6 +399,12 @@ export function createApp(services: GatewayServices): Hono {
     }
 
     const sessionId = context.req.query('session_id') || null;
+    const dropTypes = new Set(
+      (context.req.query('drop') ?? '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0),
+    );
     const lastEventId = context.req.raw.headers.get('Last-Event-ID');
     const startEventId = lastEventId ? Math.max(0, Number.parseInt(lastEventId, 10) + 1) : 0;
 
@@ -431,43 +447,39 @@ export function createApp(services: GatewayServices): Hono {
           if (closed) return;
           if (sessionId && event.sessionId && event.sessionId !== sessionId) return;
           if (event.sessionId === undefined && sessionId !== null) return;
+          if (dropTypes.size > 0) {
+            const mapped = mapEventType(event.type);
+            if (dropTypes.has(event.type) || (mapped && dropTypes.has(mapped))) return;
+          }
 
           const id = ++eventIdCounter;
-          let eventType: string = event.type;
+          const eventType: string = mapEventType(event.type);
           let eventData: Record<string, unknown> = { ...event.payload };
 
           if (event.type === 'model.delta') {
-            eventType = 'token';
             eventData = { content: event.payload.text ?? '' };
           } else if (event.type === 'tool.started') {
-            eventType = 'tool_start';
             eventData = {
               name: event.payload.name,
               args: event.payload.arguments ?? {},
             };
           } else if (event.type === 'tool.completed') {
-            eventType = 'tool_end';
             eventData = {
               name: event.payload.name,
               result: event.payload.result,
             };
           } else if (event.type === 'tool.failed') {
-            eventType = 'tool_end';
             eventData = {
               name: event.payload.name,
               error: event.payload.error ?? 'Tool failed',
             };
           } else if (event.type === 'model.completed') {
-            eventType = 'done';
             eventData = { full_response: event.payload.text ?? '' };
           } else if (event.type === 'run.started') {
-            eventType = 'status';
             eventData = { label: 'Thinking...' };
           } else if (event.type === 'run.completed') {
-            eventType = 'status';
             eventData = { label: 'Completed' };
           } else if (event.type === 'run.failed') {
-            eventType = 'error';
             eventData = { message: String(event.payload.error ?? 'Run failed') };
           }
 

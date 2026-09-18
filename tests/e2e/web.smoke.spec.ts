@@ -460,23 +460,13 @@ test('HTTP polling surfaces paused approvals when SSE approval events are lost',
   const e2eRoot = process.env.NUAAI_E2E_ROOT;
   if (!e2eRoot) throw new Error('NUAAI_E2E_ROOT is required');
   await page.route(/\/api\/agent\/stream/, async (route) => {
-    const response = await route.fetch();
-    if (!response.ok) {
-      await route.fulfill({ response });
+    const url = new URL(route.request().url());
+    if (!url.searchParams.has('drop')) {
+      url.searchParams.set('drop', 'approval.requested');
+      await route.continue({ url: url.toString() });
       return;
     }
-    const body = await response.body();
-    const filtered = body
-      .toString('utf8')
-      .split('\n\n')
-      .filter((chunk) => {
-        if (chunk.includes('approval.requested')) return false;
-        return true;
-      });
-    await route.fulfill({
-      response,
-      body: filtered.join('\n\n'),
-    });
+    await route.continue();
   });
   await page.goto(`/#token=${encodeURIComponent(createBrowserPairingToken(e2eRoot))}`);
   await expect(page.locator('.connection')).toContainText('Connected', { timeout: 30_000 });

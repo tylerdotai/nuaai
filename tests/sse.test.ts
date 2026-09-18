@@ -246,4 +246,41 @@ describe('SSE agent stream', () => {
     expect(secondData).toContain('second');
     expect(secondData).not.toContain('"first"');
   });
+
+  it('drops runtime event types listed in the drop query parameter', async () => {
+    let publish: ((event: Record<string, unknown>) => void) | undefined;
+    const gateway = services();
+    gateway.runtime.subscribe = ((listener: (event: Record<string, unknown>) => void) => {
+      publish = listener;
+      return () => undefined;
+    }) as never;
+    const app = createApp(gateway);
+    const response = await app.fetch(
+      new Request(
+        `http://localhost/api/agent/stream?token=${token}&drop=approval.requested,model.delta`,
+      ),
+    );
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+
+    setImmediate(() => {
+      publish?.({ id: 1, type: 'approval.requested', payload: { target: 'secret' } });
+      publish?.({ id: 2, type: 'model.delta', payload: { text: 'partial' } });
+      publish?.({ id: 3, type: 'message.created', payload: { text: 'allowed' } });
+    });
+
+    let data = '';
+    const start = Date.now();
+    while (reader && Date.now() - start < 1_000) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      data += decoder.decode(value);
+      if (data.includes('allowed')) break;
+    }
+    await reader?.cancel();
+
+    expect(data).toContain('allowed');
+    expect(data).not.toContain('secret');
+    expect(data).not.toContain('partial');
+  });
 });
