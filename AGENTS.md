@@ -23,14 +23,20 @@ NUAAI is a persistent local-first agent harness. The daemon owns sessions, threa
 
 ## Testing instructions
 
+Read `TESTING.md` for the testing strategy. The summary:
+
 - Fast quality gate: `npm run check`
-- Full unit and integration suite: `npm test`
-- Coverage: `npm run test:coverage`
-- End-to-end checks: `npm run test:e2e`
+- Unit tier: `npm run test:unit` — no I/O, deterministic, runs on every commit
+- Integration tier: `npm run test:integration` — real SQLite, real HTTP, runs on every PR
+- End-to-end tier: `npm run test:e2e` — Playwright against a real daemon, runs on every PR and merge to main
+- Coverage with the 80% per-file floor on critical paths: `npm run test:coverage`
+- Mutation testing on critical paths: `npm run test:mutate`
 - Complete local gate: `npm run gate`
 - Focus a test: `npx vitest run -t "<test name>"`
 - Run the relevant focused tests after each source change, then rerun the complete gate after the final cross-cutting edit.
 - Add or update behavioral tests for every changed contract. Do not weaken coverage thresholds or replace real boundary tests with snapshots.
+- Never `it.skip`, `xit`, or comment out assertions. Fix or delete flaky tests.
+- For new `src/` files, ship a unit test in the same commit. For critical-path files, the unit test must push the file's mutation score above 60%.
 
 ## Code style
 
