@@ -61,7 +61,7 @@ jobs:
         run: npm run test:unit
 
       - name: Run coverage gate
-        run: npm run test:coverage
+        run: npx vitest run --config vitest.unit.config.ts --coverage
 
   integration:
     name: Integration tests
