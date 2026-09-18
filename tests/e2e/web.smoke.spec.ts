@@ -453,19 +453,29 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   expect(browserErrors).toEqual([]);
 });
 
-test('HTTP polling surfaces paused approvals when WebSocket approval events are lost', async ({
+test('HTTP polling surfaces paused approvals when SSE approval events are lost', async ({
   page,
 }) => {
   test.setTimeout(60_000);
   const e2eRoot = process.env.NUAAI_E2E_ROOT;
   if (!e2eRoot) throw new Error('NUAAI_E2E_ROOT is required');
-  await page.routeWebSocket(/\/ws(?:\?|$)/, (socket) => {
-    const server = socket.connectToServer();
-    socket.onMessage((message) => server.send(message));
-    server.onMessage((message) => {
-      const text = String(message);
-      if (text.includes('approvals.invalidated') || text.includes('approval.requested')) return;
-      socket.send(message);
+  await page.route(/\/api\/agent\/stream/, async (route) => {
+    const response = await route.fetch();
+    if (!response.ok) {
+      await route.fulfill({ response });
+      return;
+    }
+    const body = await response.body();
+    const filtered = body
+      .toString('utf8')
+      .split('\n\n')
+      .filter((chunk) => {
+        if (chunk.includes('approval.requested')) return false;
+        return true;
+      });
+    await route.fulfill({
+      response,
+      body: filtered.join('\n\n'),
     });
   });
   await page.goto(`/#token=${encodeURIComponent(createBrowserPairingToken(e2eRoot))}`);

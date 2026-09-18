@@ -5,7 +5,6 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Hono } from 'hono';
-import { type WebSocket, WebSocketServer } from 'ws';
 
 import { RunArtifactRegistry } from './artifacts/registry.js';
 import { harnessConfig } from './config/index.js';
@@ -70,7 +69,6 @@ function log(level: 'info' | 'warn' | 'error', ...args: unknown[]): void {
     console.log(prefix, ...args);
   }
 }
-const maxWebSocketMessageBytes = 64 * 1024;
 const maxReplayPageSize = 1_000;
 const runSnapshotEventLimit = 250;
 const browserSessionTtlSeconds = 2_592_000;
@@ -180,6 +178,13 @@ export interface GatewayServices {
 function tokenFromRequest(request: Request): string | null {
   const authorization = request.headers.get('authorization');
   if (authorization?.startsWith('Bearer ')) return authorization.slice(7);
+  try {
+    const url = new URL(request.url);
+    const queryToken = url.searchParams.get('token');
+    if (queryToken) return queryToken;
+  } catch {
+    // ignore invalid url
+  }
   const cookie = request.headers
     .get('cookie')
     ?.split(';')
@@ -340,6 +345,181 @@ export function createApp(services: GatewayServices): Hono {
     const schema = services.runtime.getToolSchema(context.req.param('name'));
     return schema ? context.json({ schema }) : context.json({ error: 'Tool not found' }, 404);
   });
+
+  const HEARTBEAT_INTERVAL_MS = 15_000;
+  const MAX_EVENTS_BUFFER = 100;
+  const eventBuffer: Array<{ id: number; data: string }> = [];
+  let eventIdCounter = 0;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+  function sseFormat(eventType: string, data: unknown, id?: number): string {
+    const lines = [`event: ${eventType}`, `data: ${JSON.stringify(data)}`];
+    if (id !== undefined) lines.unshift(`id: ${id}`);
+    return `${lines.join('\n')}\n\n`;
+  }
+
+  function getAuthToken(request: Request): string | null {
+    const url = new URL(request.url);
+    const token = url.searchParams.get('token');
+    if (token) return token;
+    const cookie = request.headers.get('cookie');
+    if (cookie) {
+      const match = cookie.split(';').find((c) => c.trim().startsWith('nuaai_token='));
+      if (match) return match.trim().slice('nuaai_token='.length);
+    }
+    return null;
+  }
+
+  function startHeartbeat(controller: ReadableStreamDefaultController): void {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(() => {
+      try {
+        controller.enqueue(new TextEncoder().encode(': keepalive\n\n'));
+      } catch {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  app.get('/api/agent/stream', async (context) => {
+    const token = getAuthToken(context.req.raw);
+    const checkedAt = (services.now ?? Date.now)();
+    if (!token || !isRequestCredential(validateToken(token, services.authSecret, checkedAt))) {
+      return context.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const sessionId = context.req.query('session_id') || null;
+    const lastEventId = context.req.raw.headers.get('Last-Event-ID');
+    const startEventId = lastEventId ? Math.max(0, Number.parseInt(lastEventId, 10) + 1) : 0;
+
+    let unsubscribe: (() => void) | undefined;
+    let closed = false;
+
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      unsubscribe?.();
+    };
+
+    const stream = new ReadableStream({
+      start(controller) {
+        startHeartbeat(controller);
+
+        context.req.raw.signal.addEventListener('abort', () => {
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
+          cleanup();
+        });
+
+        if (startEventId > 0 && eventBuffer.length > 0) {
+          for (const { id, data } of eventBuffer) {
+            if (id >= startEventId) {
+              try {
+                controller.enqueue(new TextEncoder().encode(data));
+              } catch {
+                break;
+              }
+            }
+          }
+        }
+
+        unsubscribe = services.runtime.subscribe((event) => {
+          if (closed) return;
+          if (sessionId && event.sessionId && event.sessionId !== sessionId) return;
+          if (event.sessionId === undefined && sessionId !== null) return;
+
+          const id = ++eventIdCounter;
+          let eventType: string = event.type;
+          let eventData: Record<string, unknown> = { ...event.payload };
+
+          if (event.type === 'model.delta') {
+            eventType = 'token';
+            eventData = { content: event.payload.text ?? '' };
+          } else if (event.type === 'tool.started') {
+            eventType = 'tool_start';
+            eventData = {
+              name: event.payload.name,
+              args: event.payload.arguments ?? {},
+            };
+          } else if (event.type === 'tool.completed') {
+            eventType = 'tool_end';
+            eventData = {
+              name: event.payload.name,
+              result: event.payload.result,
+            };
+          } else if (event.type === 'tool.failed') {
+            eventType = 'tool_end';
+            eventData = {
+              name: event.payload.name,
+              error: event.payload.error ?? 'Tool failed',
+            };
+          } else if (event.type === 'model.completed') {
+            eventType = 'done';
+            eventData = { full_response: event.payload.text ?? '' };
+          } else if (event.type === 'run.started') {
+            eventType = 'status';
+            eventData = { label: 'Thinking...' };
+          } else if (event.type === 'run.completed') {
+            eventType = 'status';
+            eventData = { label: 'Completed' };
+          } else if (event.type === 'run.failed') {
+            eventType = 'error';
+            eventData = { message: String(event.payload.error ?? 'Run failed') };
+          }
+
+          const sseData = {
+            id,
+            type: eventType,
+            runId: event.runId,
+            taskId: event.taskId,
+            sessionId: event.sessionId,
+            threadId: event.threadId,
+            createdAt: event.createdAt,
+            event: {
+              type: event.type,
+              runId: event.runId,
+              taskId: event.taskId,
+              sessionId: event.sessionId,
+              threadId: event.threadId,
+              createdAt: event.createdAt,
+              payload: event.payload,
+              eventId: event.eventId,
+              source: event.source,
+              correlationId: event.correlationId,
+              schemaVersion: event.schemaVersion,
+            },
+            ...eventData,
+          };
+          const sseLine = sseFormat(eventType, sseData, id);
+          eventBuffer.push({ id, data: sseLine });
+          if (eventBuffer.length > MAX_EVENTS_BUFFER) eventBuffer.shift();
+
+          try {
+            controller.enqueue(new TextEncoder().encode(sseLine));
+          } catch {
+            // Client disconnected
+          }
+        });
+      },
+      cancel() {
+        cleanup();
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+        Connection: 'keep-alive',
+      },
+    });
+  });
+
   app.get('/api/sessions', (context) =>
     context.json({
       sessions: services.runtime.listSessions(context.req.query('includeOrphans') === 'true'),
@@ -974,89 +1154,15 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
     });
   });
   log('info', `NUAAI server listening on http://${services.host}:${services.port}`);
-  const wsServer = new WebSocketServer({
-    server: httpServer,
-    maxPayload: maxWebSocketMessageBytes,
-  });
-  const clients = new Map<WebSocket, string | undefined | null>();
-  const unsubscribe = services.runtime.subscribe((event) => {
-    const payload = JSON.stringify({ type: 'event', event });
-    const approvalInvalidation = event.type.startsWith('approval.')
-      ? JSON.stringify({ type: 'approvals.invalidated' })
-      : undefined;
-    for (const [client, sessionId] of clients) {
-      if (client.readyState !== client.OPEN) continue;
-      if (approvalInvalidation) client.send(approvalInvalidation);
-      if (sessionId === null) continue;
-      if (!sessionId || !event.sessionId || sessionId === event.sessionId) client.send(payload);
-    }
-  });
-  wsServer.on('connection', (socket, request) => {
-    const url = new URL(request.url ?? '/ws', `http://${request.headers.host ?? 'localhost'}`);
-    if (!['/ws', '/nuaai/ws'].includes(url.pathname)) {
-      socket.close(1008, 'Unknown WebSocket route');
-      return;
-    }
-    const token =
-      url.searchParams.get('token') ??
-      request.headers.cookie
-        ?.split(';')
-        .map((part) => part.trim())
-        .find((part) => part.startsWith('nuaai_token='))
-        ?.slice('nuaai_token='.length);
-    const checkedAt = (services.now ?? Date.now)();
-    if (!token || !isRequestCredential(validateToken(token, services.authSecret, checkedAt))) {
-      socket.close(1008, authenticationFailure(token ?? null, services.authSecret, checkedAt).code);
-      return;
-    }
-    clients.set(socket, null);
-    socket.send(JSON.stringify({ type: 'ready', version: getVersion() }));
-    socket.on('message', (raw) => {
-      try {
-        const message = JSON.parse(raw.toString()) as {
-          type?: string;
-          sessionId?: string;
-          after?: number;
-          limit?: number;
-        };
-        if (message.type === 'subscribe') {
-          clients.set(socket, message.sessionId);
-          const after = Number.isFinite(message.after)
-            ? Math.max(0, Math.trunc(message.after ?? 0))
-            : 0;
-          const limit = Number.isFinite(message.limit)
-            ? Math.min(maxReplayPageSize, Math.max(1, Math.trunc(message.limit ?? 250)))
-            : 250;
-          const page = message.sessionId
-            ? services.store.listEventsForSession(message.sessionId, after, limit)
-            : globalEventPage(services.store, after, limit);
-          for (const event of page.events) socket.send(JSON.stringify({ type: 'event', event }));
-          socket.send(
-            JSON.stringify({
-              type: 'replay.complete',
-              nextCursor: page.nextCursor,
-              hasMore: page.hasMore,
-            }),
-          );
-        }
-      } catch {
-        socket.send(JSON.stringify({ type: 'error', error: 'Invalid WebSocket message' }));
-      }
-    });
-    socket.on('close', () => clients.delete(socket));
-  });
   const address = httpServer.address();
   const port = typeof address === 'object' && address ? address.port : services.port;
   return {
     port,
     close: async () => {
-      unsubscribe();
-      for (const client of clients.keys()) client.close();
-      await new Promise<void>((resolveClose) =>
-        wsServer.close(() => {
-          httpServer.close(() => resolveClose());
-        }),
-      );
+      if (typeof httpServer.closeAllConnections === 'function') {
+        httpServer.closeAllConnections();
+      }
+      await new Promise<void>((resolveClose) => httpServer.close(() => resolveClose()));
     },
   };
 }
