@@ -3,6 +3,12 @@ import { defineConfig } from 'vitest/config';
 // Unit tier: pure logic, edge cases, reducers, contracts. Excludes
 // integration files which need real SQLite, real HTTP servers, or
 // subprocesses. Run with `npm run test:unit`.
+//
+// Coverage floor is a single 60% global number — the unit tier cannot
+// reach every critical-path file because some of them (database, HTTP
+// entrypoint, provider adapters, integration shims) need real boundaries
+// that only the integration tier exercises. The integration tier carries
+// the 80% per-file floor on those modules.
 export default defineConfig({
   test: {
     globals: true,
@@ -25,11 +31,10 @@ export default defineConfig({
         'src/providers/types.ts',
       ],
       thresholds: {
-        perFile: true,
-        lines: 80,
-        functions: 80,
-        branches: 80,
-        statements: 80,
+        lines: 60,
+        functions: 60,
+        branches: 60,
+        statements: 60,
       },
     },
   },

@@ -167,14 +167,33 @@ defect and a release blocker.
 
 ## Coverage thresholds
 
-Declared in `vitest.config.ts`. The build fails if any in-scope file
-falls below 80% lines/functions/branches/statements. Excluded files are
-not measured; they are covered by integration or E2E suites instead.
+Two thresholds, enforced separately because no single tier can reach
+every critical-path file:
+
+- **Unit tier (`vitest.unit.config.ts`)** — 60% global floor on lines,
+  functions, branches, statements. Catches the easy bugs fast. Run
+  with `npm run test:unit -- --coverage`.
+- **Integration tier (`vitest.integration.config.ts`)** — 80% per-file
+  floor on every in-scope source file. Catches the bugs that only show
+  up at the SQLite / HTTP / subprocess boundary. Run with
+  `npm run test:integration -- --coverage`.
+
+The combined gate (`vitest.config.ts`, used by `npm run test:coverage`)
+runs every test in one shot and enforces the 80% per-file floor.
+
+Excluded files in all three configs:
+
+- `src/cli.tsx`, `src/onboarding.ts`, `src/daemon.ts`, `src/server.ts` —
+  process entrypoints exercised end-to-end
+- `src/ui/**`, `src/web/**` — presentation, exercised via `tests/e2e/`
+- `src/memory/schema.ts`, `src/providers/types.ts` — type-only surface
 
 To check coverage locally:
 
 ```sh
-npm run test:coverage
+npm run test:coverage              # combined gate (full suite, 80% per-file)
+npx vitest run --config vitest.unit.config.ts --coverage       # unit tier
+npx vitest run --config vitest.integration.config.ts --coverage # integration tier
 ```
 
 ## Mutation testing

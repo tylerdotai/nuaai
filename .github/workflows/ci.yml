@@ -60,7 +60,7 @@ jobs:
       - name: Run unit suite
         run: npm run test:unit
 
-      - name: Unit coverage floor (unit-tested files)
+      - name: Unit coverage floor (60% global)
         run: npx vitest run --config vitest.unit.config.ts --coverage
 
   integration:
@@ -90,7 +90,7 @@ jobs:
       - name: Run integration suite
         run: npm run test:integration
 
-      - name: Coverage gate on critical paths
+      - name: Critical-path coverage floor (80% per-file)
         # The integration tier exercises the SQLite, HTTP, and subprocess
         # boundaries of the security, provider, integration, artifact, and
         # plugin modules. Coverage is measured here because the unit tier

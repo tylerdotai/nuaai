@@ -1,5 +1,10 @@
 import { defineConfig } from 'vitest/config';
 
+// Combined tier (used by `npm test` and the release gate): runs every
+// test, both unit and integration, with coverage. The per-file floor is
+// 80% lines/functions/branches/statements on every in-scope file. The
+// 80% number is achievable because the integration suite covers the
+// files the unit suite cannot reach.
 export default defineConfig({
   test: {
     globals: true,
@@ -26,9 +31,6 @@ export default defineConfig({
         'src/providers/types.ts',
       ],
       thresholds: {
-        // Per-file floor of 80% lines/functions/branches/statements on every
-        // in-scope source file. Excluded files (above) are not measured; they
-        // are covered by integration and E2E suites instead.
         perFile: true,
         lines: 80,
         functions: 80,
