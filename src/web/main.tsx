@@ -1299,6 +1299,42 @@ function App(): React.JSX.Element {
     }
   };
 
+  const [sessionRailCollapsed, setSessionRailCollapsed] = useState(false);
+  const [sessionContextMenu, setSessionContextMenu] = useState<{ x: number; y: number; sessionId: string } | null>(null);
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [editingSessionTitle, setEditingSessionTitle] = useState('');
+
+  const renameSession = async (id: string, title: string): Promise<void> => {
+    try {
+      await request(`/api/sessions/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ title }),
+      });
+      setSessions((current) => current.map((s) => (s.id === id ? { ...s, title } : s)));
+      setEditingSessionId(null);
+      setNotice('Session renamed');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const deleteSession = async (id: string): Promise<void> => {
+    try {
+      await request(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      setSessions((current) => {
+        const next = current.filter((s) => s.id !== id);
+        if (selectedSessionId === id && next.length > 0) {
+          void chooseSession(next[0].id);
+        }
+        return next;
+      });
+      setSessionContextMenu(null);
+      setNotice('Session deleted');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
   const scheduleAction = async (
     id: string,
     action: 'pause' | 'resume' | 'trigger',
@@ -1500,78 +1536,205 @@ function App(): React.JSX.Element {
       <div className="app-frame">
         <aside
           ref={sessionRailRef}
-          className={`session-rail ${sessionDrawerOpen ? 'open' : ''}`}
+          className={`session-rail ${sessionRailCollapsed ? 'collapsed' : ''} ${sessionDrawerOpen ? 'open' : ''}`}
           aria-label="Conversations"
           aria-modal={sessionDrawerOpen ? true : undefined}
           role={sessionDrawerOpen ? 'dialog' : undefined}
+          onClick={() => {
+            if (sessionRailCollapsed) setSessionRailCollapsed(false);
+          }}
         >
-          <div className="rail-heading">
+          {!sessionRailCollapsed && (
+            <>
+              <div className="rail-heading">
+                <button
+                  type="button"
+                  className="new-conversation-button"
+                  onClick={() => void createSession()}
+                >
+                  New conversation
+                </button>
+                <label className="session-search">
+                  <span className="sr-only">Search conversations</span>
+                  <input
+                    type="search"
+                    value={sessionSearch}
+                    placeholder="Search conversations"
+                    onChange={(event) => setSessionSearch(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="session-list" onContextMenu={(e) => e.preventDefault()}>
+                {sessionGroups.length ? (
+                  sessionGroups.map((group) => (
+                    <section className="session-group" key={group.label}>
+                      <h2>{group.label}</h2>
+                      {group.sessions.map((session) => {
+                        const isEditing = editingSessionId === session.id;
+                        return (
+                          <div
+                            className={`session-row-wrap ${selectedSessionId === session.id ? 'selected' : ''}`}
+                            key={session.id}
+                            onContextMenu={(e) => {
+                              e.preventDefault();
+                              setSessionContextMenu({ x: e.clientX, y: e.clientY, sessionId: session.id });
+                            }}
+                          >
+                            {isEditing ? (
+                              <form
+                                className="session-edit-form"
+                                onSubmit={(e) => {
+                                  e.preventDefault();
+                                  if (editingSessionTitle.trim()) renameSession(session.id, editingSessionTitle.trim());
+                                  else setEditingSessionId(null);
+                                }}
+                              >
+                                <input
+                                  autoFocus
+                                  value={editingSessionTitle}
+                                  onChange={(e) => setEditingSessionTitle(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Escape') setEditingSessionId(null);
+                                  }}
+                                />
+                              </form>
+                            ) : (
+                              <button
+                                type="button"
+                                className="session-row"
+                                aria-current={selectedSessionId === session.id ? 'page' : undefined}
+                                onClick={() => void chooseSession(session.id)}
+                                onDoubleClick={() => {
+                                  setEditingSessionId(session.id);
+                                  setEditingSessionTitle(session.title);
+                                }}
+                              >
+                                <span className="session-glyph" aria-hidden="true" />
+                                <span>
+                                  <strong>{session.title}</strong>
+                                  <small>{selectedSessionId === session.id ? 'Current' : 'Saved'}</small>
+                                </span>
+                              </button>
+                            )}
+                            <span className="session-actions">
+                              <button
+                                type="button"
+                                className="session-action-btn"
+                                title="Rename"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setEditingSessionId(session.id);
+                                  setEditingSessionTitle(session.title);
+                                }}
+                              >
+                                ✎
+                              </button>
+                              <button
+                                type="button"
+                                className="session-action-btn danger"
+                                title="Delete"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (confirm(`Delete "${session.title}"?`)) deleteSession(session.id);
+                                }}
+                              >
+                                ×
+                              </button>
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </section>
+                  ))
+                ) : (
+                  <div className="rail-empty">
+                    <strong>{sessions.length ? 'No matches' : 'No conversations'}</strong>
+                    <p>
+                      {sessions.length
+                        ? 'Try a different conversation search.'
+                        : 'Start one to create a durable session.'}
+                    </p>
+                  </div>
+                )}
+              </div>
+              <NavigationTabs
+                view={view}
+                memoryCount={memories.length}
+                automationCount={schedules.length}
+                onChange={(nextView) => {
+                  setView(nextView);
+                  setSessionDrawerOpen(false);
+                }}
+              />
+              <div className="rail-footer">
+                <span className={`connection-dot connection-${connection}`} aria-hidden="true" />
+                <span>Daemon</span>
+                <strong>{connectionLabel(connection)}</strong>
+              </div>
+            </>
+          )}
+        </aside>
+        {sessionRailCollapsed && (
+          <div className="collapsed-rail">
             <button
               type="button"
-              className="new-conversation-button"
-              onClick={() => void createSession()}
+              className="collapsed-rail-btn"
+              onClick={() => setSessionRailCollapsed(false)}
+              title="Conversations"
             >
-              New conversation
+              ☰
             </button>
-            <label className="session-search">
-              <span className="sr-only">Search conversations</span>
-              <input
-                type="search"
-                value={sessionSearch}
-                placeholder="Search conversations"
-                onChange={(event) => setSessionSearch(event.target.value)}
-              />
-            </label>
+            {sessions.slice(0, 8).map((session) => (
+              <button
+                type="button"
+                key={session.id}
+                className={`collapsed-session-btn ${selectedSessionId === session.id ? 'selected' : ''}`}
+                onClick={() => {
+                  void chooseSession(session.id);
+                  setSessionRailCollapsed(true);
+                }}
+                title={session.title}
+              >
+                {session.title.charAt(0).toUpperCase()}
+              </button>
+            ))}
           </div>
-          <div className="session-list">
-            {sessionGroups.length ? (
-              sessionGroups.map((group) => (
-                <section className="session-group" key={group.label}>
-                  <h2>{group.label}</h2>
-                  {group.sessions.map((session) => (
-                    <button
-                      type="button"
-                      className={`session-row ${selectedSessionId === session.id ? 'selected' : ''}`}
-                      aria-current={selectedSessionId === session.id ? 'page' : undefined}
-                      key={session.id}
-                      onClick={() => void chooseSession(session.id)}
-                    >
-                      <span className="session-glyph" aria-hidden="true" />
-                      <span>
-                        <strong>{session.title}</strong>
-                        <small>{selectedSessionId === session.id ? 'Current' : 'Saved'}</small>
-                      </span>
-                    </button>
-                  ))}
-                </section>
-              ))
-            ) : (
-              <div className="rail-empty">
-                <strong>{sessions.length ? 'No matches' : 'No conversations'}</strong>
-                <p>
-                  {sessions.length
-                    ? 'Try a different conversation search.'
-                    : 'Start one to create a durable session.'}
-                </p>
-              </div>
-            )}
+        )}
+        {sessionContextMenu && (
+          <div
+            className="context-menu"
+            style={{ top: sessionContextMenu.y, left: sessionContextMenu.x }}
+            role="menu"
+          >
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const session = sessions.find((s) => s.id === sessionContextMenu.sessionId);
+                if (session) {
+                  setEditingSessionId(session.id);
+                  setEditingSessionTitle(session.title);
+                }
+                setSessionContextMenu(null);
+              }}
+            >
+              Rename
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="danger"
+              onClick={() => {
+                const session = sessions.find((s) => s.id === sessionContextMenu.sessionId);
+                if (session && confirm(`Delete "${session.title}"?`)) deleteSession(session.id);
+                setSessionContextMenu(null);
+              }}
+            >
+              Delete
+            </button>
           </div>
-          <NavigationTabs
-            view={view}
-            memoryCount={memories.length}
-            automationCount={schedules.length}
-            onChange={(nextView) => {
-              setView(nextView);
-              setSessionDrawerOpen(false);
-            }}
-          />
-          <div className="rail-footer">
-            <span className={`connection-dot connection-${connection}`} aria-hidden="true" />
-            <span>Daemon</span>
-            <strong>{connectionLabel(connection)}</strong>
-          </div>
-        </aside>
-        {sessionDrawerOpen && (
+        )}
+        {sessionDrawerOpen && !sessionRailCollapsed && (
           <button
             type="button"
             className="drawer-scrim"
@@ -1782,7 +1945,6 @@ function App(): React.JSX.Element {
           {view === 'automations' && (
             <AutomationsView
               schedules={schedules}
-              tasks={tasks}
               scheduleName={scheduleName}
               scheduleInput={scheduleInput}
               onScheduleName={setScheduleName}

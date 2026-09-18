@@ -218,35 +218,37 @@ export function MemoryView({
         </button>
         {saveStatus === 'saved' && <span className="save-confirm">Saved</span>}
       </form>
-      <div className="record-grid" aria-label="Memory records">
+      <div className="memory-list" aria-label="Memory records">
         {memories.length ? (
           memories.map((memory) => (
-            <article
-              className="record-card memory-card"
+            <div
+              className="memory-row"
               key={memory.id}
               onContextMenu={(e) => {
                 e.preventDefault();
                 setContextMenu({ x: e.clientX, y: e.clientY, memoryId: memory.id });
               }}
             >
-              <div className="record-topline">
-                <span>{memory.hasEmbedding ? 'Indexed' : 'Text only'}</span>
+              <div className="memory-content">
+                <p>{memory.content}</p>
+              </div>
+              <div className="memory-meta">
+                <span className={memory.hasEmbedding ? 'indexed' : 'text-only'}>
+                  {memory.hasEmbedding ? 'Indexed' : 'Text'}
+                </span>
                 <time>{relativeTime(memory.createdAt)}</time>
               </div>
-              <p>{memory.content}</p>
               {onDelete && (
-                <div className="card-actions">
-                  <button
-                    type="button"
-                    className="danger"
-                    title="Delete this memory"
-                    onClick={() => onDelete(memory.id)}
-                  >
-                    Delete
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  className="memory-delete-btn danger"
+                  title="Delete this memory"
+                  onClick={() => onDelete(memory.id)}
+                >
+                  Delete
+                </button>
               )}
-            </article>
+            </div>
           ))
         ) : isLoading ? (
           <div className="skeleton-list" aria-label="Loading memories">
@@ -290,7 +292,6 @@ export function MemoryView({
 
 export function AutomationsView({
   schedules,
-  tasks,
   scheduleName,
   scheduleInput,
   onScheduleName,
@@ -301,7 +302,6 @@ export function AutomationsView({
   onUpdate,
 }: {
   schedules: Schedule[];
-  tasks: Task[];
   scheduleName: string;
   scheduleInput: string;
   onScheduleName(value: string): void;
@@ -314,7 +314,6 @@ export function AutomationsView({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editInput, setEditInput] = useState('');
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
 
   const startEdit = (id: string): void => {
     const schedule = schedules.find((s) => s.id === id);
@@ -329,16 +328,17 @@ export function AutomationsView({
     onUpdate?.(editingId, editName.trim(), editInput.trim());
     setEditingId(null);
   };
+
   return (
     <section id="view-automations" className="secondary-view" role="tabpanel">
       <div className="view-heading">
         <div>
           <span className="section-label">Durable background work</span>
           <h1>Automations</h1>
-          <p>Create schedules and see the real terminal state of every task.</p>
+          <p>Schedules that run tasks on a timer or trigger.</p>
         </div>
         <span className="count-chip">
-          {schedules.filter((schedule) => schedule.enabled).length} enabled
+          {schedules.filter((schedule) => schedule.enabled).length} of {schedules.length} enabled
         </span>
       </div>
       <form
@@ -374,148 +374,100 @@ export function AutomationsView({
           Create automation
         </button>
       </form>
-      <div className="automation-layout">
-        <div className="automation-list" aria-label="Automations">
-          {schedules.length ? (
-            schedules.map((schedule) => {
-              const recentTasks = tasks
-                .filter((task) => task.scheduleId === schedule.id)
-                .slice(0, 3);
-              const isEditing = editingId === schedule.id;
-              return (
-                <article className="record-card automation-card" key={schedule.id}>
-                  <div className="record-topline">
-                    <span className={schedule.enabled ? 'good-text' : ''}>
-                      {schedule.enabled ? 'Enabled' : 'Paused'}
-                    </span>
-                    <span>{schedule.type}</span>
-                  </div>
-                  {isEditing ? (
-                    <form
-                      className="edit-schedule-form"
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        saveEdit();
-                      }}
-                    >
-                      <input
-                        aria-label="Edit name"
-                        value={editName}
-                        onChange={(e) => setEditName(e.target.value)}
-                      />
-                      <textarea
-                        aria-label="Edit instruction"
-                        value={editInput}
-                        onChange={(e) => setEditInput(e.target.value)}
-                      />
-                      <div className="card-actions">
-                        <button type="submit">Save</button>
-                        <button type="button" className="danger" onClick={() => setEditingId(null)}>
-                          Cancel
-                        </button>
+      <div className="schedule-list" aria-label="Schedules">
+        {schedules.length ? (
+          schedules.map((schedule) => {
+            const isEditing = editingId === schedule.id;
+            return (
+              <div className="schedule-row" key={schedule.id}>
+                {isEditing ? (
+                  <form
+                    className="schedule-edit-form"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      saveEdit();
+                    }}
+                  >
+                    <input
+                      aria-label="Edit name"
+                      value={editName}
+                      onChange={(e) => setEditName(e.target.value)}
+                    />
+                    <textarea
+                      aria-label="Edit instruction"
+                      value={editInput}
+                      onChange={(e) => setEditInput(e.target.value)}
+                    />
+                    <div className="schedule-edit-actions">
+                      <button type="submit">Save</button>
+                      <button type="button" className="danger" onClick={() => setEditingId(null)}>
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <>
+                    <div className="schedule-info">
+                      <div className="schedule-title-row">
+                        <h2>{schedule.name}</h2>
+                        <span
+                          className={`schedule-status ${schedule.enabled ? 'enabled' : 'paused'}`}
+                        >
+                          {schedule.enabled ? 'Enabled' : 'Paused'}
+                        </span>
                       </div>
-                    </form>
-                  ) : (
-                    <>
-                      <h2>{schedule.name}</h2>
-                      <p>{schedule.agentInput}</p>
-                      <div className="automation-meta">
+                      <p className="schedule-input">{schedule.agentInput}</p>
+                      <div className="schedule-meta">
+                        <span>{schedule.type}</span>
                         <span>Next: {relativeTime(schedule.nextRunAt)}</span>
-                        <span>Attempts: {schedule.policy.maxAttempts}</span>
                       </div>
-                      {recentTasks.length > 0 && (
-                        <div className="task-chips">
-                          {recentTasks.map((task) => (
-                            <button
-                              type="button"
-                              className={`task-chip task-${task.status}`}
-                              key={task.id}
-                              title="View task details"
-                              onClick={() =>
-                                setSelectedTaskId(selectedTaskId === task.id ? null : task.id)
-                              }
-                            >
-                              {task.status}
-                            </button>
-                          ))}
-                        </div>
+                    </div>
+                    <div className="schedule-actions">
+                      <button
+                        type="button"
+                        title="Trigger this automation now"
+                        onClick={() => onAction(schedule.id, 'trigger')}
+                      >
+                        Run
+                      </button>
+                      <button
+                        type="button"
+                        title={
+                          schedule.enabled ? 'Pause this automation' : 'Resume this automation'
+                        }
+                        onClick={() => onAction(schedule.id, schedule.enabled ? 'pause' : 'resume')}
+                      >
+                        {schedule.enabled ? 'Pause' : 'Resume'}
+                      </button>
+                      <button
+                        type="button"
+                        title="Edit automation"
+                        onClick={() => startEdit(schedule.id)}
+                      >
+                        Edit
+                      </button>
+                      {onDelete && (
+                        <button
+                          type="button"
+                          className="danger"
+                          title="Delete this automation"
+                          onClick={() => onDelete(schedule.id)}
+                        >
+                          Delete
+                        </button>
                       )}
-                      {selectedTaskId && (
-                        <TaskDetail
-                          task={tasks.find((t) => t.id === selectedTaskId)}
-                          onClose={() => setSelectedTaskId(null)}
-                        />
-                      )}
-                      <div className="card-actions">
-                        <button
-                          type="button"
-                          title="Trigger this automation now"
-                          onClick={() => onAction(schedule.id, 'trigger')}
-                        >
-                          Run now
-                        </button>
-                        <button
-                          type="button"
-                          title={
-                            schedule.enabled ? 'Pause this automation' : 'Resume this automation'
-                          }
-                          onClick={() =>
-                            onAction(schedule.id, schedule.enabled ? 'pause' : 'resume')
-                          }
-                        >
-                          {schedule.enabled ? 'Pause' : 'Resume'}
-                        </button>
-                        <button
-                          type="button"
-                          title="Edit automation name and instruction"
-                          onClick={() => startEdit(schedule.id)}
-                        >
-                          Edit
-                        </button>
-                        {onDelete && (
-                          <button
-                            type="button"
-                            className="danger"
-                            title="Delete this automation"
-                            onClick={() => onDelete(schedule.id)}
-                          >
-                            Delete
-                          </button>
-                        )}
-                      </div>
-                    </>
-                  )}
-                </article>
-              );
-            })
-          ) : (
-            <div className="section-empty">
-              <h2>No automations</h2>
-              <p>
-                Create a manual automation above. Time-based schedules remain available through the
-                TUI.
-              </p>
-            </div>
-          )}
-        </div>
-        <aside className="task-history" aria-label="Task history">
-          <span className="section-label">Recent tasks</span>
-          {tasks.length ? (
-            tasks.slice(0, 10).map((task) => (
-              <div className="task-row" key={task.id}>
-                <span className={`action-icon action-${task.status}`} aria-hidden="true" />
-                <div>
-                  <strong>{String(task.payload.name ?? task.kind)}</strong>
-                  <small>
-                    {task.status} · {relativeTime(task.updatedAt)}
-                  </small>
-                </div>
+                    </div>
+                  </>
+                )}
               </div>
-            ))
-          ) : (
-            <p className="quiet-copy">Task outcomes will appear here.</p>
-          )}
-        </aside>
+            );
+          })
+        ) : (
+          <div className="section-empty">
+            <h2>No automations</h2>
+            <p>Create one above to schedule recurring background work.</p>
+          </div>
+        )}
       </div>
     </section>
   );
@@ -548,40 +500,47 @@ export function SystemView({
 }): React.JSX.Element {
   const [configuringPlugin, setConfiguringPlugin] = useState<string | null>(null);
   const [configText, setConfigText] = useState('');
+
   return (
     <section id="view-system" className="secondary-view" role="tabpanel">
       <div className="view-heading">
         <div>
           <span className="section-label">Runtime and capabilities</span>
           <h1>System</h1>
-          <p>Provider health, active model, skills, and trusted plugins.</p>
+          <p>Provider health, active model, skills, and plugins.</p>
         </div>
         <span className={`connection-badge connection-${connection}`}>
           {connectionLabel(connection)}
         </span>
       </div>
-      <div className="system-section">
-        <div className="section-heading-row">
-          <h2>Providers</h2>
-          <span>{displayModel(activeProvider)}</span>
+
+      <div className="settings-section">
+        <div className="settings-section-header">
+          <h2>Provider</h2>
+          <span className="current-model">{displayModel(activeProvider)}</span>
         </div>
-        <div className="provider-grid">
+        <div className="provider-list">
           {providers.map((provider) => (
-            <article className="record-card provider-card" key={provider.name}>
-              <div className="provider-title">
+            <div className="provider-row" key={provider.name}>
+              <div className="provider-info">
                 <span
                   className={`connection-dot ${provider.available ? 'connection-connected' : 'connection-offline'}`}
                   aria-hidden="true"
                 />
-                <h3>{displayProviderName(provider.name)}</h3>
-                <strong>{provider.available ? 'Ready' : 'Offline'}</strong>
+                <div>
+                  <strong>{displayProviderName(provider.name)}</strong>
+                  <span className="provider-status">
+                    {provider.available ? 'Ready' : 'Offline'}
+                    {provider.detail && ` · ${provider.detail}`}
+                  </span>
+                </div>
               </div>
-              <p>{provider.detail}</p>
               {provider.models?.length ? (
-                <div className="model-actions">
+                <div className="model-list">
                   {provider.models.map((model) => (
                     <button
                       type="button"
+                      className={`model-btn ${activeProvider?.name === provider.name && activeProvider.model === model ? 'active' : ''}`}
                       disabled={
                         !provider.available ||
                         (activeProvider?.name === provider.name && activeProvider.model === model)
@@ -589,143 +548,132 @@ export function SystemView({
                       key={model}
                       onClick={() => onSwitchProvider(provider.name, model)}
                     >
-                      {activeProvider?.name === provider.name && activeProvider.model === model
-                        ? 'Active'
-                        : model}
+                      {model}
                     </button>
                   ))}
                 </div>
               ) : null}
-            </article>
+            </div>
           ))}
         </div>
       </div>
-      <div className="system-columns">
-        <div className="system-section">
-          <div className="section-heading-row">
-            <h2>Skills</h2>
-            <span>{skills.length}</span>
-          </div>
-          <div className="compact-list" aria-label="Skills">
-            {skills.length ? (
-              skills.map((skill) => (
-                <article key={skill.name}>
-                  <div>
-                    <strong>{skill.name}</strong>
-                    <small>
-                      {skill.version} · {skill.source}
-                    </small>
-                  </div>
-                  <p>{skill.description}</p>
-                  {(onEnableSkill || onDisableSkill) && (
-                    <div className="card-actions">
-                      {skill.enabled === false ? (
-                        <button
-                          type="button"
-                          title="Enable this skill"
-                          onClick={() => onEnableSkill?.(skill.name)}
-                        >
-                          Enable
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          title="Disable this skill"
-                          onClick={() => onDisableSkill?.(skill.name)}
-                        >
-                          Disable
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </article>
-              ))
-            ) : (
-              <p className="quiet-copy">No skills registered.</p>
-            )}
-          </div>
+
+      <div className="settings-section">
+        <div className="settings-section-header">
+          <h2>Skills</h2>
+          <span className="count-badge">{skills.length}</span>
         </div>
-        <div className="system-section">
-          <div className="section-heading-row">
-            <h2>Plugins</h2>
-            <span>{plugins.length}</span>
-          </div>
-          <div className="compact-list" aria-label="Plugins">
-            {plugins.length ? (
-              plugins.map((plugin) => {
-                const health = pluginHealth.find((item) => item.name === plugin.name);
-                const isConfiguring = configuringPlugin === plugin.name;
-                return (
-                  <article key={plugin.name}>
-                    <div>
-                      <strong>{plugin.name}</strong>
-                      <small>
-                        {plugin.version} · {health?.enabled ? 'enabled' : 'disabled'}
-                      </small>
-                    </div>
-                    <p>{plugin.capabilities.join(', ') || 'No declared capabilities'}</p>
-                    {isConfiguring ? (
-                      <form
-                        className="plugin-config-form"
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          try {
-                            const parsed = JSON.parse(configText);
-                            onConfigurePlugin?.(plugin.name, parsed);
-                            setConfiguringPlugin(null);
-                          } catch {
-                            // invalid JSON, ignore
-                          }
-                        }}
-                      >
-                        <textarea
-                          aria-label="Plugin config (JSON)"
-                          value={configText}
-                          onChange={(e) => setConfigText(e.target.value)}
-                          placeholder='{"key": "value"}'
-                        />
-                        <div className="card-actions">
-                          <button type="submit">Save</button>
-                          <button type="button" onClick={() => setConfiguringPlugin(null)}>
-                            Cancel
-                          </button>
-                        </div>
-                      </form>
-                    ) : (
-                      <div className="card-actions">
-                        {plugin.config && Object.keys(plugin.config).length > 0 && (
-                          <small className="config-preview">
-                            {Object.keys(plugin.config).join(', ')}
-                          </small>
-                        )}
-                        <button
-                          type="button"
-                          title="Configure plugin"
-                          onClick={() => {
-                            setConfiguringPlugin(plugin.name);
-                            setConfigText(
-                              plugin.config ? JSON.stringify(plugin.config, null, 2) : '{}',
-                            );
-                          }}
-                        >
-                          Configure
-                        </button>
-                        <button
-                          type="button"
-                          className="text-button danger-text"
-                          onClick={() => onUnloadPlugin(plugin.name)}
-                        >
-                          Unload
+        <div className="settings-list" aria-label="Skills">
+          {skills.length ? (
+            skills.map((skill) => (
+              <div className="settings-row" key={skill.name}>
+                <div className="settings-row-info">
+                  <strong>{skill.name}</strong>
+                  <span>{skill.description}</span>
+                </div>
+                <div className="settings-row-meta">
+                  <span className="skill-source">{skill.source}</span>
+                  <span className="skill-version">v{skill.version}</span>
+                </div>
+                {(onEnableSkill || onDisableSkill) && (
+                  <button
+                    type="button"
+                    className={`toggle-btn ${skill.enabled === false ? 'disabled' : 'enabled'}`}
+                    onClick={() =>
+                      skill.enabled === false
+                        ? onEnableSkill?.(skill.name)
+                        : onDisableSkill?.(skill.name)
+                    }
+                  >
+                    {skill.enabled === false ? 'Disabled' : 'Enabled'}
+                  </button>
+                )}
+              </div>
+            ))
+          ) : (
+            <p className="quiet-copy">No skills registered.</p>
+          )}
+        </div>
+      </div>
+
+      <div className="settings-section">
+        <div className="settings-section-header">
+          <h2>Plugins</h2>
+          <span className="count-badge">{plugins.length}</span>
+        </div>
+        <div className="settings-list" aria-label="Plugins">
+          {plugins.length ? (
+            plugins.map((plugin) => {
+              const health = pluginHealth.find((item) => item.name === plugin.name);
+              const isConfiguring = configuringPlugin === plugin.name;
+              return (
+                <div className="settings-row" key={plugin.name}>
+                  <div className="settings-row-info">
+                    <strong>{plugin.name}</strong>
+                    <span>{plugin.capabilities.join(', ') || 'No declared capabilities'}</span>
+                  </div>
+                  <div className="settings-row-meta">
+                    <span className="plugin-version">v{plugin.version}</span>
+                    <span className={health?.enabled ? 'plugin-enabled' : 'plugin-disabled'}>
+                      {health?.enabled ? 'Enabled' : 'Disabled'}
+                    </span>
+                  </div>
+                  {isConfiguring ? (
+                    <form
+                      className="plugin-config-form"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        try {
+                          const parsed = JSON.parse(configText);
+                          onConfigurePlugin?.(plugin.name, parsed);
+                          setConfiguringPlugin(null);
+                        } catch {
+                          // invalid JSON, ignore
+                        }
+                      }}
+                    >
+                      <textarea
+                        aria-label="Plugin config (JSON)"
+                        value={configText}
+                        onChange={(e) => setConfigText(e.target.value)}
+                        placeholder='{"key": "value"}'
+                      />
+                      <div className="plugin-config-actions">
+                        <button type="submit">Save</button>
+                        <button type="button" onClick={() => setConfiguringPlugin(null)}>
+                          Cancel
                         </button>
                       </div>
-                    )}
-                  </article>
-                );
-              })
-            ) : (
-              <p className="quiet-copy">No trusted plugins loaded.</p>
-            )}
-          </div>
+                    </form>
+                  ) : (
+                    <div className="settings-row-actions">
+                      <button
+                        type="button"
+                        className="secondary-btn"
+                        onClick={() => {
+                          setConfiguringPlugin(plugin.name);
+                          setConfigText(
+                            plugin.config ? JSON.stringify(plugin.config, null, 2) : '{}',
+                          );
+                        }}
+                      >
+                        Configure
+                      </button>
+                      <button
+                        type="button"
+                        className="danger-btn"
+                        onClick={() => onUnloadPlugin(plugin.name)}
+                      >
+                        Unload
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          ) : (
+            <p className="quiet-copy">No trusted plugins loaded.</p>
+          )}
         </div>
       </div>
     </section>
