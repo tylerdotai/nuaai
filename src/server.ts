@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,48 @@ import { getVersion } from './version.js';
 import { buildThreadPresentation } from './web/presentation.js';
 
 const maxRequestBodyBytes = 1024 * 1024;
+
+interface LogOptions {
+  level: 'info' | 'warn' | 'error';
+  method?: string;
+  path?: string;
+  status?: number;
+  error?: unknown;
+  duration?: number;
+}
+
+async function logToFile(options: LogOptions): Promise<void> {
+  const timestamp = new Date().toISOString();
+  const level = options.level.toUpperCase().padEnd(5);
+  const parts = [`[${timestamp}]`, level];
+  if (options.method) parts.push(`${options.method} ${options.path}`);
+  if (options.status) parts.push(`${options.status}`);
+  if (options.duration) parts.push(`${options.duration}ms`);
+  if (options.error) {
+    const message = options.error instanceof Error ? options.error.message : String(options.error);
+    parts.push(message);
+  }
+  const line = `${parts.join(' | ')}\n`;
+  try {
+    await appendFile('/home/tyler/.nuaai/logs/server.log', line).catch(() => {});
+  } catch {
+    // ignore
+  }
+}
+
+function log(level: 'info' | 'warn' | 'error', ...args: unknown[]): void {
+  const timestamp = new Date().toISOString();
+  const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
+  if (level === 'error') {
+    console.error(prefix, ...args);
+    const error = args.find((a) => a instanceof Error) as Error | undefined;
+    void logToFile({ level, error: error?.message ?? String(args[0]) });
+  } else if (level === 'warn') {
+    console.warn(prefix, ...args);
+  } else {
+    console.log(prefix, ...args);
+  }
+}
 const maxWebSocketMessageBytes = 64 * 1024;
 const maxReplayPageSize = 1_000;
 const runSnapshotEventLimit = 250;
@@ -336,8 +378,8 @@ export function createApp(services: GatewayServices): Hono {
       ? context.json({ session, threads: services.runtime.listThreads(session.id), active: true })
       : context.json({ error: 'Session not found' }, 404);
   });
-  app.put('/api/sessions/:id', (context) => {
-    const { title } = context.req.query();
+  app.put('/api/sessions/:id', async (context) => {
+    const { title } = await context.req.json();
     if (typeof title !== 'string' || !title.trim()) {
       return context.json({ error: 'title is required' }, 400);
     }
@@ -348,8 +390,8 @@ export function createApp(services: GatewayServices): Hono {
     const deleted = services.runtime.deleteSession(context.req.param('id'));
     return deleted ? context.json({ ok: true }) : context.json({ error: 'Session not found' }, 404);
   });
-  app.put('/api/threads/:id', (context) => {
-    const { title } = context.req.query();
+  app.put('/api/threads/:id', async (context) => {
+    const { title } = await context.req.json();
     if (typeof title !== 'string' || !title.trim()) {
       return context.json({ error: 'title is required' }, 400);
     }
@@ -861,6 +903,8 @@ export interface GatewayHandle {
 }
 
 export async function startServer(services: GatewayServices): Promise<GatewayHandle> {
+  await mkdir('/home/tyler/.nuaai/logs', { recursive: true }).catch(() => {});
+  log('info', `Starting NUAAI server on ${services.host}:${services.port}`);
   const app = createApp(services);
   const httpServer = createServer(async (request, response) => {
     try {
@@ -907,6 +951,8 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       webResponse.headers.forEach((value, key) => response.setHeader(key, value));
       response.end(Buffer.from(await webResponse.arrayBuffer()));
     } catch (error) {
+      const requestPath = request.url ?? '/';
+      log('error', `${request.method ?? 'UNKNOWN'} ${requestPath} -> 500`, error);
       response.statusCode = 500;
       response.end(error instanceof Error ? error.message : String(error));
     }
@@ -918,6 +964,7 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       resolveListen();
     });
   });
+  log('info', `NUAAI server listening on http://${services.host}:${services.port}`);
   const wsServer = new WebSocketServer({
     server: httpServer,
     maxPayload: maxWebSocketMessageBytes,
