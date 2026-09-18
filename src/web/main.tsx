@@ -9,6 +9,7 @@ import {
   webSocketCloseDisposition,
 } from './auth.js';
 import { AgentComposer } from './components/AgentComposer.js';
+import { ArtifactCards } from './components/ArtifactCards.js';
 import { MarkdownContent } from './components/MarkdownContent.js';
 import { RunStatusSummary } from './components/RunStatusSummary.js';
 import { type ComposerCommand, draftStorageKey, resolveComposerCommand } from './composer.js';
@@ -711,12 +712,22 @@ function App(): React.JSX.Element {
       pollGeneration.current === generation &&
       selectedSessionRef.current === sessionId &&
       selectedThreadRef.current === threadId;
+    let nextPausedApprovalRefreshAt = 0;
     const timer = window.setInterval(() => {
       void request<{ status: string }>(`/api/runs/${encodeURIComponent(runId)}`, {
         signal: controller.signal,
       })
         .then((run) => {
-          if (!ownsPoll() || !terminalRunStates.has(run.status)) return;
+          if (!ownsPoll()) return;
+          if (run.status === 'paused') {
+            const now = Date.now();
+            if (now >= nextPausedApprovalRefreshAt) {
+              nextPausedApprovalRefreshAt = now + 15_000;
+              void loadSystem().catch(reportBackgroundFailure);
+            }
+            return;
+          }
+          if (!terminalRunStates.has(run.status)) return;
           setActiveRunsByThread((current) =>
             current[threadId] === runId ? { ...current, [threadId]: null } : current,
           );
@@ -745,6 +756,18 @@ function App(): React.JSX.Element {
     reportBackgroundFailure,
     selectedThreadId,
   ]);
+
+  useEffect(() => {
+    const refreshVisibleApprovals = (): void => {
+      if (document.visibilityState === 'visible') void loadSystem().catch(reportBackgroundFailure);
+    };
+    window.addEventListener('focus', refreshVisibleApprovals);
+    document.addEventListener('visibilitychange', refreshVisibleApprovals);
+    return () => {
+      window.removeEventListener('focus', refreshVisibleApprovals);
+      document.removeEventListener('visibilitychange', refreshVisibleApprovals);
+    };
+  }, [loadSystem, reportBackgroundFailure]);
 
   const scrollRevision = `${messages.at(-1)?.id ?? ''}:${events.at(-1)?.id ?? ''}`;
   useEffect(() => {
@@ -1599,6 +1622,7 @@ function App(): React.JSX.Element {
                             <time>{relativeTime(message.createdAt)}</time>
                           </div>
                           <MarkdownContent markdown={message.markdown} />
+                          <ArtifactCards message={message} resolveUrl={appPath} />
                           {message.role === 'assistant' && (
                             <RunStatusSummary
                               message={message}
