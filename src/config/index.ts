@@ -229,6 +229,9 @@ export function parseRuntimeConfig(value: unknown, root = process.cwd()): Runtim
   const environmentPort = Number(process.env.NUAAI_PORT);
   if (Number.isInteger(environmentPort) && environmentPort >= 1 && environmentPort <= 65_535)
     raw.port = environmentPort;
+  const environmentHost = process.env.NUAAI_HOST;
+  if (environmentHost && environmentHost.trim())
+    raw.host = environmentHost.trim();
   const rawWeb =
     raw.web && typeof raw.web === 'object' ? { ...(raw.web as Record<string, unknown>) } : {};
   if (rawWeb.publicBasePath === undefined && process.env.NUAAI_PUBLIC_BASE_PATH)
