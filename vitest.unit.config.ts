@@ -1,19 +1,18 @@
 import { defineConfig } from 'vitest/config';
 
+// Unit tier: pure logic, edge cases, reducers, contracts. Excludes
+// integration files which need real SQLite, real HTTP servers, or
+// subprocesses. Run with `npm run test:unit`.
 export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
     include: ['tests/**/*.test.ts'],
-    exclude: ['node_modules/**', 'dist/**', 'tests/e2e/**'],
+    exclude: ['node_modules/**', 'dist/**', 'tests/e2e/**', '**/*.integration.test.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary', 'html'],
       include: ['src/**/*.ts', 'src/**/*.tsx'],
-      // Presentation (src/ui, src/web), schema declarations, and process
-      // entrypoints (src/cli.tsx, src/onboarding.ts, src/daemon.ts,
-      // src/server.ts) are tested at the integration or E2E tier rather
-      // than via coverage. Provider/types.ts is type-only.
       exclude: [
         'src/**/*.d.ts',
         'src/cli.tsx',
@@ -26,9 +25,6 @@ export default defineConfig({
         'src/providers/types.ts',
       ],
       thresholds: {
-        // Per-file floor of 80% lines/functions/branches/statements on every
-        // in-scope source file. Excluded files (above) are not measured; they
-        // are covered by integration and E2E suites instead.
         perFile: true,
         lines: 80,
         functions: 80,
