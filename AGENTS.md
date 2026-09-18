@@ -47,7 +47,7 @@ NUAAI is a persistent local-first agent harness. The daemon owns sessions, threa
 - `src/memory/db.ts` owns SQLite persistence and migrations.
 - `src/integrations/matrix.ts` owns Matrix protocol calls, receipts, typing, reactions, relations, and media.
 - `src/skills/` owns standard skill parsing, validation, loading, trigger matching, and learning.
-- `src/server.ts` owns authenticated HTTP and WebSocket client routes.
+- `src/server.ts` owns authenticated HTTP and Server-Sent Events (SSE) client routes.
 - `src/web/` and `src/ui/` render daemon-backed clients only.
 
 ## Security considerations

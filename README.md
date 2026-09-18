@@ -59,7 +59,7 @@ The default path is a local model endpoint: native Ollama or an OpenAI-compatibl
 - Automatic recall uses semantic retrieval when embeddings are available and bounded lexical retrieval otherwise; exceptional run failures are persisted into thread context for truthful follow-up diagnosis.
 - Workspace traversal, symlink, and hard-link protection; command allowlists; subprocess timeouts; and daemon authentication.
 - Bounded workspace file inspection for metadata and text previews; configured MCP servers are namespaced and permission-filtered.
-- Ink TUI, React web dashboard, CLI commands, and authenticated HTTP/WebSocket APIs.
+- Ink TUI, React web dashboard, CLI commands, and authenticated HTTP/Server-Sent Events APIs.
 - Installable private NUAAI PWA with a viewport-bound responsive shell, durable conversations, run activity, memory, automations, system health, reconnect handling, and an authenticated command palette.
 - Interactive onboarding with provider, integration, telemetry, Tailscale, and launch choices.
 
@@ -139,7 +139,7 @@ The **Commands** palette is NUAAI-native, not Element-native. It is available fr
 - **Automations** opens schedules and task history.
 - **Cancel active run** requests cancellation for the current run.
 
-The service worker caches only the static shell. `/api/*` and WebSocket traffic are never cached, so sessions and agent state remain live.
+The service worker caches only the static shell. `/api/*` and Server-Sent Events traffic are never cached, so sessions and agent state remain live.
 
 ## Onboarding
 
@@ -278,7 +278,7 @@ Element iOS ── Matrix over Tailscale Serve ──┐
                                              │
 Ink TUI ───────────────┐                     │
 React web ─────────────┼─ authenticated ── NUAAI daemon
-CLI ───────────────────┘   HTTP/WebSocket       │
+CLI ───────────────────┘   HTTP/SSE             │
                                                 ├─ AgentRuntime
                                                 ├─ SQLite / sqlite-vec
                                                 ├─ Ollama / optional Codex
@@ -384,7 +384,7 @@ The boundaries are concrete:
 ## Security boundaries
 
 - The daemon binds to loopback by default.
-- HTTP and WebSocket routes require generated local bearer authentication.
+- HTTP and Server-Sent Events routes require generated local bearer authentication.
 - Loading the browser shell does not issue credentials; browser access requires an explicit `nuaai pair` URL.
 - Synapse and search services bind to loopback through the supplied Compose file.
 - Tailscale Serve is opt-in and tailnet-scoped; Funnel is not used.
