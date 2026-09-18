@@ -2,8 +2,6 @@ import { describe, expect, it } from 'vitest';
 
 import { displayModel, displayProviderName } from '../src/web/format.js';
 import {
-  EventReplayBuffer,
-  EventReplayCursor,
   LatestRequestCoordinator,
   SelectionLoadCoordinator,
   type WebEventRecord,
@@ -145,31 +143,6 @@ describe('web run event projection', () => {
       runState: { lastEventId: 500 },
       presentation: { messages: ['final answer'] },
     });
-  });
-
-  it('keeps replay continuation separate from a higher live event id', () => {
-    const cursor = new EventReplayCursor(0);
-    expect(cursor.beginReplay()).toBe(0);
-    cursor.observe(1_000);
-    expect(cursor.completePage(250, true)).toBe(250);
-    expect(cursor.beginReplay()).toBe(250);
-    cursor.observe(251);
-    cursor.observe(500);
-    expect(cursor.completePage(500, true)).toBe(500);
-    expect(cursor.beginReplay()).toBe(500);
-    cursor.observe(600);
-    expect(cursor.completePage(600, false)).toBeNull();
-    expect(cursor.beginReplay()).toBe(1_000);
-  });
-
-  it('deduplicates and orders replay events before projection', () => {
-    const buffer = new EventReplayBuffer();
-    expect(buffer.add(event(1_000, 'run-1', 'model.delta', { text: 'live' }))).toBe(true);
-    expect(buffer.add(event(2, 'run-1', 'model.delta', { text: 'second' }))).toBe(true);
-    expect(buffer.add(event(1, 'run-1', 'model.delta', { text: 'first' }))).toBe(true);
-    expect(buffer.add(event(2, 'run-1', 'model.delta', { text: 'duplicate' }))).toBe(false);
-    expect(buffer.drain().map((entry) => entry.id)).toEqual([1, 2, 1_000]);
-    expect(buffer.size).toBe(0);
   });
 
   it('projects readable action states and retains failed outcomes', () => {

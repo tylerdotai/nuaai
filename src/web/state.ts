@@ -9,35 +9,6 @@ export interface WebEventRecord {
   runId?: string;
 }
 
-export class EventReplayBuffer {
-  private readonly keyedEvents = new Map<number, WebEventRecord>();
-  private readonly unkeyedEvents: WebEventRecord[] = [];
-
-  get size(): number {
-    return this.keyedEvents.size + this.unkeyedEvents.length;
-  }
-
-  add(event: WebEventRecord): boolean {
-    if (event.id === undefined) {
-      this.unkeyedEvents.push(event);
-      return true;
-    }
-    if (this.keyedEvents.has(event.id)) return false;
-    this.keyedEvents.set(event.id, event);
-    return true;
-  }
-
-  drain(): WebEventRecord[] {
-    const events = [...this.keyedEvents.values()].sort(
-      (left, right) => (left.id ?? 0) - (right.id ?? 0),
-    );
-    events.push(...this.unkeyedEvents);
-    this.keyedEvents.clear();
-    this.unkeyedEvents.length = 0;
-    return events;
-  }
-}
-
 export type WebRunStatus = 'queued' | 'running' | 'action' | 'completed' | 'failed' | 'cancelled';
 
 export interface WebToolActivity {
@@ -179,44 +150,6 @@ export class SelectionLoadCoordinator {
     this.controller?.abort();
     this.controller = null;
     this.generation += 1;
-  }
-}
-
-export class EventReplayCursor {
-  private committedCursor: number;
-  private observedCursor: number;
-  private replaying = false;
-
-  constructor(initialCursor: number) {
-    this.committedCursor = initialCursor;
-    this.observedCursor = initialCursor;
-  }
-
-  beginReplay(): number {
-    if (!this.replaying) {
-      this.committedCursor = Math.max(this.committedCursor, this.observedCursor);
-      this.replaying = true;
-    }
-    return this.committedCursor;
-  }
-
-  observe(eventId: number): void {
-    if (Number.isFinite(eventId)) this.observedCursor = Math.max(this.observedCursor, eventId);
-  }
-
-  completePage(nextCursor: number, hasMore: boolean): number | null {
-    if (Number.isFinite(nextCursor))
-      this.committedCursor = Math.max(this.committedCursor, nextCursor);
-    this.replaying = hasMore;
-    return hasMore ? this.committedCursor : null;
-  }
-
-  highWater(): number {
-    return Math.max(this.committedCursor, this.observedCursor);
-  }
-
-  isReplaying(): boolean {
-    return this.replaying;
   }
 }
 

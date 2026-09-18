@@ -1,9 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Box, Text, useApp, useInput } from 'ink';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
-import { WebSocket } from 'ws';
 
-import { webSocketCloseDisposition } from '../web/auth.js';
 import { parseScheduleCommand } from './tui-schedule.js';
 import {
   type TuiConversationMessage,
@@ -318,79 +316,103 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
 
   useEffect(() => {
     let stopped = false;
-    let socket: WebSocket | null = null;
+    let abortController: AbortController | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let approvalFallbackTimer: ReturnType<typeof setInterval> | null = null;
     let retry = 0;
+    let isConnected = false;
 
-    const handleMessage: NonNullable<WebSocket['onmessage']> = (event) => {
-      const value = JSON.parse(String(event.data)) as {
+    const handleSSEData = (value: {
+      type: string;
+      event?: {
         type: string;
-        event?: {
-          type: string;
-          runId?: string;
-          taskId?: string;
-          payload?: Record<string, unknown>;
-        };
+        runId?: string;
+        taskId?: string;
+        payload?: Record<string, unknown>;
+        sessionId?: string;
       };
-      if (value.type === 'approvals.invalidated') {
-        void refresh();
-        return;
-      }
-      if (value.type !== 'event' || !value.event) return;
+    }): void => {
+      if (!value.event) return;
       const tuiEvent = toTuiEvent(value.event);
       if (tuiEvent) dispatch(tuiEvent);
       if (
         ['run.completed', 'run.failed', 'run.cancelled'].includes(value.event.type) ||
-        value.event.type.startsWith('approval.')
+        (value.event.type ?? '').startsWith('approval.')
       )
         void refresh();
     };
 
+    const parseSSEStream = async (response: Response): Promise<void> => {
+      if (!response.body) return;
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      try {
+        while (!stopped) {
+          const { value: chunk, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(chunk, { stream: true });
+          const lines = buffer.split('\n\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            const dataMatch = line.match(/^data: (.+)$/m);
+            if (!dataMatch) continue;
+            try {
+              const payload = JSON.parse(dataMatch[1]) as Parameters<typeof handleSSEData>[0];
+              handleSSEData(payload);
+            } catch {
+              // Skip malformed event
+            }
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    };
+
     const connect = (): void => {
       if (stopped) return;
-      const current = new WebSocket(
-        `${baseUrl.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}`,
-      );
-      socket = current;
-      current.onopen = () => {
-        if (stopped || socket !== current) return;
-        retry = 0;
-        setStatus('Connected');
-        dispatch({ type: 'connection.changed', status: 'connected' });
-        void refresh().finally(() => {
-          if (stopped || socket !== current || current.readyState !== WebSocket.OPEN) return;
-          current.send(
-            JSON.stringify({ type: 'subscribe', after: Number.MAX_SAFE_INTEGER, limit: 1 }),
-          );
-        });
-      };
-      current.onmessage = handleMessage;
-      current.onerror = () => current.close();
-      current.onclose = (event) => {
-        if (stopped || socket !== current) return;
-        const disposition = webSocketCloseDisposition(event.code, event.reason.toString());
-        const message = disposition.message ?? 'WebSocket disconnected';
-        setStatus(disposition.reconnect ? 'Reconnecting…' : 'Disconnected');
-        dispatch({ type: 'connection.changed', status: 'disconnected', error: message });
-        if (!disposition.reconnect) {
-          stopped = true;
-          setError(message);
-          if (approvalFallbackTimer) clearInterval(approvalFallbackTimer);
-          return;
+      const controller = new AbortController();
+      abortController = controller;
+      const streamUrl = `${baseUrl.replace(/^http/, 'http')}/api/agent/stream?token=${encodeURIComponent(token)}`;
+      isConnected = false;
+      void (async () => {
+        try {
+          const response = await fetch(streamUrl, {
+            headers: { Accept: 'text/event-stream' },
+            signal: controller.signal,
+          });
+          if (stopped) return;
+          if (!response.ok) {
+            throw new Error(`SSE HTTP ${response.status}`);
+          }
+          retry = 0;
+          isConnected = true;
+          setStatus('Connected');
+          dispatch({ type: 'connection.changed', status: 'connected' });
+          await parseSSEStream(response);
+        } catch (cause) {
+          if (stopped || controller.signal.aborted) return;
+          isConnected = false;
+          setStatus('Reconnecting…');
+          dispatch({
+            type: 'connection.changed',
+            status: 'disconnected',
+            error: cause instanceof Error ? cause.message : String(cause),
+          });
+          retry += 1;
+          reconnectTimer = setTimeout(connect, tuiReconnectDelayMs(retry));
         }
-        retry += 1;
-        reconnectTimer = setTimeout(connect, tuiReconnectDelayMs(retry));
-      };
+      })();
     };
 
     void refresh();
     connect();
     approvalFallbackTimer = setInterval(() => {
-      if (stopped || socket?.readyState === WebSocket.OPEN) return;
+      if (stopped || isConnected) return;
       void loadCatalog(baseUrl, token)
         .then((catalog) => {
-          if (!stopped && socket?.readyState !== WebSocket.OPEN) dispatch(catalog);
+          if (!stopped && !isConnected) dispatch(catalog);
         })
         .catch((cause: unknown) => {
           if (!stopped) setError(cause instanceof Error ? cause.message : String(cause));
@@ -401,7 +423,7 @@ export function Tui({ baseUrl, token }: TuiProps): React.JSX.Element {
       stopped = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (approvalFallbackTimer) clearInterval(approvalFallbackTimer);
-      socket?.close();
+      abortController?.abort();
     };
   }, [baseUrl, refresh, token]);
   useInput(

@@ -53,14 +53,3 @@ export async function parseApiResponse<T>(response: Response): Promise<T> {
     );
   return body;
 }
-
-export function webSocketCloseDisposition(
-  code: number,
-  reason: string,
-): { reconnect: boolean; message?: string } {
-  if (code !== 1008) return { reconnect: true };
-  return {
-    reconnect: false,
-    message: reason === 'AUTH_EXPIRED' ? AUTH_EXPIRED_MESSAGE : AUTH_REQUIRED_MESSAGE,
-  };
-}
