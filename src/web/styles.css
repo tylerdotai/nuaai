@@ -329,6 +329,22 @@ kbd {
   margin-right: 0.45rem;
 }
 
+.collapse-rail-btn {
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.85rem;
+  height: 32px;
+  width: 32px;
+}
+
+.collapse-rail-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
 .session-search input {
   background: var(--canvas);
   border: 1px solid var(--border);

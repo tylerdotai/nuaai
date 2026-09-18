@@ -1554,6 +1554,14 @@ function App(): React.JSX.Element {
                 >
                   New conversation
                 </button>
+                <button
+                  type="button"
+                  className="collapse-rail-btn"
+                  onClick={() => setSessionRailCollapsed(true)}
+                  title="Collapse sidebar"
+                >
+                  ☰
+                </button>
                 <label className="session-search">
                   <span className="sr-only">Search conversations</span>
                   <input
