@@ -559,6 +559,11 @@ kbd {
   width: 48px;
   min-width: 48px;
   overflow: visible;
+  padding: 0;
+}
+
+.app-frame.rail-collapsed {
+  grid-template-columns: 48px minmax(0, 1fr);
 }
 
 .session-rail.collapsed .rail-heading,

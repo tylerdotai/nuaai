@@ -1533,7 +1533,7 @@ function App(): React.JSX.Element {
         </div>
       </header>
 
-      <div className="app-frame">
+      <div className={`app-frame ${sessionRailCollapsed ? 'rail-collapsed' : ''}`}>
         <aside
           ref={sessionRailRef}
           className={`session-rail ${sessionRailCollapsed ? 'collapsed' : ''} ${sessionDrawerOpen ? 'open' : ''}`}
