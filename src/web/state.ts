@@ -55,6 +55,7 @@ export interface WebRunProjection {
   tools: WebToolActivity[];
   error?: string;
   startedAt?: number;
+  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
 }
 
 export interface WebRunSnapshotRecord {
@@ -350,6 +351,7 @@ export function projectRunEvents(
   let liveOutput = '';
   let error: string | undefined;
   let startedAt: number | undefined;
+  let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined;
   const tools = new Map<string, WebToolActivity>();
   for (const event of events) {
     if (event.runId !== selectedRunId) continue;
@@ -367,6 +369,8 @@ export function projectRunEvents(
     } else if (event.type === 'model.completed' && typeof event.payload.text === 'string') {
       status = 'running';
       liveOutput = event.payload.text;
+    } else if (event.type === 'model.usage') {
+      usage = event.payload.usage as typeof usage;
     } else if (event.type === 'tool.started') {
       status = 'action';
       const id = String(event.payload.id ?? event.id ?? tools.size);
@@ -424,5 +428,6 @@ export function projectRunEvents(
     tools: [...tools.values()],
     ...(error ? { error } : {}),
     ...(startedAt ? { startedAt } : {}),
+    ...(usage ? { usage } : {}),
   };
 }

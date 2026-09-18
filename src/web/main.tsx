@@ -884,7 +884,12 @@ function App(): React.JSX.Element {
     [activeRunId, messages],
   );
   const liveMessage = useMemo<MessageView | null>(() => {
-    if (!runProjection || terminalRunStates.has(runProjection.status)) return null;
+    if (!runProjection) return null;
+    const isTerminal = terminalRunStates.has(runProjection.status);
+    const completedMessageExists = messages.some(
+      (m) => m.role === 'assistant' && m.runId === runProjection.runId,
+    );
+    if (isTerminal && completedMessageExists) return null;
     const startedAt =
       threadEvents.find(
         (event) => event.runId === runProjection.runId && event.type === 'run.started',
@@ -896,11 +901,11 @@ function App(): React.JSX.Element {
       markdown: liveOutputByRun[runProjection.runId] ?? runProjection.liveOutput,
       createdAt: startedAt,
       ...(activeProvider ? { provider: activeProvider } : {}),
-      status: 'streaming',
+      status: isTerminal ? 'completed' : 'streaming',
       activities: [
         {
           runId: runProjection.runId,
-          status: 'streaming',
+          status: isTerminal ? 'completed' : 'streaming',
           startedAt,
           items: runProjection.tools.map((tool) => ({
             id: tool.id,
@@ -915,7 +920,7 @@ function App(): React.JSX.Element {
       attachments: [],
       artifacts: [],
     };
-  }, [activeProvider, liveOutputByRun, runProjection, threadEvents]);
+  }, [activeProvider, liveOutputByRun, messages, runProjection, threadEvents]);
 
   const createSession = async (): Promise<void> => {
     followNextOutput();

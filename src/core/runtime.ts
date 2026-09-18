@@ -2069,6 +2069,14 @@ export class AgentRuntime {
                 });
               else if (event.type === 'done' && !turnOutput.text && event.text)
                 appendModelText(event.text);
+              if (event.type === 'done' && event.usage) {
+                const usageEvent = event as {
+                  type: 'done';
+                  text: string;
+                  usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+                };
+                this.emit('model.usage', { turn, usage: usageEvent.usage }, eventContext);
+              }
             }
           }
         } catch (cause) {
