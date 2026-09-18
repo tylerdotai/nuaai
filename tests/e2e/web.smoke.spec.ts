@@ -175,7 +175,6 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await expect(toolResponse).toContainText('NUAAI deterministic test response', {
     timeout: 30_000,
   });
-  await toolResponse.getByRole('button', { name: 'Inspect run activity' }).click();
   await expect(toolResponse).toContainText('workspace.list');
   await expect(toolResponse.locator('[data-activity-id]')).toHaveCount(1);
 
