@@ -1965,7 +1965,7 @@ function App(): React.JSX.Element {
                         Start a conversation
                       </button>
                     </div>
-                  ) : transcript.length === 0 && !runProjection?.liveOutput ? (
+                  ) : transcript.length === 0 && !runProjection ? (
                     <div className="conversation-empty">
                       <span className="empty-mark" aria-hidden="true">
                         N
