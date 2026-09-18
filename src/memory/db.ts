@@ -859,6 +859,48 @@ export class DatabaseStore {
       .run(sourceKey, now, id);
   }
 
+  deleteThread(id: string): boolean {
+    const thread = this.getThread(id);
+    if (!thread) return false;
+    const tx = this.database.raw.transaction(() => {
+      this.database.raw.prepare('DELETE FROM messages WHERE thread_id = ?').run(id);
+      this.database.raw.prepare('DELETE FROM message_artifacts WHERE thread_id = ?').run(id);
+      this.database.raw.prepare('DELETE FROM threads WHERE id = ?').run(id);
+    });
+    return Boolean(tx());
+  }
+
+  deleteSession(id: string): boolean {
+    const session = this.getSession(id);
+    if (!session) return false;
+    const tx = this.database.raw.transaction(() => {
+      const threads = this.listThreads(id);
+      for (const thread of threads) {
+        this.database.raw.prepare('DELETE FROM messages WHERE thread_id = ?').run(thread.id);
+        this.database.raw
+          .prepare('DELETE FROM message_artifacts WHERE thread_id = ?')
+          .run(thread.id);
+        this.database.raw.prepare('DELETE FROM threads WHERE id = ?').run(thread.id);
+      }
+      this.database.raw.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+    });
+    return Boolean(tx());
+  }
+
+  renameSession(id: string, title: string, now = Date.now()): boolean {
+    const result = this.database.raw
+      .prepare('UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?')
+      .run(title, now, id);
+    return result.changes > 0;
+  }
+
+  renameThread(id: string, title: string, now = Date.now()): boolean {
+    const result = this.database.raw
+      .prepare('UPDATE threads SET title = ?, updated_at = ? WHERE id = ?')
+      .run(title, now, id);
+    return result.changes > 0;
+  }
+
   getThreadBySource(sourceKey: string): ThreadRow | undefined {
     return this.database.raw
       .prepare(
@@ -1935,6 +1977,10 @@ export class DatabaseStore {
         Date.now(),
         id,
       );
+  }
+  deleteSchedule(id: string): boolean {
+    const result = this.database.raw.prepare('DELETE FROM schedules WHERE id = ?').run(id);
+    return result.changes > 0;
   }
   upsertPlugin(plugin: Omit<PluginRow, 'updatedAt'>, now = Date.now()): void {
     this.database.raw

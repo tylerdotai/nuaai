@@ -112,6 +112,7 @@ function App(): React.JSX.Element {
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [plugins, setPlugins] = useState<PluginRecord[]>([]);
   const [pluginHealth, setPluginHealth] = useState<PluginHealth[]>([]);
@@ -1271,6 +1272,33 @@ function App(): React.JSX.Element {
     }
   };
 
+  const saveMemory = async (content: string): Promise<void> => {
+    setSaveStatus('saving');
+    try {
+      await request('/api/memory', {
+        method: 'POST',
+        body: JSON.stringify({ content }),
+      });
+      setSaveStatus('saved');
+      await loadSystem();
+      setTimeout(() => setSaveStatus('idle'), 2000);
+    } catch (cause) {
+      setSaveStatus('error');
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setTimeout(() => setSaveStatus('idle'), 3000);
+    }
+  };
+
+  const deleteMemory = async (id: string): Promise<void> => {
+    try {
+      await request(`/api/memory/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      setMemories((current) => current.filter((m) => m.id !== id));
+      setNotice('Memory deleted');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
   const scheduleAction = async (
     id: string,
     action: 'pause' | 'resume' | 'trigger',
@@ -1279,6 +1307,29 @@ function App(): React.JSX.Element {
       await request(`/api/schedules/${encodeURIComponent(id)}/${action}`, { method: 'POST' });
       await loadSystem();
       setNotice(action === 'trigger' ? 'Automation started' : `Automation ${action}d`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const deleteSchedule = async (id: string): Promise<void> => {
+    try {
+      await request(`/api/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await loadSystem();
+      setNotice('Automation deleted');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const updateSchedule = async (id: string, name: string, agentInput: string): Promise<void> => {
+    try {
+      await request(`/api/schedules/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name, agentInput }),
+      });
+      await loadSystem();
+      setNotice('Automation updated');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -1314,6 +1365,39 @@ function App(): React.JSX.Element {
       await request(`/api/plugins/${encodeURIComponent(name)}/unload`, { method: 'POST' });
       await loadSystem();
       setNotice(`${name} unloaded`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const enableSkill = async (name: string): Promise<void> => {
+    try {
+      await request(`/api/skills/${encodeURIComponent(name)}/enable`, { method: 'POST' });
+      await loadSystem();
+      setNotice(`${name} enabled`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const disableSkill = async (name: string): Promise<void> => {
+    try {
+      await request(`/api/skills/${encodeURIComponent(name)}/disable`, { method: 'POST' });
+      await loadSystem();
+      setNotice(`${name} disabled`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const configurePlugin = async (name: string, config: Record<string, unknown>): Promise<void> => {
+    try {
+      await request(`/api/plugins/${encodeURIComponent(name)}/config`, {
+        method: 'POST',
+        body: JSON.stringify({ config }),
+      });
+      await loadSystem();
+      setNotice(`${name} configured`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -1686,7 +1770,14 @@ function App(): React.JSX.Element {
             </section>
           )}
 
-          {view === 'memory' && <MemoryView memories={memories} />}
+          {view === 'memory' && (
+            <MemoryView
+              memories={memories}
+              onDelete={deleteMemory}
+              saveMemory={saveMemory}
+              saveStatus={saveStatus}
+            />
+          )}
 
           {view === 'automations' && (
             <AutomationsView
@@ -1698,6 +1789,8 @@ function App(): React.JSX.Element {
               onScheduleInput={setScheduleInput}
               onCreate={() => void createSchedule()}
               onAction={(id, action) => void scheduleAction(id, action)}
+              onDelete={deleteSchedule}
+              onUpdate={updateSchedule}
             />
           )}
 
@@ -1711,6 +1804,9 @@ function App(): React.JSX.Element {
               pluginHealth={pluginHealth}
               onSwitchProvider={(provider, model) => void switchProvider(provider, model)}
               onUnloadPlugin={(name) => void unloadPlugin(name)}
+              onEnableSkill={enableSkill}
+              onDisableSkill={disableSkill}
+              onConfigurePlugin={configurePlugin}
             />
           )}
         </main>

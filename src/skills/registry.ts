@@ -12,6 +12,7 @@ export interface Skill {
   triggers?: string[];
   body?: string;
   path?: string;
+  enabled?: boolean;
   input: z.ZodType<unknown>;
   execute(input: unknown): unknown | Promise<unknown>;
 }
@@ -25,6 +26,7 @@ export interface SkillSummary {
   compatibility?: string;
   triggers: string[];
   path?: string;
+  enabled?: boolean;
 }
 
 export interface LoadedSkill {
@@ -85,6 +87,7 @@ export class SkillRegistry {
         ...(skill.compatibility ? { compatibility: skill.compatibility } : {}),
         triggers: skillTriggers(skill),
         ...(skill.path ? { path: skill.path } : {}),
+        enabled: skill.enabled,
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -93,12 +96,25 @@ export class SkillRegistry {
     return this.skills.has(name);
   }
 
+  enable(name: string): void {
+    const skill = this.skills.get(name);
+    if (!skill) throw new Error(`Unknown skill: ${name}`);
+    this.skills.set(name, { ...skill, enabled: true });
+  }
+
+  disable(name: string): void {
+    const skill = this.skills.get(name);
+    if (!skill) throw new Error(`Unknown skill: ${name}`);
+    this.skills.set(name, { ...skill, enabled: false });
+  }
+
   get(name: string): Skill | undefined {
     return this.skills.get(name);
   }
 
   match(input: string, limit = 4): Skill[] {
     return [...this.skills.values()]
+      .filter((skill) => skill.enabled !== false)
       .map((skill) => {
         const triggers = skillTriggers(skill);
         const score =

@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { RefObject } from 'react';
 
 import type {
@@ -157,9 +158,35 @@ export function ApprovalInbox({
   );
 }
 
-export function MemoryView({ memories }: { memories: MemoryRecord[] }): React.JSX.Element {
+export function MemoryView({
+  memories,
+  onDelete,
+  saveMemory,
+  saveStatus,
+  isLoading,
+}: {
+  memories: MemoryRecord[];
+  onDelete?(id: string): void;
+  saveMemory?(content: string): void;
+  saveStatus?: 'idle' | 'saving' | 'saved' | 'error';
+  isLoading?: boolean;
+}): React.JSX.Element {
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; memoryId: string } | null>(
+    null,
+  );
+
+  const closeContextMenu = (): void => setContextMenu(null);
+
   return (
-    <section id="view-memory" className="secondary-view" role="tabpanel">
+    <section
+      id="view-memory"
+      className="secondary-view"
+      role="tabpanel"
+      onClick={closeContextMenu}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') closeContextMenu();
+      }}
+    >
       <div className="view-heading">
         <div>
           <span className="section-label">Explicit recall</span>
@@ -168,17 +195,69 @@ export function MemoryView({ memories }: { memories: MemoryRecord[] }): React.JS
         </div>
         <span className="count-chip">{memories.length} records</span>
       </div>
+      <form
+        className="memory-save-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          const form = e.currentTarget;
+          const input = form.elements.namedItem('memory-content') as HTMLTextAreaElement;
+          if (input?.value?.trim() && saveMemory) {
+            saveMemory(input.value.trim());
+            input.value = '';
+          }
+        }}
+      >
+        <textarea
+          name="memory-content"
+          placeholder="Save a note to remember across sessions..."
+          rows={2}
+          disabled={saveStatus === 'saving'}
+        />
+        <button type="submit" disabled={saveStatus === 'saving'}>
+          {saveStatus === 'saving' ? 'Saving...' : 'Save to memory'}
+        </button>
+        {saveStatus === 'saved' && <span className="save-confirm">Saved</span>}
+      </form>
       <div className="record-grid" aria-label="Memory records">
         {memories.length ? (
           memories.map((memory) => (
-            <article className="record-card memory-card" key={memory.id}>
+            <article
+              className="record-card memory-card"
+              key={memory.id}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setContextMenu({ x: e.clientX, y: e.clientY, memoryId: memory.id });
+              }}
+            >
               <div className="record-topline">
                 <span>{memory.hasEmbedding ? 'Indexed' : 'Text only'}</span>
                 <time>{relativeTime(memory.createdAt)}</time>
               </div>
               <p>{memory.content}</p>
+              {onDelete && (
+                <div className="card-actions">
+                  <button
+                    type="button"
+                    className="danger"
+                    title="Delete this memory"
+                    onClick={() => onDelete(memory.id)}
+                  >
+                    Delete
+                  </button>
+                </div>
+              )}
             </article>
           ))
+        ) : isLoading ? (
+          <div className="skeleton-list" aria-label="Loading memories">
+            {[1, 2, 3].map((i) => (
+              <div className="skeleton-card" key={i}>
+                <div className="skeleton-line skeleton-short" />
+                <div className="skeleton-line" />
+                <div className="skeleton-line skeleton-medium" />
+              </div>
+            ))}
+          </div>
         ) : (
           <div className="section-empty">
             <h2>No saved memory</h2>
@@ -186,6 +265,25 @@ export function MemoryView({ memories }: { memories: MemoryRecord[] }): React.JS
           </div>
         )}
       </div>
+      {contextMenu && (
+        <div
+          className="context-menu"
+          style={{ top: contextMenu.y, left: contextMenu.x }}
+          role="menu"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            className="danger"
+            onClick={() => {
+              onDelete?.(contextMenu.memoryId);
+              closeContextMenu();
+            }}
+          >
+            Delete memory
+          </button>
+        </div>
+      )}
     </section>
   );
 }
@@ -199,6 +297,8 @@ export function AutomationsView({
   onScheduleInput,
   onCreate,
   onAction,
+  onDelete,
+  onUpdate,
 }: {
   schedules: Schedule[];
   tasks: Task[];
@@ -208,7 +308,27 @@ export function AutomationsView({
   onScheduleInput(value: string): void;
   onCreate(): void;
   onAction(id: string, action: 'pause' | 'resume' | 'trigger'): void;
+  onDelete?(id: string): void;
+  onUpdate?(id: string, name: string, agentInput: string): void;
 }): React.JSX.Element {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editInput, setEditInput] = useState('');
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+
+  const startEdit = (id: string): void => {
+    const schedule = schedules.find((s) => s.id === id);
+    if (!schedule) return;
+    setEditingId(id);
+    setEditName(schedule.name);
+    setEditInput(schedule.agentInput);
+  };
+
+  const saveEdit = (): void => {
+    if (!editingId || !editName.trim() || !editInput.trim()) return;
+    onUpdate?.(editingId, editName.trim(), editInput.trim());
+    setEditingId(null);
+  };
   return (
     <section id="view-automations" className="secondary-view" role="tabpanel">
       <div className="view-heading">
@@ -261,6 +381,7 @@ export function AutomationsView({
               const recentTasks = tasks
                 .filter((task) => task.scheduleId === schedule.id)
                 .slice(0, 3);
+              const isEditing = editingId === schedule.id;
               return (
                 <article className="record-card automation-card" key={schedule.id}>
                   <div className="record-topline">
@@ -269,32 +390,101 @@ export function AutomationsView({
                     </span>
                     <span>{schedule.type}</span>
                   </div>
-                  <h2>{schedule.name}</h2>
-                  <p>{schedule.agentInput}</p>
-                  <div className="automation-meta">
-                    <span>Next: {relativeTime(schedule.nextRunAt)}</span>
-                    <span>Attempts: {schedule.policy.maxAttempts}</span>
-                  </div>
-                  {recentTasks.length > 0 && (
-                    <div className="task-chips">
-                      {recentTasks.map((task) => (
-                        <span className={`task-chip task-${task.status}`} key={task.id}>
-                          {task.status}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                  <div className="card-actions">
-                    <button type="button" onClick={() => onAction(schedule.id, 'trigger')}>
-                      Run now
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onAction(schedule.id, schedule.enabled ? 'pause' : 'resume')}
+                  {isEditing ? (
+                    <form
+                      className="edit-schedule-form"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        saveEdit();
+                      }}
                     >
-                      {schedule.enabled ? 'Pause' : 'Resume'}
-                    </button>
-                  </div>
+                      <input
+                        aria-label="Edit name"
+                        value={editName}
+                        onChange={(e) => setEditName(e.target.value)}
+                      />
+                      <textarea
+                        aria-label="Edit instruction"
+                        value={editInput}
+                        onChange={(e) => setEditInput(e.target.value)}
+                      />
+                      <div className="card-actions">
+                        <button type="submit">Save</button>
+                        <button type="button" className="danger" onClick={() => setEditingId(null)}>
+                          Cancel
+                        </button>
+                      </div>
+                    </form>
+                  ) : (
+                    <>
+                      <h2>{schedule.name}</h2>
+                      <p>{schedule.agentInput}</p>
+                      <div className="automation-meta">
+                        <span>Next: {relativeTime(schedule.nextRunAt)}</span>
+                        <span>Attempts: {schedule.policy.maxAttempts}</span>
+                      </div>
+                      {recentTasks.length > 0 && (
+                        <div className="task-chips">
+                          {recentTasks.map((task) => (
+                            <button
+                              type="button"
+                              className={`task-chip task-${task.status}`}
+                              key={task.id}
+                              title="View task details"
+                              onClick={() =>
+                                setSelectedTaskId(selectedTaskId === task.id ? null : task.id)
+                              }
+                            >
+                              {task.status}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      {selectedTaskId && (
+                        <TaskDetail
+                          task={tasks.find((t) => t.id === selectedTaskId)}
+                          onClose={() => setSelectedTaskId(null)}
+                        />
+                      )}
+                      <div className="card-actions">
+                        <button
+                          type="button"
+                          title="Trigger this automation now"
+                          onClick={() => onAction(schedule.id, 'trigger')}
+                        >
+                          Run now
+                        </button>
+                        <button
+                          type="button"
+                          title={
+                            schedule.enabled ? 'Pause this automation' : 'Resume this automation'
+                          }
+                          onClick={() =>
+                            onAction(schedule.id, schedule.enabled ? 'pause' : 'resume')
+                          }
+                        >
+                          {schedule.enabled ? 'Pause' : 'Resume'}
+                        </button>
+                        <button
+                          type="button"
+                          title="Edit automation name and instruction"
+                          onClick={() => startEdit(schedule.id)}
+                        >
+                          Edit
+                        </button>
+                        {onDelete && (
+                          <button
+                            type="button"
+                            className="danger"
+                            title="Delete this automation"
+                            onClick={() => onDelete(schedule.id)}
+                          >
+                            Delete
+                          </button>
+                        )}
+                      </div>
+                    </>
+                  )}
                 </article>
               );
             })
@@ -340,6 +530,9 @@ export function SystemView({
   pluginHealth,
   onSwitchProvider,
   onUnloadPlugin,
+  onEnableSkill,
+  onDisableSkill,
+  onConfigurePlugin,
 }: {
   connection: ConnectionState;
   activeProvider: ActiveProvider | null;
@@ -349,7 +542,12 @@ export function SystemView({
   pluginHealth: PluginHealth[];
   onSwitchProvider(provider: string, model: string): void;
   onUnloadPlugin(name: string): void;
+  onEnableSkill?(name: string): void;
+  onDisableSkill?(name: string): void;
+  onConfigurePlugin?(name: string, config: Record<string, unknown>): void;
 }): React.JSX.Element {
+  const [configuringPlugin, setConfiguringPlugin] = useState<string | null>(null);
+  const [configText, setConfigText] = useState('');
   return (
     <section id="view-system" className="secondary-view" role="tabpanel">
       <div className="view-heading">
@@ -419,6 +617,27 @@ export function SystemView({
                     </small>
                   </div>
                   <p>{skill.description}</p>
+                  {(onEnableSkill || onDisableSkill) && (
+                    <div className="card-actions">
+                      {skill.enabled === false ? (
+                        <button
+                          type="button"
+                          title="Enable this skill"
+                          onClick={() => onEnableSkill?.(skill.name)}
+                        >
+                          Enable
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          title="Disable this skill"
+                          onClick={() => onDisableSkill?.(skill.name)}
+                        >
+                          Disable
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </article>
               ))
             ) : (
@@ -435,6 +654,7 @@ export function SystemView({
             {plugins.length ? (
               plugins.map((plugin) => {
                 const health = pluginHealth.find((item) => item.name === plugin.name);
+                const isConfiguring = configuringPlugin === plugin.name;
                 return (
                   <article key={plugin.name}>
                     <div>
@@ -444,13 +664,61 @@ export function SystemView({
                       </small>
                     </div>
                     <p>{plugin.capabilities.join(', ') || 'No declared capabilities'}</p>
-                    <button
-                      type="button"
-                      className="text-button danger-text"
-                      onClick={() => onUnloadPlugin(plugin.name)}
-                    >
-                      Unload
-                    </button>
+                    {isConfiguring ? (
+                      <form
+                        className="plugin-config-form"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          try {
+                            const parsed = JSON.parse(configText);
+                            onConfigurePlugin?.(plugin.name, parsed);
+                            setConfiguringPlugin(null);
+                          } catch {
+                            // invalid JSON, ignore
+                          }
+                        }}
+                      >
+                        <textarea
+                          aria-label="Plugin config (JSON)"
+                          value={configText}
+                          onChange={(e) => setConfigText(e.target.value)}
+                          placeholder='{"key": "value"}'
+                        />
+                        <div className="card-actions">
+                          <button type="submit">Save</button>
+                          <button type="button" onClick={() => setConfiguringPlugin(null)}>
+                            Cancel
+                          </button>
+                        </div>
+                      </form>
+                    ) : (
+                      <div className="card-actions">
+                        {plugin.config && Object.keys(plugin.config).length > 0 && (
+                          <small className="config-preview">
+                            {Object.keys(plugin.config).join(', ')}
+                          </small>
+                        )}
+                        <button
+                          type="button"
+                          title="Configure plugin"
+                          onClick={() => {
+                            setConfiguringPlugin(plugin.name);
+                            setConfigText(
+                              plugin.config ? JSON.stringify(plugin.config, null, 2) : '{}',
+                            );
+                          }}
+                        >
+                          Configure
+                        </button>
+                        <button
+                          type="button"
+                          className="text-button danger-text"
+                          onClick={() => onUnloadPlugin(plugin.name)}
+                        >
+                          Unload
+                        </button>
+                      </div>
+                    )}
                   </article>
                 );
               })
@@ -490,6 +758,57 @@ export function ErrorToast({
         ×
       </button>
     </div>
+  );
+}
+
+export function TaskDetail({
+  task,
+  onClose,
+}: {
+  task?: Task;
+  onClose(): void;
+}): React.JSX.Element | null {
+  if (!task) return null;
+  return (
+    <section className="task-detail" aria-label="Task details">
+      <div className="task-detail-header">
+        <h3>Task {task.kind}</h3>
+        <button
+          type="button"
+          className="icon-button"
+          aria-label="Close task details"
+          onClick={onClose}
+        >
+          ×
+        </button>
+      </div>
+      <dl>
+        <div>
+          <dt>Status</dt>
+          <dd>
+            <span className={`task-chip task-${task.status}`}>{task.status}</span>
+          </dd>
+        </div>
+        <div>
+          <dt>Updated</dt>
+          <dd>{relativeTime(task.updatedAt)}</dd>
+        </div>
+        {task.scheduleId && (
+          <div>
+            <dt>Schedule</dt>
+            <dd>{task.scheduleId}</dd>
+          </div>
+        )}
+        {task.payload && Object.keys(task.payload).length > 0 && (
+          <div>
+            <dt>Payload</dt>
+            <dd>
+              <pre>{JSON.stringify(task.payload, null, 2)}</pre>
+            </dd>
+          </div>
+        )}
+      </dl>
+    </section>
   );
 }
 

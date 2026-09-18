@@ -114,28 +114,6 @@ export interface ApprovalRequest {
   };
 }
 
-export interface ApprovalRequest {
-  id: string;
-  runId: string;
-  threadId: string;
-  toolName: string;
-  status: 'pending' | 'approved' | 'denied' | 'expired' | 'executed' | 'failed';
-  payloadHash: string;
-  target: string;
-  risk: string;
-  providerOwned: boolean;
-  createdAt: number;
-  expiresAt: number;
-  decidedAt?: number;
-  execution?: {
-    startedAt?: number;
-    completedAt?: number;
-    resultHash?: string;
-    resultPreview?: string;
-    error?: string;
-  };
-}
-
 export interface MessageView {
   id: string;
   runId?: string;
@@ -194,8 +172,10 @@ export interface MemoryRecord {
 export interface SkillRecord {
   name: string;
   description: string;
-  version: string;
-  source: string;
+  version?: string;
+  source?: string;
+  triggers: string[];
+  enabled?: boolean;
 }
 
 export interface PluginRecord {
@@ -204,6 +184,7 @@ export interface PluginRecord {
   apiVersion: string;
   capabilities: string[];
   trusted: boolean;
+  config?: Record<string, unknown>;
 }
 
 export interface PluginHealth {

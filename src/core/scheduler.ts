@@ -221,6 +221,12 @@ export class Scheduler {
     });
     this.onEvent('schedule.updated', { enabled: true }, { taskId: id });
   }
+  deleteSchedule(id: string): void {
+    const schedule = this.list().find((entry) => entry.id === id);
+    if (!schedule) throw new Error(`Unknown schedule: ${id}`);
+    this.store.deleteSchedule(id);
+    this.running.delete(id);
+  }
 
   listTasks() {
     return this.store.listTasks();

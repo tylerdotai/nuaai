@@ -1061,6 +1061,18 @@ export class AgentRuntime {
     }
     return this.createThread(sessionId, title ?? 'New thread', sourceKey);
   }
+  deleteThread(threadId: string): boolean {
+    return this.options.store.deleteThread(threadId);
+  }
+  deleteSession(sessionId: string): boolean {
+    return this.options.store.deleteSession(sessionId);
+  }
+  renameThread(threadId: string, title: string): boolean {
+    return this.options.store.renameThread(threadId, title);
+  }
+  renameSession(sessionId: string, title: string): boolean {
+    return this.options.store.renameSession(sessionId, title);
+  }
   listMessages(threadId: string) {
     return this.options.store.listMessages(threadId);
   }

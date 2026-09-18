@@ -335,6 +335,30 @@ export function createApp(services: GatewayServices): Hono {
       ? context.json({ session, threads: services.runtime.listThreads(session.id), active: true })
       : context.json({ error: 'Session not found' }, 404);
   });
+  app.put('/api/sessions/:id', (context) => {
+    const { title } = context.req.query();
+    if (typeof title !== 'string' || !title.trim()) {
+      return context.json({ error: 'title is required' }, 400);
+    }
+    const updated = services.runtime.renameSession(context.req.param('id'), title.trim());
+    return updated ? context.json({ ok: true }) : context.json({ error: 'Session not found' }, 404);
+  });
+  app.delete('/api/sessions/:id', (context) => {
+    const deleted = services.runtime.deleteSession(context.req.param('id'));
+    return deleted ? context.json({ ok: true }) : context.json({ error: 'Session not found' }, 404);
+  });
+  app.put('/api/threads/:id', (context) => {
+    const { title } = context.req.query();
+    if (typeof title !== 'string' || !title.trim()) {
+      return context.json({ error: 'title is required' }, 400);
+    }
+    const updated = services.runtime.renameThread(context.req.param('id'), title.trim());
+    return updated ? context.json({ ok: true }) : context.json({ error: 'Thread not found' }, 404);
+  });
+  app.delete('/api/threads/:id', (context) => {
+    const deleted = services.runtime.deleteThread(context.req.param('id'));
+    return deleted ? context.json({ ok: true }) : context.json({ error: 'Thread not found' }, 404);
+  });
   app.get('/api/threads/:id/messages', (context) =>
     context.json({ messages: services.runtime.listMessages(context.req.param('id')) }),
   );
@@ -543,6 +567,35 @@ export function createApp(services: GatewayServices): Hono {
         .map(({ embedding, ...memory }) => ({ ...memory, hasEmbedding: Boolean(embedding) })),
     }),
   );
+  app.post('/api/memory', async (context) => {
+    try {
+      const { content, metadata } = await context.req.json();
+      if (typeof content !== 'string' || !content.trim()) {
+        return context.json({ error: 'content is required' }, 400);
+      }
+      let embedding: number[] | null = null;
+      try {
+        embedding = services.providers
+          ? await services.providers.get('ollama').embed(content)
+          : null;
+      } catch {
+        // embedding unavailable - store lexically only
+      }
+      const id = randomUUID();
+      services.store.storeMemory(id, content.trim(), embedding, metadata ?? {});
+      return context.json({ id, hasEmbedding: Boolean(embedding) }, 201);
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+  app.delete('/api/memory/:id', (context) => {
+    try {
+      const deleted = services.store.deleteMemory(context.req.param('id'));
+      return deleted ? context.json({ ok: true }) : context.json({ error: 'Not found' }, 404);
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
   app.get('/api/schedules', (context) => context.json({ schedules: services.scheduler.list() }));
   app.get('/api/tasks', (context) => context.json({ tasks: services.scheduler.listTasks() }));
   app.post('/api/tasks/:id/cancel', (context) => {
@@ -593,7 +646,43 @@ export function createApp(services: GatewayServices): Hono {
       return context.json({ error: error instanceof Error ? error.message : String(error) }, 404);
     }
   });
+  app.delete('/api/schedules/:id', (context) => {
+    try {
+      services.scheduler.deleteSchedule(context.req.param('id'));
+      return context.json({ ok: true });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 404);
+    }
+  });
+  app.put('/api/schedules/:id', async (context) => {
+    try {
+      const body = await context.req.json();
+      const updated = services.scheduler.update(context.req.param('id'), {
+        name: body.name,
+        agentInput: body.agentInput,
+      });
+      return context.json(updated);
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 404);
+    }
+  });
   app.get('/api/skills', (context) => context.json({ skills: services.skills.list() }));
+  app.post('/api/skills/:name/enable', (context) => {
+    try {
+      services.skills.enable(context.req.param('name'));
+      return context.json({ ok: true });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 404);
+    }
+  });
+  app.post('/api/skills/:name/disable', (context) => {
+    try {
+      services.skills.disable(context.req.param('name'));
+      return context.json({ ok: true });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 404);
+    }
+  });
   app.get('/api/plugins', (context) =>
     context.json({ plugins: services.plugins.list(), health: services.plugins.health() }),
   );

@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useMemo, useState } from 'react';
+import { type RefObject, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   type ComposerCommand,
@@ -58,6 +58,8 @@ export function AgentComposer({
 }): React.JSX.Element {
   const [focused, setFocused] = useState(false);
   const [followupMode, setFollowupMode] = useState<'next' | 'interrupt'>('next');
+  const [attachments, setAttachments] = useState<Array<File & { id: string }>>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const action = composerAction({ input, activeRunId });
   const capabilities = capabilitySummary(permissionProfile);
   const modelOptions = useMemo(() => {
@@ -125,6 +127,41 @@ export function AgentComposer({
           ))}
         </div>
       )}
+
+      {attachments.length > 0 && (
+        <div className="composer-attachments" aria-label="Attachments">
+          {attachments.map((file) => (
+            <span className="attachment-chip" key={file.id}>
+              {file.name}
+              <button
+                type="button"
+                aria-label={`Remove ${file.name}`}
+                onClick={() => setAttachments((current) => current.filter((f) => f.id !== file.id))}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="sr-only"
+        tabIndex={-1}
+        onChange={(event) => {
+          const files = Array.from(event.target.files ?? []);
+          if (files.length) {
+            setAttachments((current) => [
+              ...current,
+              ...files.map((f) => Object.assign(f, { id: crypto.randomUUID() })),
+            ]);
+            event.target.value = '';
+          }
+        }}
+      />
 
       {commandSuggestions.length > 0 && (
         <div className="composer-commands" aria-label="Slash commands">
@@ -243,6 +280,15 @@ export function AgentComposer({
           </details>
         </div>
         <div className="composer-utilities">
+          <button
+            type="button"
+            className="composer-attach"
+            aria-label="Attach files"
+            title="Attach files"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            📎
+          </button>
           <span className={`composer-hint ${focused ? 'visible' : ''}`}>
             Enter to send · Shift+Enter for line break
           </span>
