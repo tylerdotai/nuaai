@@ -19,6 +19,7 @@ import type { SkillRegistry } from '../skills/registry.js';
 import {
   type ToolBudget,
   ToolBudgetError,
+  type ToolDescription,
   type ToolRegistry,
   createToolBudget,
 } from '../tools/registry.js';
@@ -1232,6 +1233,14 @@ export class AgentRuntime {
 
   async providerHealth() {
     return this.options.providers.health();
+  }
+
+  listTools(): ToolDescription[] {
+    return this.options.tools.listTools();
+  }
+
+  getTool(name: string): ToolDescription | null {
+    return this.options.tools.getTool(name);
   }
   status(): {
     activeRuns: number;

@@ -331,6 +331,11 @@ export function createApp(services: GatewayServices): Hono {
       );
     }
   });
+  app.get('/api/tools', (context) => context.json({ tools: services.runtime.listTools() }));
+  app.get('/api/tools/:name', (context) => {
+    const tool = services.runtime.getTool(context.req.param('name'));
+    return tool ? context.json({ tool }) : context.json({ error: 'Tool not found' }, 404);
+  });
   app.get('/api/sessions', (context) =>
     context.json({
       sessions: services.runtime.listSessions(context.req.query('includeOrphans') === 'true'),
