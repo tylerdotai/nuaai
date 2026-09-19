@@ -112,5 +112,8 @@
     "esbuild@0.27.7": true,
     "esbuild@0.23.1": true,
     "esbuild@0.28.2": true
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }
