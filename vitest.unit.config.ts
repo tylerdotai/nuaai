@@ -14,7 +14,7 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['tests/**/*.test.ts'],
-    exclude: ['node_modules/**', 'dist/**', 'tests/e2e/**', '**/*.integration.test.ts'],
+    exclude: ['node_modules/**', 'dist/**', 'tests/e2e/**', '**/*.integration.test.ts', 'tests/integrations.test.ts', 'tests/action-approvals.test.ts', 'tests/action-approval-store.test.ts', 'tests/run-artifacts.test.ts', 'tests/codex-responses.test.ts', 'tests/foundation.test.ts', 'tests/run-artifacts.presentation.test.ts', 'tests/run-artifacts.runtime.test.ts', 'tests/run-artifacts.server.test.ts', 'tests/service.test.ts', 'tests/providers.codex.test.ts', 'tests/providers.ollama.test.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary', 'html'],

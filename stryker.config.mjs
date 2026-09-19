@@ -1,7 +1,6 @@
 /** @type {import('@stryker-mutator/core').PartialStrykerOptions} */
 export default {
   packageManager: 'npm',
-  runners: ['vitest'],
   testRunner: 'vitest',
   // Mutation testing the entire `src/` tree on every CI run would burn the
   // budget on presentation code and entry points. Limit mutation to the
@@ -45,12 +44,11 @@ export default {
   },
   // Keep reporters minimal in CI; the JSON reporter is consumed by the
   // stryker dashboard if it is wired up later.
-  reporters: ['progress', 'clear-text-text', 'json'],
+  reporters: ['progress', 'clear-text', 'json'],
   jsonReporter: { fileName: 'reports/mutation/mutation.json' },
   clearTextReporter: {
     fileName: 'reports/mutation/mutation.txt',
-    reportTypes: ['text', 'html'],
+    reportType: 'text',
   },
   htmlReporter: { fileName: 'reports/mutation/mutation.html' },
-  reportFile: 'reports/mutation',
 };

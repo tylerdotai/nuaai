@@ -43,7 +43,7 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:e2e": "npm run build:release && node scripts/run-e2e.mjs",
     "test:coverage": "vitest run --coverage",
-    "test:mutate": "stryker run --configFile stryker.config.mjs",
+    "test:mutate": "stryker run stryker.config.mjs",
     "audit:dependencies": "npm audit --audit-level=moderate",
     "package:smoke": "node scripts/package-smoke.mjs",
     "version:check": "node scripts/check-version.mjs",
