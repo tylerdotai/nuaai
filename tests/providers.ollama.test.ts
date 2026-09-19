@@ -366,4 +366,125 @@ describe('OllamaProvider contract', () => {
     }
     expect(events).toEqual([{ type: 'delta' }, { type: 'done' }]);
   });
+
+  it('aggregates native Ollama streaming tool calls split across multiple chunks', async () => {
+    const jsonLines = [
+      JSON.stringify({
+        message: {
+          tool_calls: [
+            { id: 'call-1', function: { name: 'workspace.read', arguments: '{"path":' } },
+          ],
+        },
+      }),
+      JSON.stringify({
+        message: {
+          tool_calls: [
+            { id: 'call-1', function: { name: 'workspace.read', arguments: ' "README.md"}' } },
+          ],
+        },
+      }),
+      JSON.stringify({ message: { done: true } }),
+    ];
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const line of jsonLines) {
+          controller.enqueue(encoder.encode(`${line}\n`));
+        }
+        controller.close();
+      },
+    });
+    fetchMock.mockResolvedValueOnce(
+      new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/x-ndjson' },
+      }),
+    );
+
+    const provider = makeProvider();
+    const events: Array<{ type: string; name?: string; arguments?: Record<string, unknown> }> = [];
+    for await (const event of provider.stream({
+      model: 'llama-test',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) {
+      if (event.type === 'tool_call') {
+        events.push({ type: event.type, name: event.name, arguments: event.arguments });
+      } else {
+        events.push({ type: event.type });
+      }
+    }
+    expect(events).toEqual([
+      { type: 'tool_call', name: 'workspace.read', arguments: { path: 'README.md' } },
+      { type: 'done' },
+    ]);
+  });
+
+  it('throws when a native Ollama stream reports an error chunk', async () => {
+    const chunks = [{ error: 'model is unavailable' }, { done: true }];
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(`${JSON.stringify(chunk)}\n`));
+        }
+        controller.close();
+      },
+    });
+    fetchMock.mockResolvedValueOnce(
+      new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/x-ndjson' },
+      }),
+    );
+
+    const provider = makeProvider();
+    await expect(async () => {
+      for await (const _event of provider.stream({
+        model: 'llama-test',
+        messages: [{ role: 'user', content: 'hi' }],
+      })) {
+        // drain
+      }
+    }).rejects.toThrow(/Ollama error: model is unavailable/);
+  });
+
+  it('emits a final tool_call for any tool calls collected across the stream', async () => {
+    const jsonLines = [
+      JSON.stringify({
+        message: {
+          tool_calls: [{ id: 'call-1', function: { name: 'workspace.list', arguments: {} } }],
+        },
+      }),
+      JSON.stringify({ message: { done: true } }),
+    ];
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const line of jsonLines) {
+          controller.enqueue(encoder.encode(`${line}\n`));
+        }
+        controller.close();
+      },
+    });
+    fetchMock.mockResolvedValueOnce(
+      new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/x-ndjson' },
+      }),
+    );
+
+    const provider = makeProvider();
+    const events: Array<{ type: string; name?: string }> = [];
+    for await (const event of provider.stream({
+      model: 'llama-test',
+      messages: [{ role: 'user', content: 'hi' }],
+    })) {
+      if (event.type === 'tool_call') {
+        events.push({ type: event.type, name: event.name });
+      } else {
+        events.push({ type: event.type });
+      }
+    }
+    expect(events).toEqual([{ type: 'tool_call', name: 'workspace.list' }, { type: 'done' }]);
+  });
 });
