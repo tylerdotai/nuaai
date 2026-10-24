@@ -68,7 +68,7 @@ E2E suites:
 | Unit | vitest | `tests/**/*.test.ts` excluding `*.integration.test.ts` | Every push |
 | Integration | vitest | `tests/**/*.integration.test.ts` | Every PR |
 | End-to-end | Playwright | `tests/e2e/*.spec.ts` | Every PR and merge to main |
-| Mutation | Stryker (vitest runner) | critical paths only | Every PR and merge to main |
+| Mutation | Stryker (vitest runner) | critical paths only | Full nightly/manual audit; focused checks for critical changes |
 
 ### Unit tier
 
@@ -117,9 +117,12 @@ suite must reach an overall mutation score of at least 60%
 high-score target (`thresholds.high`). These are overall thresholds, not
 per-file enforcement; per-file reports still guide critical-path review.
 
-The mutation suite is slow and runs on every PR; it is not a gate on
-every commit. A regression in the mutation score is treated as a
-critical-path defect, not a flake.
+The full mutation suite is a nightly/manual test-quality audit, not a PR
+merge gate. Ordinary tests, coverage, security scans, builds and browser/package/
+terminal checks remain blocking. For critical changes, reviewers use bounded,
+focused mutation checks on the affected modules or ranges and record their scope.
+A demonstrated surviving security/authority defect still requires a fix; moving
+the broad audit off PR CI does not make such defects acceptable.
 
 ## What a test must look like
 
@@ -214,17 +217,25 @@ mutant means the test suite did not detect the injected fault.
 To run mutation testing locally:
 
 ```sh
-npm run test:mutate
+npm run test:mutate                                      # full configured audit
+npm run test:mutate -- --mutate src/core/approvals.ts --concurrency 2 # focused module
 ```
 
-Reports are written to `reports/mutation/`. Upload the JSON file to
-`https://dashboard.stryker-mutator.io/` for trend tracking.
+Reports are written to `reports/mutation/`. The separate
+`.github/workflows/mutation.yml` runs the unchanged full critical-path scope
+nightly at 06:00 UTC on the default branch, or on manual dispatch. Its optional
+`mutate` input explicitly selects files/ranges for a focused manual audit; a
+focused result must never be labeled a full-scope pass. The workflow uses two
+workers and a finite six-hour wall budget. A budget expiry is incomplete evidence,
+not a passing score; available reports and Actions logs retain failures.
 
-The mutation job runs on every PR and main push after integration succeeds.
-Its configured break threshold is 60% overall. No automatic historical
-5% regression comparison is configured; reviewers must inspect changes in
-mutation results. The quality job does not declare a dependency on mutation,
-so a passing quality job alone is not evidence of a passing mutation job.
+The score break threshold remains **60% overall**, with an **80% target**; scope,
+operators and thresholds in `stryker.config.mjs` are unchanged. The audit job
+fails normally on errors or a low score (no `continue-on-error`), but is not a
+PR-triggered check and does not block the ordinary quality pipeline. No historical
+5% regression comparison is configured. Review audit failures as test-quality
+findings, retaining exact revision, scope, resource profile and incomplete work.
+Do not hand-edit reports or reuse stale source/test/helper results as acceptance.
 
 ## How to run each tier
 
@@ -234,7 +245,7 @@ npm run test:unit       # unit only — runs in seconds, run on every commit
 npm run test:integration # integration only — runs in under a minute
 npm run test:e2e         # Playwright against a real daemon
 npm run test:coverage   # unit + integration with v8 coverage gate
-npm run test:mutate      # Stryker against critical paths
+npm run test:mutate      # full nightly/manual audit; use --mutate for focused checks
 npm run gate             # full release gate (version, lint, coverage, e2e, package smoke, audit)
 ```
 
@@ -248,12 +259,17 @@ npm run gate             # full release gate (version, lint, coverage, e2e, pack
 | `unit` | every push | Unit suite + coverage gate |
 | `integration` | PR + main | Integration suite, then combined per-file coverage |
 | `e2e` | PR + main | Playwright against the production bundle |
-| `mutation` | PR + main | Stryker against critical paths |
 | `quality` | PR + main | Release gate (version, gate, diff hygiene, npm pack on tags) |
 
-Jobs are wired with `needs:` so a failure in any earlier stage blocks
-the downstream gate. `concurrency.cancel-in-progress: true` aborts
-in-flight runs when a new commit lands.
+The separate `mutation.yml` workflow runs the full mutation audit nightly/manual
+only; it is not part of PR merge-blocking CI. Manual focused audits use the same
+configuration with an explicitly recorded selector. It preserves real failure
+conclusions and uploads available evidence even on failure.
+
+Ordinary CI jobs are wired with `needs:` so a failure in an earlier stage blocks
+the downstream quality gate. Its `concurrency.cancel-in-progress: true` aborts
+obsolete PR runs when a new commit lands. Mutation audit concurrency is separate
+and does not cancel an active audit for each PR update.
 
 ## Policy on flaky tests
 
@@ -284,8 +300,10 @@ without any code change. Flakiness is a defect, not a fact of life:
 4. Write the failing assertion first. If the test passes on the
    first run, you have not tested anything.
 5. Run `npm run test:unit` and confirm the suite still passes.
-6. If the new test is on a critical path, run `npm run test:mutate`
-   locally and confirm the mutation score holds.
+6. If the new test is on a critical path, run a bounded focused check such as
+   `npm run test:mutate -- --mutate src/core/approvals.ts --concurrency 2`.
+   Record the exact module/range, score and any incomplete work. Leave full-scope
+   auditing to the nightly/manual workflow; do not claim a focused pass covers it.
 
 ## Policy on new source files
 

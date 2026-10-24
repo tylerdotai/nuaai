@@ -1,0 +1,79 @@
+name: Mutation audit
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      mutate:
+        description: 'Optional Stryker file/range selectors for a focused audit; empty runs the full configured scope'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nuaai-mutation-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Mutation audit (not a PR gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run full or explicitly focused mutation audit
+        id: mutation
+        shell: bash
+        env:
+          MUTATE_TARGETS: ${{ inputs.mutate || '' }}
+        run: |
+          if [[ -n "$MUTATE_TARGETS" ]]; then
+            echo 'Running an explicitly focused audit; this is not a full-scope score.'
+            npm run test:mutate -- --concurrency 2 --mutate "$MUTATE_TARGETS"
+          else
+            npm run test:mutate -- --concurrency 2
+          fi
+
+      - name: Record audit scope and outcome
+        if: always()
+        env:
+          MUTATE_TARGETS: ${{ inputs.mutate || '' }}
+          MUTATION_OUTCOME: ${{ steps.mutation.outcome }}
+        run: |
+          {
+            echo '## Mutation audit'
+            printf 'Revision: `%s`\n\n' "$GITHUB_SHA"
+            if [[ -n "$MUTATE_TARGETS" ]]; then
+              echo 'Scope: explicitly focused selectors (not full-scope acceptance).'
+            else
+              echo 'Scope: unchanged full critical-path configuration.'
+            fi
+            printf '\nStep outcome: %s\n\n' "$MUTATION_OUTCOME"
+            echo 'A cancelled, failed or timed-out audit is not a passing score. Inspect logs and artifacts.'
+            echo 'This audit is separate from blocking PR quality/security checks.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload mutation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-audit-${{ github.run_id }}
+          path: reports/mutation/
+          if-no-files-found: warn

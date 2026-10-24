@@ -2,12 +2,9 @@
 export default {
   packageManager: 'npm',
   testRunner: 'vitest',
-  // Mutation testing the entire `src/` tree on every CI run would burn the
-  // budget on presentation code and entry points. Limit mutation to the
-  // critical paths documented in TESTING.md (security, providers, tool
-  // registry, approvals, database, artifact storage, integrations). This
-  // catches the meaningful behavioural bugs while keeping mutation runtime
-  // under a few minutes on CI.
+  // Full critical-path mutation is a nightly/manual audit, not a PR gate.
+  // Keep its complete scope here; bounded focused review checks may select
+  // explicit modules/ranges with --mutate without claiming a full audit pass.
   mutate: [
     'src/gateway/**/*.ts',
     'src/security/**/*.ts',
@@ -27,9 +24,8 @@ export default {
   vitest: {
     configFile: 'vitest.unit.config.ts',
   },
-  // Report a per-file mutation score; fail the build if any critical file
-  // drops below 60% killed. The mutation score is the percentage of mutants
-  // killed by the test suite; higher means the suite catches injected bugs.
+  // These are overall audit thresholds, not per-file enforcement.
+  // A score below 60% fails the audit; 80% remains the high-score target.
   thresholds: {
     high: 80,
     low: 60,

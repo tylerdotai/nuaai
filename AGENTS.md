@@ -30,7 +30,8 @@ Read `TESTING.md` for the testing strategy. The summary:
 - Integration tier: `npm run test:integration` — real SQLite, real HTTP, runs on every PR
 - End-to-end tier: `npm run test:e2e` — Playwright against a real daemon, runs on every PR and merge to main
 - Coverage with the 80% per-file floor on critical paths: `npm run test:coverage`
-- Mutation testing on critical paths: `npm run test:mutate`
+- Full mutation audit (nightly/manual, not a PR merge gate): `npm run test:mutate`
+- For critical changes, run bounded focused mutation checks, for example `npm run test:mutate -- --mutate src/core/approvals.ts --concurrency 2`; record exact scope and incomplete work honestly.
 - Complete local gate: `npm run gate`
 - Focus a test: `npx vitest run -t "<test name>"`
 - Run the relevant focused tests after each source change, then rerun the complete gate after the final cross-cutting edit.
