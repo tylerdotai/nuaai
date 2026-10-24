@@ -6,6 +6,7 @@ import type {
   ApprovalRequest,
   CommandId,
   ConnectionState,
+  LearningStatus,
   MemoryRecord,
   PluginHealth,
   PluginRecord,
@@ -160,12 +161,22 @@ export function ApprovalInbox({
 
 export function MemoryView({
   memories,
+  learning,
+  changingLearning,
+  onLearningMode,
+  onRevert,
+  revertingId,
   onDelete,
   saveMemory,
   saveStatus,
   isLoading,
 }: {
   memories: MemoryRecord[];
+  learning: LearningStatus | null;
+  changingLearning: boolean;
+  onLearningMode(mode: LearningStatus['mode']): void;
+  onRevert(id: string): void;
+  revertingId: string | null;
   onDelete?(id: string): void;
   saveMemory?(content: string): void;
   saveStatus?: 'idle' | 'saving' | 'saved' | 'error';
@@ -176,6 +187,13 @@ export function MemoryView({
   );
 
   const closeContextMenu = (): void => setContextMenu(null);
+  const active = memories.filter(
+    (memory) =>
+      !['superseded', 'disabled'].includes(String(memoryKnowledge(memory).state ?? 'active')),
+  );
+  const retired = memories.filter((memory) =>
+    ['superseded', 'disabled'].includes(String(memoryKnowledge(memory).state)),
+  );
 
   return (
     <section
@@ -189,11 +207,44 @@ export function MemoryView({
     >
       <div className="view-heading">
         <div>
-          <span className="section-label">Explicit recall</span>
+          <span className="section-label">Durable knowledge</span>
           <h1>Memory</h1>
-          <p>Only information intentionally saved for future sessions appears here.</p>
+          <p>
+            Saved notes and selectively learned project knowledge, with retained evidence and
+            history.
+          </p>
         </div>
         <span className="count-chip">{memories.length} records</span>
+      </div>
+      <div className="learning-controls">
+        <div>
+          <label htmlFor="agent-learning">Agent learning</label>
+          <p>
+            {!learning
+              ? 'Loading the actual setting…'
+              : !learning.available
+                ? 'Automatic learning is unavailable in this runtime.'
+                : learning.mode === 'automatic'
+                  ? 'Selectively reviews meaningful completed work. Verified project knowledge can be saved without a remember command.'
+                  : learning.mode === 'manual'
+                    ? 'No automatic review. The agent saves only when explicitly asked.'
+                    : 'Automatic review and agent saves are off. Existing notes remain available; notes can still be managed here.'}
+          </p>
+        </div>
+        <select
+          id="agent-learning"
+          value={learning?.mode ?? ''}
+          disabled={!learning?.available || changingLearning}
+          onChange={(event) => onLearningMode(event.target.value as LearningStatus['mode'])}
+        >
+          <option value="" disabled>
+            Loading…
+          </option>
+          <option value="automatic">Automatic</option>
+          <option value="manual">Manual</option>
+          <option value="off">Off</option>
+        </select>
+        {changingLearning && <output>Saving and verifying…</output>}
       </div>
       <form
         className="memory-save-form"
@@ -219,18 +270,25 @@ export function MemoryView({
         {saveStatus === 'saved' && <span className="save-confirm">Saved</span>}
       </form>
       <div className="memory-list" aria-label="Memory records">
-        {memories.length ? (
-          memories.map((memory) => (
+        {active.length ? (
+          active.map((memory) => (
             <div
               className="memory-row"
               key={memory.id}
               onContextMenu={(e) => {
                 e.preventDefault();
-                setContextMenu({ x: e.clientX, y: e.clientY, memoryId: memory.id });
+                if (memoryKnowledge(memory).origin !== 'automatic')
+                  setContextMenu({ x: e.clientX, y: e.clientY, memoryId: memory.id });
               }}
             >
               <div className="memory-content">
                 <p>{memory.content}</p>
+                <span className="knowledge-origin">
+                  {memoryKnowledge(memory).origin === 'automatic'
+                    ? 'Learned automatically'
+                    : 'Saved note'}
+                </span>
+                <MemoryEvidence memory={memory} />
               </div>
               <div className="memory-meta">
                 <span className={memory.hasEmbedding ? 'indexed' : 'text-only'}>
@@ -238,7 +296,16 @@ export function MemoryView({
                 </span>
                 <time>{relativeTime(memory.createdAt)}</time>
               </div>
-              {onDelete && (
+              {memoryKnowledge(memory).origin === 'automatic' && (
+                <button
+                  type="button"
+                  disabled={revertingId !== null}
+                  onClick={() => onRevert(memory.id)}
+                >
+                  {revertingId === memory.id ? 'Verifying undo…' : 'Undo learning'}
+                </button>
+              )}
+              {onDelete && memoryKnowledge(memory).origin !== 'automatic' && (
                 <button
                   type="button"
                   className="memory-delete-btn danger"
@@ -263,10 +330,29 @@ export function MemoryView({
         ) : (
           <div className="section-empty">
             <h2>No saved memory</h2>
-            <p>Ask NUAAI to remember something when persistence is useful.</p>
+            <p>
+              Useful project preferences and verified workflows can appear after meaningful work
+              when automatic learning is enabled. A note can also be saved explicitly.
+            </p>
           </div>
         )}
       </div>
+      {retired.length > 0 && (
+        <details className="learning-history">
+          <summary>Learning history</summary>
+          <div aria-label="Retired learning">
+            {retired.map((memory) => (
+              <article key={memory.id}>
+                <p>{memory.content}</p>
+                <small>
+                  {String(memoryKnowledge(memory).state)} · retained for review, not recalled
+                </small>
+                <MemoryEvidence memory={memory} />
+              </article>
+            ))}
+          </div>
+        </details>
+      )}
       {contextMenu && (
         <div
           className="context-menu"
@@ -287,6 +373,55 @@ export function MemoryView({
         </div>
       )}
     </section>
+  );
+}
+
+function memoryKnowledge(memory: MemoryRecord): Record<string, unknown> {
+  const value = memory.metadata?.knowledge;
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function MemoryEvidence({ memory }: { memory: MemoryRecord }): React.JSX.Element | null {
+  const knowledge = memoryKnowledge(memory);
+  if (!Object.keys(knowledge).length) return null;
+  return (
+    <details className="memory-evidence">
+      <summary>Evidence and scope</summary>
+      <dl>
+        <dt>Applies to</dt>
+        <dd>
+          {knowledge.scope === 'workspace'
+            ? String(knowledge.workspaceRoot ?? 'Unknown workspace')
+            : 'Profile'}
+        </dd>
+        <dt>Origin</dt>
+        <dd>{String(knowledge.origin ?? 'Unspecified')}</dd>
+        {typeof knowledge.sourceRunId === 'string' && (
+          <>
+            <dt>Source run</dt>
+            <dd>
+              <code>{String(knowledge.sourceRunId)}</code>
+            </dd>
+          </>
+        )}
+        {typeof knowledge.topic === 'string' && (
+          <>
+            <dt>Topic</dt>
+            <dd>{String(knowledge.topic)}</dd>
+          </>
+        )}
+      </dl>
+      {typeof knowledge.sourceQuote === 'string' && knowledge.sourceQuote && (
+        <blockquote>{knowledge.sourceQuote}</blockquote>
+      )}
+      {Array.isArray(knowledge.evidenceCallIds) && knowledge.evidenceCallIds.length > 0 && (
+        <p>
+          Recorded successful calls: {knowledge.evidenceCallIds.slice(0, 8).map(String).join(', ')}
+        </p>
+      )}
+    </details>
   );
 }
 
@@ -778,6 +913,7 @@ export function CommandPalette({
     ['new-thread', 'New thread', 'Continue this session in a clean thread', 'T'],
     ['focus-composer', 'Focus composer', 'Jump back to the conversation', 'A'],
     ['refresh', 'Refresh runtime', 'Reload daemon and system state', 'R'],
+    ['identity', 'Instruction sources', 'Inspect the retained SOUL.md and AGENTS.md snapshot', ''],
     ['cancel-run', 'Cancel active run', 'Stop the current agent task', 'Esc'],
   ];
   return (
@@ -809,7 +945,8 @@ export function CommandPalette({
               type="button"
               className="command-row"
               disabled={
-                (id === 'cancel-run' && !activeRunId) || (id === 'new-thread' && !selectedSessionId)
+                (id === 'cancel-run' && !activeRunId) ||
+                ((id === 'new-thread' || id === 'identity') && !selectedSessionId)
               }
               key={id}
               ref={index === 0 ? firstActionRef : undefined}
@@ -819,7 +956,7 @@ export function CommandPalette({
                 <strong>{label}</strong>
                 <small>{description}</small>
               </span>
-              <kbd>{shortcut}</kbd>
+              {shortcut && <kbd>{shortcut}</kbd>}
             </button>
           ))}
         </div>

@@ -1,9 +1,10 @@
-import { randomInt } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { randomInt, randomUUID } from 'node:crypto';
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import { config as loadDotenv } from 'dotenv';
 import { z } from 'zod';
+import { MAX_GOAL_DURATION_MS, MAX_GOAL_RUNS } from '../core/execution-policy.js';
 
 import { harnessConfig } from '../../.config/harness.config.js';
 
@@ -12,7 +13,7 @@ export { harnessConfig };
 const providerSchema = z.object({
   name: z.string().default('ollama'),
   model: z.string().default('qwen3.5:latest'),
-  selectedModels: z.record(z.string().trim().min(1)).default({}),
+  selectedModels: z.record(z.string(), z.string().trim().min(1)).prefault({}),
   baseUrl: z.string().url().default('http://127.0.0.1:11434'),
   contextWindow: z.number().int().positive().max(262_144).default(262_144),
   codex: z
@@ -20,7 +21,7 @@ const providerSchema = z.object({
       executable: z.string().min(1).default('codex'),
       timeoutMs: z.number().int().positive().max(900_000).default(900_000),
     })
-    .default({}),
+    .prefault({}),
 });
 
 const searchSchema = z.object({
@@ -87,7 +88,7 @@ const permissionProfileSchema = z.enum(['read-only', 'operator']);
 const mcpServerSchema = z.object({
   command: z.string().min(1),
   args: z.array(z.string()).default([]),
-  env: z.record(z.string()).default({}),
+  env: z.record(z.string(), z.string()).prefault({}),
   permission: z.enum(['read', 'write', 'execute']).default('read'),
 });
 
@@ -103,52 +104,60 @@ const agentSchema = z.object({
   maxOutputBytes: z.number().int().positive().max(10_000_000).default(2_000_000),
   commands: z
     .record(
+      z.string(),
       z.object({
         command: z.string().min(1),
         args: z.array(z.string()).default([]),
         inheritEnv: z.array(z.string().regex(/^[A-Z_][A-Z0-9_]*$/)).default([]),
       }),
     )
-    .default({}),
+    .prefault({}),
 });
 
+export const learningModeSchema = z.enum(['automatic', 'manual', 'off']);
+export type LearningMode = z.infer<typeof learningModeSchema>;
+
 export const runtimeConfigSchema = z.object({
+  learning: z.object({ mode: learningModeSchema.default('automatic') }).prefault({}),
   version: z.literal(1).default(1),
   name: z.string().default('NUAAI'),
   host: z.string().default('127.0.0.1'),
   port: z.number().int().min(1).max(65_535).default(40_101),
   workspaceRoot: z.string().default(process.cwd()),
   authSecret: z.string().min(32).optional(),
-  provider: providerSchema.default({}),
+  provider: providerSchema.prefault({}),
   embedding: z
     .object({
       model: z.string().default('nomic-embed-text:latest'),
       baseUrl: z.string().url().default('http://127.0.0.1:11434'),
     })
-    .default({}),
-  search: searchSchema.default({}),
-  web: webSchema.default({}),
-  matrix: matrixSchema.default({}),
-  audio: audioSchema.default({}),
+    .prefault({}),
+  search: searchSchema.prefault({}),
+  web: webSchema.prefault({}),
+  matrix: matrixSchema.prefault({}),
+  audio: audioSchema.prefault({}),
   mcp: z
     .object({
       enabled: z.boolean().default(false),
-      servers: z.record(mcpServerSchema).default({}),
-      computer: computerSchema.default({}),
+      servers: z.record(z.string(), mcpServerSchema).prefault({}),
+      computer: computerSchema.prefault({}),
     })
-    .default({}),
-  agents: agentSchema.default({}),
-  features: featureSchema.default({}),
+    .prefault({}),
+  agents: agentSchema.prefault({}),
+  features: featureSchema.prefault({}),
   permissions: z
     .object({
       web: permissionProfileSchema.default('operator'),
       matrix: permissionProfileSchema.default('operator'),
       scheduler: permissionProfileSchema.default('operator'),
     })
-    .default({}),
+    .prefault({}),
   limits: z
     .object({
       maxTurns: z.number().int().positive().max(100).default(48),
+      maxGoalSlices: z.number().int().positive().max(MAX_GOAL_RUNS).default(4),
+      maxGoalFamilyRuns: z.number().int().positive().max(MAX_GOAL_RUNS).default(12),
+      goalTimeoutMs: z.number().int().positive().max(MAX_GOAL_DURATION_MS).default(600_000),
       maxToolCalls: z.number().int().positive().max(100).default(48),
       maxToolCostUnits: z.number().int().positive().max(1_000).default(96),
       maxOutputBytes: z.number().int().positive().max(10_000_000).default(1_000_000),
@@ -163,7 +172,7 @@ export const runtimeConfigSchema = z.object({
       maxMemoryContextBytes: z.number().int().positive().max(200_000).default(64_000),
       maxToolResultBytes: z.number().int().positive().max(200_000).default(16_000),
     })
-    .default({}),
+    .prefault({}),
 });
 
 export type RuntimeConfig = z.infer<typeof runtimeConfigSchema>;
@@ -230,8 +239,7 @@ export function parseRuntimeConfig(value: unknown, root = process.cwd()): Runtim
   if (Number.isInteger(environmentPort) && environmentPort >= 1 && environmentPort <= 65_535)
     raw.port = environmentPort;
   const environmentHost = process.env.NUAAI_HOST;
-  if (environmentHost && environmentHost.trim())
-    raw.host = environmentHost.trim();
+  if (environmentHost?.trim()) raw.host = environmentHost.trim();
   const rawWeb =
     raw.web && typeof raw.web === 'object' ? { ...(raw.web as Record<string, unknown>) } : {};
   if (rawWeb.publicBasePath === undefined && process.env.NUAAI_PUBLIC_BASE_PATH)
@@ -300,26 +308,63 @@ export async function loadRuntimeConfig(root = process.cwd()): Promise<RuntimeCo
   return parseRuntimeConfig(value, root);
 }
 
+const configWrites = new Map<string, Promise<void>>();
+async function updateRuntimeConfig(
+  root: string,
+  update: (raw: Record<string, unknown>) => void,
+): Promise<void> {
+  const path = resolve(workspaceDirectory(root), 'config.json');
+  const apply = async () => {
+    const raw: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw))
+      throw new Error('Stored runtime configuration must be an object');
+    update(raw as Record<string, unknown>);
+    const staged = `${path}.${randomUUID()}.partial`;
+    await writeFile(staged, `${JSON.stringify(raw, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    await rename(staged, path);
+  };
+  // A rejected write is reported to its caller; it must not poison later independent settings writes.
+  const previous = configWrites.get(path) ?? Promise.resolve();
+  const pending = previous.then(apply, apply);
+  configWrites.set(path, pending);
+  try {
+    await pending;
+  } finally {
+    if (configWrites.get(path) === pending) configWrites.delete(path);
+  }
+}
+
 export async function persistProviderSelection(
   root: string,
   provider: string,
   model: string,
 ): Promise<void> {
   if (!provider.trim() || !model.trim()) throw new Error('Provider and model are required');
-  const path = resolve(workspaceDirectory(root), 'config.json');
-  const raw = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
-  const current = raw.provider && typeof raw.provider === 'object' ? raw.provider : {};
-  const selectedModels =
-    (current as Record<string, unknown>).selectedModels &&
-    typeof (current as Record<string, unknown>).selectedModels === 'object'
-      ? { ...((current as Record<string, unknown>).selectedModels as Record<string, unknown>) }
-      : {};
-  selectedModels[provider] = model;
-  raw.provider = {
-    ...(current as Record<string, unknown>),
-    name: provider,
-    model,
-    selectedModels,
-  };
-  await writeFile(path, `${JSON.stringify(raw, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await updateRuntimeConfig(root, (raw) => {
+    const current =
+      raw.provider && typeof raw.provider === 'object'
+        ? (raw.provider as Record<string, unknown>)
+        : {};
+    const selectedModels =
+      current.selectedModels && typeof current.selectedModels === 'object'
+        ? { ...(current.selectedModels as Record<string, unknown>) }
+        : {};
+    selectedModels[provider] = model;
+    raw.provider = { ...current, name: provider, model, selectedModels };
+  });
+}
+
+export async function persistLearningMode(root: string, mode: LearningMode): Promise<void> {
+  learningModeSchema.parse(mode);
+  await updateRuntimeConfig(root, (raw) => {
+    raw.learning = {
+      ...(raw.learning && typeof raw.learning === 'object' ? raw.learning : {}),
+      mode,
+    };
+  });
+  const stored = JSON.parse(
+    await readFile(resolve(workspaceDirectory(root), 'config.json'), 'utf8'),
+  ) as RuntimeConfig;
+  if (stored.learning.mode !== mode)
+    throw new Error('Learning mode persistence could not be verified');
 }

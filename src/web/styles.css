@@ -3376,3 +3376,80 @@ kbd {
     animation-delay: 120ms;
   }
 }
+
+.learning-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1rem;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.learning-controls > div {
+  flex: 1 1 260px;
+}
+.learning-controls label {
+  color: var(--text);
+  font-weight: 600;
+  font-size: 0.875rem;
+}
+.learning-controls p {
+  margin: 0.4rem 0 0;
+  max-width: 68ch;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+.learning-controls select {
+  min-height: 40px;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--surface-raised);
+}
+.learning-controls output {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+.knowledge-origin {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+.memory-evidence {
+  margin-top: 0.65rem;
+  font-size: 0.8125rem;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+}
+.memory-evidence summary,
+.learning-history > summary {
+  cursor: pointer;
+}
+.memory-evidence dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.5rem 1rem;
+}
+.memory-evidence dd {
+  margin: 0;
+}
+.memory-evidence blockquote {
+  margin: 0.75rem 0;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text);
+}
+.learning-history {
+  margin-top: 1rem;
+  color: var(--text-secondary);
+}
+.learning-history article {
+  margin-top: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}

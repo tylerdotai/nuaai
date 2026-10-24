@@ -1,10 +1,23 @@
+import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, chmod, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import {
+  access,
+  chmod,
+  copyFile,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  writeFile,
+} from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import { type Change, diffLines } from 'diff';
 import { execa } from 'execa';
-import fg from 'fast-glob';
+import { type DiscoveryOptions, discoverFiles } from './discovery.js';
 
 import { defaultRuntimeConfig, workspaceDirectory } from '../config/index.js';
 import { sanitizedSubprocessEnvironment } from '../security/environment.js';
@@ -46,6 +59,10 @@ function isProtectedProjectFile(relativePath: string): boolean {
     normalized.startsWith('.nuaai/') ||
     normalized === '.git' ||
     normalized.startsWith('.git/') ||
+    /(?:^|\/)(?:\.hermes|\.codex|\.claude|\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker)(?:\/|$)/.test(
+      normalized,
+    ) ||
+    /(?:^|\/)\.pi\/agent(?:\/|$)/.test(normalized) ||
     PROTECTED_PROJECT_BASENAME.test(projectBasename) ||
     /\.(?:key|pem|p12|pfx)$/i.test(projectBasename)
   );
@@ -234,41 +251,358 @@ export async function writeWorkspaceFile(
   await chmod(path, 0o600);
 }
 
-export async function listWorkspaceFiles(root: string): Promise<string[]> {
-  return (
-    await fg('**/*', {
-      cwd: resolve(root),
-      dot: true,
-      onlyFiles: true,
-      followSymbolicLinks: false,
-      ignore: [
-        '.git/**',
-        '.nuaai/**',
-        'node_modules/**',
-        'dist/**',
-        'coverage/**',
-        'test-results/**',
-      ],
-    })
-  )
-    .filter((file) => !isProtectedProjectFile(file))
-    .sort();
+export async function editWorkspaceFile(
+  root: string,
+  path: string,
+  oldText: string,
+  newText: string,
+): Promise<unknown> {
+  const before = await readWorkspaceFile(root, path);
+  if (!oldText || !before.includes(oldText)) throw new Error('Edit text does not match the file');
+  if (before.indexOf(oldText) !== before.lastIndexOf(oldText))
+    throw new Error('Edit requires a unique exact match');
+  await writeWorkspaceFile(
+    root,
+    path,
+    before.replace(oldText, () => newText),
+  );
+  return {
+    edited: path,
+    sha256: createHash('sha256')
+      .update(before.replace(oldText, () => newText))
+      .digest('hex'),
+  };
+}
+
+export async function statWorkspacePath(root: string, path: string): Promise<unknown> {
+  const target = await assertSafeProjectFile(root, path);
+  try {
+    const stat = await lstat(target);
+    return { path, exists: true, type: stat.isDirectory() ? 'directory' : 'file', size: stat.size };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { path, exists: false };
+    throw error;
+  }
+}
+
+export async function mkdirWorkspacePath(root: string, path: string): Promise<unknown> {
+  assertAgentProjectFile(path);
+  const target = safePath(root, path);
+  await assertSafeWriteParent(root, target);
+  await mkdir(target, { recursive: true, mode: 0o700 });
+  await assertSafeProjectFile(root, path);
+  return { created: path };
+}
+
+export async function trashWorkspaceFile(root: string, path: string): Promise<unknown> {
+  const target = safePath(root, path);
+  await assertSafeProjectFile(root, path);
+  const stat = await lstat(target);
+  if (!stat.isFile() || stat.isSymbolicLink())
+    throw new Error('Trash accepts only a regular file, not directories or symbolic links');
+  // Freedesktop trash owned by this workspace, not the operator's personal trash.
+  const dataHome = safePath(root, '.nuaai/trash');
+  await assertSafeWriteParent(root, dataHome);
+  await mkdir(dataHome, { recursive: true, mode: 0o700 });
+  const result = await execa('gio', ['trash', '--', target], {
+    env: { ...sanitizedSubprocessEnvironment(), XDG_DATA_HOME: dataHome },
+    extendEnv: false,
+    shell: false,
+    reject: false,
+    timeout: 30_000,
+    maxBuffer: 16_000,
+  });
+  if (result.exitCode !== 0)
+    throw new Error(
+      `System trash failed; no permanent-delete fallback: ${result.stderr.slice(0, 500)}`,
+    );
+  return {
+    trashed: path,
+    recoverable: true,
+    recovery: 'Workspace .nuaai/trash/Trash (Freedesktop files and info)',
+  };
+}
+
+export async function copyWorkspaceFile(
+  root: string,
+  path: string,
+  destination: string,
+  move = false,
+): Promise<unknown> {
+  const source = await assertSafeProjectFile(root, path);
+  if (!(await lstat(source)).isFile() || (await lstat(safePath(root, path))).isSymbolicLink())
+    throw new Error('Copy/move accepts only a regular file');
+  assertAgentProjectFile(destination);
+  const target = safePath(root, destination);
+  await assertSafeWriteParent(root, dirname(target));
+  await assertSafeProjectFile(root, destination);
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  await copyFile(source, target, constants.COPYFILE_EXCL);
+  await chmod(target, 0o600);
+  if (move) await trashWorkspaceFile(root, path);
+  const sha256 = createHash('sha256')
+    .update(await readFile(target))
+    .digest('hex');
+  return move ? { moved: path, destination, sha256 } : { copied: path, destination, sha256 };
+}
+
+export async function listWorkspaceDirectory(
+  root: string,
+  path = '.',
+  limit = 200,
+): Promise<{
+  path: string;
+  entries: Array<{ name: string; path: string; type: 'file' | 'directory' }>;
+  total: number;
+  truncated: boolean;
+}> {
+  const directory = await assertSafeProjectFile(root, path);
+  const workspace = await realpath(resolve(root));
+  const location = relative(workspace, directory).replaceAll('\\', '/') || '.';
+  const homeState = new Set([
+    '.local',
+    '.cache',
+    '.config',
+    '.hermes',
+    '.codex',
+    '.claude',
+    '.ssh',
+    '.gnupg',
+    '.npm',
+    '.nvm',
+    '.mozilla',
+    '.var',
+    '.docker',
+  ]);
+  const homeWorkspace = workspace === (await realpath(homedir()));
+  if (homeWorkspace && homeState.has(location.split('/')[0]))
+    throw new Error('Home application state is excluded from project listing.');
+  const omittedDirectories = new Set([
+    '.git',
+    '.nuaai',
+    'node_modules',
+    'dist',
+    'coverage',
+    'test-results',
+  ]);
+  const entries = (await readdir(directory, { withFileTypes: true }))
+    .filter((entry) => !entry.isSymbolicLink() && (entry.isFile() || entry.isDirectory()))
+    .filter((entry) => !(entry.isDirectory() && omittedDirectories.has(entry.name)))
+    .map((entry) => ({
+      name: entry.name,
+      path: relative(workspace, resolve(directory, entry.name)).replaceAll('\\', '/'),
+      type: entry.isDirectory() ? ('directory' as const) : ('file' as const),
+    }))
+    .filter(
+      (entry) =>
+        !isProtectedProjectFile(entry.path) &&
+        !(homeWorkspace && homeState.has(entry.path.split('/')[0])),
+    )
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return {
+    path: location,
+    entries: entries.slice(0, limit),
+    total: entries.length,
+    truncated: entries.length > limit,
+  };
+}
+
+export async function listWorkspaceFiles(
+  root: string,
+  options: DiscoveryOptions & { path?: string } = {},
+): Promise<string[]> {
+  options.signal?.throwIfAborted();
+  const directory = options.path ? await assertSafeProjectFile(root, options.path) : resolve(root);
+  const prefix = relative(resolve(root), directory).replaceAll('\\', '/');
+  if (options.path && (await lstat(directory)).isFile()) return [prefix];
+  const projectPath = (path: string): string => (prefix ? `${prefix}/${path}` : path);
+  // Home application/container state is not project source. Preserve errors in real projects.
+  const homeState = new Set(
+    resolve(root) === resolve(homedir())
+      ? [
+          '.local',
+          '.cache',
+          '.config',
+          '.hermes',
+          '.codex',
+          '.claude',
+          '.ssh',
+          '.gnupg',
+          '.npm',
+          '.nvm',
+          '.mozilla',
+          '.var',
+          '.docker',
+        ]
+      : [],
+  );
+  const omitted = new Set(['.git', '.nuaai', 'node_modules', 'dist', 'coverage', 'test-results']);
+  const files = await discoverFiles(directory, {
+    ...options,
+    skipDirectory: (path) =>
+      homeState.has(projectPath(path).split('/')[0]) ||
+      omitted.has(path.split('/').at(-1) ?? '') ||
+      isProtectedProjectFile(projectPath(path)) ||
+      Boolean(options.skipDirectory?.(path)),
+    includeFile: (path) =>
+      !isProtectedProjectFile(projectPath(path)) &&
+      (!options.includeFile || options.includeFile(path)),
+  });
+  return files.map(projectPath);
+}
+
+export interface WorkspaceSearchOptions {
+  path?: string;
+  limit?: number;
+  maxFileBytes?: number;
+  maxBytes?: number;
+  maxFiles?: number;
+  maxEntries?: number;
+  signal?: AbortSignal;
+}
+export interface WorkspaceSearchResult {
+  matches: Array<{ file: string; line: number; text: string }>;
+  complete: boolean;
+  scannedFiles: number;
+  bytesRead: number;
+  skipped: Record<'oversized' | 'binary' | 'unreadable', number>;
+  warnings: Array<{ file: string; reason: string }>;
+  stoppedBecause?: 'match_limit' | 'byte_limit' | 'file_limit' | 'entry_limit';
+  limits: Required<Omit<WorkspaceSearchOptions, 'path' | 'signal'>>;
 }
 
 export async function searchWorkspace(
   root: string,
   query: string,
-): Promise<Array<{ file: string; line: number; text: string }>> {
+  options: WorkspaceSearchOptions = {},
+): Promise<WorkspaceSearchResult> {
   if (!query.trim()) throw new Error('Search query is required');
-  const results: Array<{ file: string; line: number; text: string }> = [];
-  for (const file of await listWorkspaceFiles(root)) {
-    const content = await readWorkspaceFile(root, file);
-    content.split('\n').forEach((text, index) => {
-      if (text.toLowerCase().includes(query.toLowerCase()))
-        results.push({ file, line: index + 1, text });
-    });
+  options.signal?.throwIfAborted();
+  const limits = {
+    limit: options.limit ?? 200,
+    maxFileBytes: options.maxFileBytes ?? 1024 * 1024,
+    maxBytes: options.maxBytes ?? 16 * 1024 * 1024,
+    maxFiles: options.maxFiles ?? 2000,
+    maxEntries: options.maxEntries ?? 10000,
+  };
+  if (Object.values(limits).some((value) => !Number.isSafeInteger(value) || value < 1))
+    throw new Error('Search limits must be positive integers');
+  const result: WorkspaceSearchResult = {
+    matches: [],
+    complete: true,
+    scannedFiles: 0,
+    bytesRead: 0,
+    skipped: { oversized: 0, binary: 0, unreadable: 0 },
+    warnings: [],
+    limits,
+  };
+  const skip = (file: string, reason: keyof WorkspaceSearchResult['skipped']): void => {
+    result.skipped[reason] += 1;
+    if (result.warnings.length < 24) result.warnings.push({ file, reason });
+  };
+  const files = await listWorkspaceFiles(root, {
+    path: options.path,
+    maxFiles: limits.maxFiles + 1,
+    maxEntries: limits.maxEntries,
+    signal: options.signal,
+    onLimit: (reason) => {
+      result.stoppedBecause = reason;
+    },
+    onError: (file) => skip(file, 'unreadable'),
+  });
+  const needle = query.toLowerCase();
+  search: for (const file of files) {
+    options.signal?.throwIfAborted();
+    if (result.scannedFiles >= limits.maxFiles) {
+      result.stoppedBecause = 'file_limit';
+      break;
+    }
+    result.scannedFiles += 1;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      const path = await assertSafeProjectFile(root, file);
+      handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.nlink > 1) {
+        skip(file, 'unreadable');
+        continue;
+      }
+      if (stats.size > limits.maxFileBytes) {
+        skip(file, 'oversized');
+        continue;
+      }
+      const remaining = limits.maxBytes - result.bytesRead;
+      if (remaining < stats.size || remaining === 0) {
+        result.stoppedBecause = 'byte_limit';
+        break;
+      }
+      const allowance = Math.min(limits.maxFileBytes + 1, remaining);
+      const chunks: Buffer[] = [];
+      let size = 0;
+      while (size < allowance) {
+        options.signal?.throwIfAborted();
+        const chunk = Buffer.allocUnsafe(Math.min(65536, allowance - size));
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+        if (!bytesRead) break;
+        size += bytesRead;
+        result.bytesRead += bytesRead;
+        chunks.push(chunk.subarray(0, bytesRead));
+      }
+      options.signal?.throwIfAborted();
+      const finalSize = (await handle.stat()).size;
+      if (size > limits.maxFileBytes || finalSize > limits.maxFileBytes) {
+        skip(file, 'oversized');
+        continue;
+      }
+      if (finalSize > size) {
+        result.stoppedBecause = 'byte_limit';
+        break;
+      }
+      const bytes = Buffer.concat(chunks, size);
+      if (bytes.includes(0)) {
+        skip(file, 'binary');
+        continue;
+      }
+      let content: string;
+      try {
+        content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch {
+        skip(file, 'binary');
+        continue;
+      }
+      const lines = content.split('\n');
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        const found = line.toLowerCase().indexOf(needle);
+        if (found < 0) continue;
+        const start = Math.max(0, found - 80);
+        result.matches.push({
+          file,
+          line: index + 1,
+          text: line.slice(start, Math.max(found + query.length, start + 2000)),
+        });
+        if (result.matches.length >= limits.limit) {
+          result.stoppedBecause = 'match_limit';
+          break search;
+        }
+      }
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      if (
+        options.path &&
+        /Protected|escapes workspace|hard-linked/.test(
+          error instanceof Error ? error.message : String(error),
+        )
+      )
+        throw error;
+      skip(file, 'unreadable');
+    } finally {
+      await handle?.close();
+    }
   }
-  return results.slice(0, 200);
+  result.complete =
+    !result.stoppedBecause && Object.values(result.skipped).every((count) => count === 0);
+  return result;
 }
 
 export async function runWorkspaceCommand(

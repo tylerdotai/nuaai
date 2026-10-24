@@ -2,12 +2,13 @@ import { defineConfig, devices } from '@playwright/test';
 
 const e2ePort = Number(process.env.NUAAI_E2E_PORT ?? 49_187);
 const projectRoot = process.cwd();
-const daemonEntry = JSON.stringify(`${projectRoot}/dist/cli.js`);
+const daemonEntry = JSON.stringify(`${projectRoot}/tests/e2e/daemon.mjs`);
 const browserExecutable = process.env.NUAAI_PLAYWRIGHT_EXECUTABLE_PATH;
 
 export default defineConfig({
   testDir: './tests/e2e',
   fullyParallel: false,
+  workers: 1,
   forbidOnly: true,
   retries: 0,
   timeout: 60_000,
@@ -19,10 +20,11 @@ export default defineConfig({
     ...(browserExecutable ? { launchOptions: { executablePath: browserExecutable } } : {}),
   },
   webServer: {
-    command: `NUAAI_TEST_MODE=1 NUAAI_PORT=${e2ePort} node ${daemonEntry} daemon`,
+    command: `NUAAI_TEST_MODE=1 NUAAI_PORT=${e2ePort} node ${daemonEntry}`,
     url: `http://127.0.0.1:${e2ePort}/health`,
     reuseExistingServer: true,
     cwd: process.env.NUAAI_E2E_ROOT ?? process.cwd(),
+    env: { NUAAI_ROOT: process.env.NUAAI_E2E_ROOT ?? process.cwd() },
     timeout: 120_000,
     stdout: 'pipe',
     stderr: 'pipe',

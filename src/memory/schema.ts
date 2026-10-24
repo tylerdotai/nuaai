@@ -8,6 +8,23 @@ export const sessions = sqliteTable('sessions', {
   updatedAt: integer('updated_at').notNull(),
 });
 
+export const sessionIdentitySnapshots = sqliteTable('session_identity_snapshots', {
+  id: text('id').primaryKey(),
+  sessionId: text('session_id').notNull(),
+  revision: integer('revision').notNull(),
+  snapshot: text('snapshot').notNull(),
+});
+
+export const sessionApprovalPolicies = sqliteTable('session_approval_policies', {
+  sessionId: text('session_id').primaryKey(),
+  value: text('value').notNull(),
+});
+
+export const approvalSessionScopes = sqliteTable('approval_session_scopes', {
+  approvalId: text('approval_id').primaryKey(),
+  value: text('value').notNull(),
+});
+
 export const threads = sqliteTable('threads', {
   id: text('id').primaryKey(),
   sessionId: text('session_id').notNull(),
@@ -70,6 +87,11 @@ export const runs = sqliteTable('runs', {
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
   correlationId: text('correlation_id').notNull(),
+});
+
+export const runExecutionContexts = sqliteTable('run_execution_contexts', {
+  runId: text('run_id').primaryKey(),
+  value: text('value').notNull(),
 });
 
 export const runArtifacts = sqliteTable('run_artifacts', {

@@ -1,3 +1,4 @@
+import { decodeToolArguments } from '../core/tool-input.js';
 import { canonicalProviderMessages } from './request.js';
 import type {
   ProviderAdapter,
@@ -119,20 +120,6 @@ function openAiMessage(message: ProviderMessage): Record<string, unknown> {
   };
 }
 
-function openAiToolArguments(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value))
-    return value as Record<string, unknown>;
-  if (typeof value !== 'string') return {};
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
-}
-
 function textEncodedToolCall(
   content: string,
   tools: ProviderTool[] | undefined,
@@ -168,15 +155,7 @@ function textEncodedToolCall(
 }
 
 function parseToolArguments(tool: CollectedToolCall): Record<string, unknown> {
-  if (!tool.rawArguments) return tool.arguments;
-  try {
-    const parsed = JSON.parse(tool.rawArguments) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
+  return decodeToolArguments(tool.rawArguments || tool.arguments);
 }
 
 export class OllamaProvider implements ProviderAdapter {
@@ -271,7 +250,7 @@ export class OllamaProvider implements ProviderAdapter {
             type: 'tool_call',
             id: call.id ?? crypto.randomUUID(),
             name: toolNameMap.get(wireName) ?? wireName,
-            arguments: openAiToolArguments(call.function?.arguments),
+            arguments: decodeToolArguments(call.function?.arguments),
           };
         }
         yield { type: 'done', text: visibleOutput };
@@ -328,7 +307,8 @@ export class OllamaProvider implements ProviderAdapter {
           existing.name = functionCall.name;
           if (typeof functionCall.arguments === 'string')
             existing.rawArguments += functionCall.arguments;
-          else if (functionCall.arguments) existing.arguments = functionCall.arguments;
+          else if (functionCall.arguments !== undefined)
+            existing.arguments = decodeToolArguments(functionCall.arguments);
           toolCalls.set(key, existing);
         }
       };

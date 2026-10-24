@@ -321,9 +321,9 @@ describe('runtime context contract', () => {
       store,
       providers: providers(adapter),
       tools: new ToolRegistry(root),
-      identityContext: 'Canonical system policy.',
     });
     const created = runtime.createSession('canonical system transport');
+    store.updateSessionContext(created.session.id, 'Canonical system policy.');
     store.addMessage(
       created.thread.id,
       'system',
@@ -419,7 +419,7 @@ describe('runtime context contract', () => {
     const requests: ProviderRequest[] = [];
     const adapter = provider(requests);
     const config = defaultRuntimeConfig(root);
-    config.limits.maxContextTokens = 300;
+    config.limits.maxContextTokens = 6000;
     config.limits.maxContextSummaryTokens = 80;
     config.limits.contextResponseReserveTokens = 50;
     const runtime = new AgentRuntime({
@@ -433,8 +433,8 @@ describe('runtime context contract', () => {
     store.updateSessionContext(created.session.id, 'Never change the project constraint.');
     store.storeMemory('pinned-1', 'Pinned fact survives every selection.', null, { pinned: true });
     for (let index = 0; index < 8; index += 1) {
-      store.addMessage(created.thread.id, 'user', `old user ${index} ${'x'.repeat(80)}`);
-      store.addMessage(created.thread.id, 'assistant', `old answer ${index} ${'y'.repeat(80)}`);
+      store.addMessage(created.thread.id, 'user', `old user ${index} ${'x'.repeat(2000)}`);
+      store.addMessage(created.thread.id, 'assistant', `old answer ${index} ${'y'.repeat(2000)}`);
     }
 
     const run = runtime.startRun({
@@ -458,7 +458,7 @@ describe('runtime context contract', () => {
       selectedMessageCount: expect.any(Number),
       droppedMessageCount: expect.any(Number),
       estimatedContextUnits: expect.any(Number),
-      maxContextUnits: 300,
+      maxContextUnits: 6000,
       overBudget: expect.any(Boolean),
     });
     for (const event of [compacted, selected]) {

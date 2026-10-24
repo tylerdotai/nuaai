@@ -3,11 +3,12 @@ import { once } from 'node:events';
 import { readFile, stat } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 
-import fg from 'fast-glob';
+import { discoverFiles } from '../workspace/discovery.js';
 
 import { workspaceDirectory } from '../config/index.js';
 import { createEvent } from '../core/events.js';
 import type { DatabaseStore } from '../memory/db.js';
+import { type PermissionContext, assertPermission } from '../security/permissions.js';
 import { type PluginManifest, pluginManifestSchema } from './manifest.js';
 
 const SUPPORTED_API_MAJOR = 1;
@@ -93,10 +94,12 @@ export class PluginRegistry {
     const root = workspaceDirectory(this.root);
     const persisted = new Map(this.store?.listPlugins().map((plugin) => [plugin.name, plugin]));
     const candidates = new Map<string, PluginRecord>();
-    for (const manifestPath of await fg('plugins/*/manifest.json', {
-      cwd: root,
-      onlyFiles: true,
+    for (const path of await discoverFiles(resolve(root, 'plugins'), {
+      maxDepth: 1,
+      skipDirectory: (path) => path.startsWith('.'),
+      includeFile: (path) => path.split('/').length === 2 && path.endsWith('/manifest.json'),
     })) {
+      const manifestPath = `plugins/${path}`;
       const pluginRoot = resolve(root, manifestPath, '..');
       try {
         const manifest = pluginManifestSchema.parse(
@@ -191,7 +194,37 @@ export class PluginRegistry {
     );
   }
 
-  async execute(name: string, input: unknown): Promise<unknown> {
+  assertCallable(name: string, permissions: PermissionContext): void {
+    assertPermission(permissions, 'execute');
+    const record = this.plugins.get(name);
+    if (!record) throw new Error(`Unknown plugin: ${name}`);
+    if (this.disabled.has(name)) throw new Error(`Plugin ${name} is disabled`);
+    if (permissions.capabilities.subprocess !== true)
+      throw new Error(`Plugin ${name} requires capability: subprocess`);
+    for (const capability of record.manifest.capabilities) {
+      if (permissions.capabilities[capability] !== true)
+        throw new Error(`Plugin ${name} requires capability: ${capability}`);
+      if (capability === 'secrets') assertPermission(permissions, 'secret');
+    }
+  }
+
+  discover(permissions: PermissionContext): Array<{ name: string; capabilities: string[] }> {
+    return this.list().flatMap((plugin) => {
+      try {
+        this.assertCallable(plugin.name, permissions);
+        return [{ name: plugin.name, capabilities: [...plugin.capabilities] }];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  stop(): void {
+    this.stopAllChildren();
+  }
+
+  async execute(name: string, input: unknown, signal?: AbortSignal): Promise<unknown> {
+    signal?.throwIfAborted();
     const record = this.plugins.get(name);
     if (!record) throw new Error(`Unknown plugin: ${name}`);
     if (this.disabled.has(name)) throw new Error(`Plugin ${name} is disabled`);
@@ -211,6 +244,10 @@ export class PluginRegistry {
       },
     );
     this.trackChild(name, child);
+    const abort = () => {
+      child.kill('SIGTERM');
+    };
+    signal?.addEventListener('abort', abort, { once: true });
     try {
       const result = await this.invokeChild(name, child, {
         input,
@@ -233,6 +270,7 @@ export class PluginRegistry {
       );
       throw new Error(`Plugin ${name} failed: ${message}`);
     } finally {
+      signal?.removeEventListener('abort', abort);
       this.untrackChild(name, child);
       if (!child.killed) child.kill('SIGTERM');
     }

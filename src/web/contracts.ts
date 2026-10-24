@@ -162,7 +162,10 @@ export interface Task {
   updatedAt: number;
 }
 
+export type { LearningStatus } from '../memory/learning.js';
+
 export interface MemoryRecord {
+  metadata?: Record<string, unknown>;
   id: string;
   content: string;
   createdAt: number;
@@ -210,4 +213,10 @@ export interface ActiveProvider {
 export type PermissionProfile = 'read-only' | 'operator';
 export type ViewId = 'conversation' | 'memory' | 'automations' | 'system';
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline';
-export type CommandId = 'new-session' | 'new-thread' | 'refresh' | 'focus-composer' | 'cancel-run';
+export type CommandId =
+  | 'new-session'
+  | 'new-thread'
+  | 'refresh'
+  | 'identity'
+  | 'focus-composer'
+  | 'cancel-run';

@@ -79,7 +79,7 @@ describe('durable run artifact persistence', () => {
           value: string;
         }
       ).value,
-    ).toBe('7');
+    ).toBe('9');
     expect(
       (
         database.raw.prepare('PRAGMA table_info(run_artifacts)').all() as Array<{ name: string }>

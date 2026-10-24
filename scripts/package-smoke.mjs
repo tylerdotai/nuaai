@@ -16,6 +16,7 @@ function run(command, args, options = {}) {
   return execFileSync(command, args, {
     cwd: root,
     encoding: 'utf8',
+    env: { ...process.env, NUAAI_ROOT: workspace },
     maxBuffer: 10_000_000,
     ...options,
   });
@@ -59,7 +60,9 @@ const packOutput = run('npm', [
   artifacts,
 ]);
 const jsonStart = packOutput.lastIndexOf('\n[');
-const packed = JSON.parse(packOutput.slice(jsonStart >= 0 ? jsonStart + 1 : 0));
+const packManifest = JSON.parse(packOutput.slice(jsonStart >= 0 ? jsonStart + 1 : 0));
+// npm 12 keys manifests by package name; earlier npm versions return an array.
+const packed = Array.isArray(packManifest) ? packManifest : Object.values(packManifest);
 if (!Array.isArray(packed) || packed.length !== 1) throw new Error('npm pack returned no artifact');
 const manifest = packed[0];
 const packagedFiles = new Set((manifest.files ?? []).map((file) => file.path));
@@ -90,6 +93,25 @@ const installedPackage = JSON.parse(
 );
 if (installedPackage.scripts?.['dogfood:live'])
   throw new Error('Installed package advertises unavailable host-specific dogfood tooling');
+// A healthy daemon does not prove that the installed terminal renderer can start.
+run(
+  process.execPath,
+  [
+    '--input-type=module',
+    '-e',
+    `
+  import { createRequire } from 'node:module';
+  import { resolve } from 'node:path';
+  const app = createRequire(resolve('package.json'));
+  for (const name of ['ink', 'react-dom']) {
+    const dependency = createRequire(app.resolve(name));
+    if (app('react') !== dependency('react'))
+      throw new Error('Installed ' + name + ' resolved a different React instance');
+  }
+`,
+  ],
+  { cwd: resolve(installRoot, 'node_modules/nuaai') },
+);
 const bin = resolve(installRoot, 'node_modules/.bin/nuaai');
 const version = run(bin, ['--version'], { cwd: workspace }).trim();
 if (version !== packageVersion)

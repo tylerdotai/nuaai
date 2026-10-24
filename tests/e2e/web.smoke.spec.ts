@@ -36,10 +36,12 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await expect(commandPalette.getByRole('button', { name: /Cancel active run/ })).toBeDisabled();
   await commandPalette.getByRole('button', { name: 'Close commands' }).click();
 
-  const initialSessionCount = await page.locator('.session-row').count();
+  const initialSessions = await page.request.get('/api/sessions');
+  const initialSessionCount = (await initialSessions.json()).sessions.length;
+  await expect(page.locator('.session-row')).toHaveCount(initialSessionCount);
   await page.locator('.new-conversation-button').click();
   await expect(page.locator('.session-row')).toHaveCount(initialSessionCount + 1);
-  const selectedSession = page.locator('.session-row.selected');
+  const selectedSession = page.locator('.session-row[aria-current="page"]');
   await expect(selectedSession).toContainText('Current');
   const createdSessionTitle = await selectedSession.locator('strong').textContent();
   expect(createdSessionTitle).toBeTruthy();
@@ -379,7 +381,8 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
     .locator('.primary-nav')
     .getByRole('tab', { name: /Memory/ })
     .click();
-  await expect(page.getByRole('tabpanel')).toContainText('Only information intentionally saved');
+  await expect(page.getByRole('tabpanel')).toContainText('selectively learned project knowledge');
+  await expect(page.getByRole('combobox', { name: 'Agent learning' })).toBeEnabled();
   await expect(page.locator('[aria-label="Memory records"]')).toBeVisible();
 
   await page
@@ -399,10 +402,39 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await page.getByLabel('Schedule name').fill(scheduleName);
   await page.getByLabel('Schedule agent input').fill('Say hello.');
   await page.getByRole('button', { name: 'Create automation' }).click();
-  const automationCard = page.locator('.automation-card').filter({ hasText: scheduleName });
+  const automationCard = page
+    .getByLabel('Schedules', { exact: true })
+    .locator('.schedule-row')
+    .filter({ has: page.getByRole('heading', { name: scheduleName, exact: true }) });
   await expect(automationCard).toBeVisible();
-  await automationCard.getByRole('button', { name: 'Run now' }).click();
-  await expect(automationCard).toContainText('completed', { timeout: 30_000 });
+  const scheduleResponse = await page.request.get('/api/schedules');
+  expect(scheduleResponse.ok()).toBe(true);
+  const { schedules } = (await scheduleResponse.json()) as {
+    schedules: Array<{ id: string; name: string; agentInput: string }>;
+  };
+  const createdSchedule = schedules.find((schedule) => schedule.name === scheduleName);
+  expect(createdSchedule?.agentInput).toBe('Say hello.');
+  await automationCard.getByRole('button', { name: 'Run', exact: true }).click();
+  await expect
+    .poll(
+      async () => {
+        const response = await page.request.get('/api/tasks');
+        expect(response.ok()).toBe(true);
+        const { tasks } = (await response.json()) as {
+          tasks: Array<{
+            scheduleId: string | null;
+            status: string;
+            payload: { agentInput?: string };
+          }>;
+        };
+        const completed = tasks.find(
+          (task) => task.scheduleId === createdSchedule?.id && task.status === 'completed',
+        );
+        return completed && { status: completed.status, input: completed.payload.agentInput };
+      },
+      { timeout: 30_000 },
+    )
+    .toEqual({ status: 'completed', input: 'Say hello.' });
 
   await page.setViewportSize({ width: 390, height: 844 });
   const mobileTabs = page.locator('.mobile-nav').getByRole('tab');
@@ -537,15 +569,15 @@ test('a failed optional provider switch keeps the active runtime healthy', async
     .getByRole('tab', { name: /System/ })
     .click();
 
-  const codex = page.locator('.provider-card').filter({ hasText: 'Codex' });
+  const codex = page.locator('.provider-row').filter({ hasText: /codex/i });
   await codex.getByRole('button', { name: 'gpt-test' }).click();
 
   await expect(page.locator('.connection')).toContainText('Codex unavailable', {
     timeout: 10_000,
   });
-  await expect(codex.locator('.provider-title strong')).toHaveText('Offline');
+  await expect(codex.locator('.provider-status')).toContainText('Offline');
   await expect(page.getByRole('alert')).toHaveCount(0);
-  await expect(page.locator('.system-section .section-heading-row').first()).toContainText(
+  await expect(page.locator('.current-model').first()).toContainText(
     /deterministic · deterministic/i,
   );
 });
@@ -749,7 +781,7 @@ test('an accepted run is not restored to the composer when its refresh fails', a
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 
   await expect(page.getByRole('alert')).toContainText(
-    'Run accepted, but conversation refresh failed',
+    'Run accepted, but client reconciliation failed',
   );
   await expect(composer).toHaveValue('');
 });

@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { DatabaseStore } from '../memory/db.js';
 
 export interface Skill {
   name: string;
@@ -29,6 +30,17 @@ export interface SkillSummary {
   enabled?: boolean;
 }
 
+export class SkillAvailabilityError extends Error {
+  constructor(
+    readonly reason: 'not_found' | 'disabled' | 'missing_tools',
+    message: string,
+    readonly unavailableTools: readonly string[] = [],
+  ) {
+    super(message);
+    this.name = 'SkillAvailabilityError';
+  }
+}
+
 export interface LoadedSkill {
   name: string;
   description: string;
@@ -56,11 +68,26 @@ function skillTriggers(skill: Skill): string[] {
 
 export class SkillRegistry {
   private readonly skills = new Map<string, Skill>();
+  private store?: DatabaseStore;
+
+  attachStore(store: DatabaseStore): void {
+    this.store = store;
+    for (const skill of this.skills.values()) this.replace(skill);
+  }
+
+  private persist(skill: Skill): Skill {
+    const saved = {
+      ...skill,
+      enabled: this.store?.getSkillEnabled(skill.name) ?? skill.enabled ?? true,
+    };
+    this.store?.saveSkill(saved);
+    return saved;
+  }
 
   register(skill: Skill): void {
     if (!skill.name.trim()) throw new Error('Skill name is required');
     if (this.skills.has(skill.name)) throw new Error(`Skill already registered: ${skill.name}`);
-    this.skills.set(skill.name, skill);
+    this.skills.set(skill.name, this.persist(skill));
   }
 
   registerInstruction(skill: Omit<Skill, 'input' | 'execute'>): void {
@@ -73,7 +100,7 @@ export class SkillRegistry {
 
   replace(skill: Skill): void {
     if (!skill.name.trim()) throw new Error('Skill name is required');
-    this.skills.set(skill.name, skill);
+    this.skills.set(skill.name, this.persist(skill));
   }
 
   list(): SkillSummary[] {
@@ -99,12 +126,14 @@ export class SkillRegistry {
   enable(name: string): void {
     const skill = this.skills.get(name);
     if (!skill) throw new Error(`Unknown skill: ${name}`);
+    this.store?.saveSkill({ ...skill, enabled: true });
     this.skills.set(name, { ...skill, enabled: true });
   }
 
   disable(name: string): void {
     const skill = this.skills.get(name);
     if (!skill) throw new Error(`Unknown skill: ${name}`);
+    this.store?.saveSkill({ ...skill, enabled: false });
     this.skills.set(name, { ...skill, enabled: false });
   }
 
@@ -142,13 +171,19 @@ export class SkillRegistry {
 
   load(name: string, availableTools?: ReadonlySet<string>): LoadedSkill {
     const skill = this.skills.get(name);
-    if (!skill) throw new Error(`Unknown skill: ${name}`);
+    if (!skill) throw new SkillAvailabilityError('not_found', `Unknown skill: ${name}`);
+    if (skill.enabled === false)
+      throw new SkillAvailabilityError('disabled', `Skill ${name} is disabled`);
     const requiredTools = skill.allowedTools ?? [];
     const unavailable = availableTools
       ? requiredTools.filter((tool) => !availableTools.has(tool))
       : [];
     if (unavailable.length)
-      throw new Error(`Skill ${name} requires unavailable tools: ${unavailable.join(', ')}`);
+      throw new SkillAvailabilityError(
+        'missing_tools',
+        `Skill ${name} requires unavailable tools: ${unavailable.join(', ')}`,
+        unavailable,
+      );
     return {
       name: skill.name,
       description: skill.description,
@@ -160,6 +195,7 @@ export class SkillRegistry {
 
   promptContext(input: string, maxBytes = 30_000, availableTools?: ReadonlySet<string>): string {
     const catalog = this.list()
+      .filter((skill) => skill.enabled !== false)
       .map(
         (skill) =>
           `- ${skill.name}: ${skill.description}${skill.triggers.length ? ` (trigger words: ${skill.triggers.join(', ')})` : ''}`,
@@ -198,6 +234,7 @@ export class SkillRegistry {
   async dispatch(name: string, input: unknown): Promise<unknown> {
     const skill = this.skills.get(name);
     if (!skill) throw new Error(`Unknown skill: ${name}`);
+    if (skill.enabled === false) throw new Error(`Skill ${name} is disabled`);
     return skill.execute(skill.input.parse(input));
   }
 }

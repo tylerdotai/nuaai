@@ -1,9 +1,21 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { relative } from 'node:path';
+import { redactText } from '../security/redaction.js';
+import { abortableStream } from './async.js';
+import {
+  type ExecutionRequest,
+  MAX_GOAL_DURATION_MS,
+  MAX_GOAL_RUNS,
+  executionPolicy,
+  executionRequestSchema,
+} from './execution-policy.js';
 
 import type { RunArtifactCandidate, RunArtifactRegistry } from '../artifacts/registry.js';
 import type { RuntimeConfig } from '../config/index.js';
 import type { McpManager } from '../integrations/mcp.js';
 import type { DatabaseStore, MessageRow, RunRow, SessionRow, ThreadRow } from '../memory/db.js';
+import type { KnowledgeLearner } from '../memory/learning.js';
+import { memoryVisibleInWorkspace } from '../memory/scope.js';
 import type { ProviderRegistry } from '../providers/registry.js';
 import { canonicalProviderMessages } from '../providers/request.js';
 import type {
@@ -22,31 +34,49 @@ import {
   type ToolRegistry,
   createToolBudget,
 } from '../tools/registry.js';
+import { assertSafeProjectFile } from '../workspace/fs.js';
 import {
   ApprovalDeniedError,
   ApprovalExpiredError,
+  type ApprovalPreviewV1,
   type ApprovalRequestRow,
   type ApprovalRequestView,
   ApprovalStateError,
   type ApprovalStatus,
   approvalPayloadHash,
   approvalTarget,
+  buildTransientApprovalPreview,
   canonicalizeApprovalArguments,
   publicApprovalRequest,
 } from './approvals.js';
 import {
+  type VerificationObservation,
   buildCapabilityManifest,
   classifyVerificationPolicy,
+  hasRelevantVerificationEvidence,
+  isCapabilityRefusal,
+  requestDisablesTools,
   verificationRequiresEvidence,
 } from './capabilities.js';
+import { ContextBufferManager } from './context-buffer.js';
 import {
+  assertRequestContextBudget,
   estimateMessageTokens,
   estimateToolSchemaTokens,
   selectContextMessages,
 } from './context.js';
 import { type EventRecord, createEvent } from './events.js';
+import {
+  type SessionIdentitySnapshot,
+  captureSessionIdentity,
+  identityStatus,
+  identityWorkspace,
+  sessionIdentityPrompt,
+} from './identity.js';
+import { registerRuntimeIntrospection } from './introspection.js';
 import { assembleSystemPrompt } from './prompt.js';
 import { SessionRunQueue } from './queue.js';
+import { ToolExecutionError, isRepairableToolRejection } from './tool-errors.js';
 
 export interface RuntimeOptions {
   root: string;
@@ -54,16 +84,28 @@ export interface RuntimeOptions {
   store: DatabaseStore;
   providers: ProviderRegistry;
   tools: ToolRegistry;
-  identityContext?: string;
   mcp?: McpManager;
   skills?: SkillRegistry;
   skillLearner?: SkillLearner;
+  knowledgeLearner?: KnowledgeLearner;
   artifacts?: RunArtifactRegistry;
   resolvePermissions?: (source: string) => PermissionContext;
+  onRunAdmitted?: (run: RunRow, request: RunRequest) => void;
+}
+export interface SessionIdentityOptions {
+  workspaceRoot?: string;
+  parentSessionId?: string;
+  parentIdentitySnapshotId?: string;
 }
 export interface RunRequest {
+  execution?: ExecutionRequest;
+  parentRunId?: string;
+  goalId?: string;
+  continuationOf?: string;
+  identitySnapshotId?: string;
   threadId: string;
   input: string;
+  verificationInput?: string;
   images?: ProviderImage[];
   provider?: string;
   model?: string;
@@ -72,6 +114,16 @@ export interface RunRequest {
   permissionSource?: string;
 }
 export type RuntimeListener = (event: EventRecord & { id: number }) => void;
+
+export class RunRecoveryAuthorizationError extends Error {
+  readonly code = 'RUN_RECOVERY_AUTHORIZATION_REQUIRED';
+  constructor() {
+    super(
+      'Run recovery requires retained execution context and current authorization for its original authority source.',
+    );
+    this.name = 'RunRecoveryAuthorizationError';
+  }
+}
 
 const modelDeltaBatchBytes = 256;
 const modelDeltaBatchIntervalMs = 50;
@@ -112,14 +164,6 @@ function transcriptSummaryContext(
   ].join('\n');
 }
 
-function isCapabilityRefusal(value: string): boolean {
-  return (
-    /\b(?:i\s+(?:can't|cannot|do not|don't)\s+(?:access|create|send|read|run|have)|what\s+i\s+cannot|not able to|without direct access)\b/i.test(
-      value,
-    ) || /\b(?:there (?:is|are)|i have)\s+no\b.{0,80}\b(?:tool|access|shell|browser)\b/i.test(value)
-  );
-}
-
 function looksLikeFutureIntent(value: string): boolean {
   const trimmed = value.trim();
   return (
@@ -144,11 +188,7 @@ export function selectProviderTools(
   input: string,
   tools: ProviderToolSchema[],
 ): ProviderToolSchema[] {
-  return /\b(?:do not|don't|without|no)\s+(?:use|call|run|execute)\s+(?:any\s+)?tools?\b/i.test(
-    input,
-  )
-    ? []
-    : tools;
+  return requestDisablesTools(input) ? [] : tools;
 }
 
 function selectCodexDynamicTools(
@@ -362,16 +402,14 @@ function requestsExactRepositoryCount(input: string): boolean {
   );
 }
 
-function requestsMemoryMutation(input: string): boolean {
-  return (
-    /\b(?:delete|forget|remove|store|save|update|clear)\b.{0,60}\b(?:memory|memories|remembered)\b/i.test(
-      input,
-    ) ||
-    /\b(?:memory|memories|remembered)\b.{0,60}\b(?:delete|forget|remove|store|save|update|clear)\b/i.test(
-      input,
-    )
-  );
-}
+import {
+  type ApprovalMode,
+  SmartApprovalDeniedError,
+  reviewApproval,
+  sessionApprovalGrant,
+} from './approval-policy.js';
+
+import { HostCommandError } from '../host/command.js';
 
 interface RunAuthority {
   source: string;
@@ -404,13 +442,30 @@ export class AgentRuntime {
   private readonly writerOwnerId = randomUUID();
   private readonly runAuthorities = new Map<string, RunAuthority>();
   private readonly approvalWaiters = new Map<string, ApprovalWaiter>();
+  private readonly approvalPreviews = new Map<
+    string,
+    { payloadHash: string; preview: ApprovalPreviewV1 }
+  >();
   private readonly approvalExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private stopping = false;
+  private readonly releaseIntrospection: () => void;
 
   constructor(private readonly options: RuntimeOptions) {
-    this.options.store.releaseAllRunWriters();
-    this.recoverActiveRuns();
-    this.recoverApprovalRuns();
+    this.releaseIntrospection = registerRuntimeIntrospection(
+      options.tools,
+      options.store,
+      () => this.status().context,
+      () => options.knowledgeLearner?.status() ?? { available: false, enabled: false },
+      (runId) => this.executionStatus(runId),
+    );
+    try {
+      this.options.store.releaseAllRunWriters();
+      this.recoverActiveRuns();
+      this.recoverApprovalRuns();
+    } catch (error) {
+      this.releaseIntrospection();
+      throw error;
+    }
   }
 
   private failRecoveredRun(run: RunRow, output: string, approvalId?: string): void {
@@ -486,21 +541,72 @@ export class AgentRuntime {
   listApprovals(status?: ApprovalStatus): ApprovalRequestView[] {
     return this.options.store
       .listApprovalRequests(status)
-      .map((approval) => publicApprovalRequest(approval));
+      .map((approval) => this.approvalView(approval));
+  }
+
+  private approvalView(approval: ApprovalRequestRow): ApprovalRequestView {
+    const view = publicApprovalRequest(approval);
+    const live = this.approvalPreviews.get(approval.id);
+    const preview =
+      approval.status === 'pending' && live?.payloadHash === approval.payloadHash
+        ? live.preview
+        : view.preview;
+    const scope = this.options.store.approvalScope(approval.id);
+    return {
+      ...view,
+      preview: {
+        ...preview,
+        fields: scope
+          ? [
+              { label: 'Session scope', value: `${scope.tool} · ${scope.target}` },
+              ...preview.fields,
+            ]
+          : preview.fields,
+      },
+    };
   }
 
   getApproval(id: string): ApprovalRequestView | undefined {
     const approval = this.options.store.getApprovalRequest(id);
-    return approval ? publicApprovalRequest(approval) : undefined;
+    return approval ? this.approvalView(approval) : undefined;
   }
 
-  approveApproval(id: string, payloadHash: string): ApprovalRequestView {
-    const approval = this.options.store.decideApprovalRequest(
-      id,
-      'approved',
-      Date.now(),
-      payloadHash,
-    );
+  sessionApprovalPolicy(sessionId: string) {
+    return this.options.store.sessionApprovalPolicy(sessionId);
+  }
+
+  setSessionApprovalPolicy(sessionId: string, mode: ApprovalMode, revokeGrants = false) {
+    const current = this.options.store.sessionApprovalPolicy(sessionId);
+    const policy = { mode, grants: revokeGrants ? [] : current.grants };
+    this.options.store.saveSessionApprovalPolicy(sessionId, policy);
+    this.emit('approval.policy.changed', { mode, grants: policy.grants.length }, { sessionId });
+    return policy;
+  }
+
+  approveApproval(
+    id: string,
+    payloadHash: string,
+    scope: 'once' | 'session' = 'once',
+  ): ApprovalRequestView {
+    const approval = this.options.store.transaction(() => {
+      const grant = scope === 'session' ? this.options.store.approvalScope(id) : undefined;
+      if (scope === 'session' && !grant)
+        throw new Error('Session scope unavailable for this legacy approval; approve once instead');
+      const decided = this.options.store.decideApprovalRequest(
+        id,
+        'approved',
+        Date.now(),
+        payloadHash,
+      );
+      if (grant && decided.sessionId) {
+        const policy = this.options.store.sessionApprovalPolicy(decided.sessionId);
+        this.options.store.saveSessionApprovalPolicy(decided.sessionId, {
+          ...policy,
+          grants: [...policy.grants.filter((item) => item.key !== grant.key), grant].slice(-256),
+        });
+      }
+      return decided;
+    });
     this.emitApprovalEvent('approval.approved', approval);
     const waiter = this.approvalWaiters.get(id);
     if (waiter) waiter.resolve();
@@ -540,6 +646,7 @@ export class AgentRuntime {
       | 'approval.failed',
     approval: ApprovalRequestRow,
   ): void {
+    if (type !== 'approval.requested') this.approvalPreviews.delete(approval.id);
     this.emit(
       type,
       { ...publicApprovalRequest(approval) },
@@ -595,10 +702,22 @@ export class AgentRuntime {
   private resumeApprovedRun(approval: ApprovalRequestRow): void {
     const run = this.options.store.getRun(approval.runId);
     if (!run || run.status !== 'paused') return;
-    const permissions = this.currentPermissions(run.id, approval.permissionSource);
+    const stored = this.options.store.getRunExecutionContext(run.id);
+    let permissions: PermissionContext;
+    try {
+      permissions = stored
+        ? this.recoverExecutionContext(run.id).permissions
+        : this.currentPermissions(run.id, approval.permissionSource);
+    } catch (error) {
+      this.terminateApprovalRun(
+        approval,
+        error instanceof Error ? error.message : 'Run recovery authorization failed',
+      );
+      return;
+    }
     this.runAuthorities.set(run.id, { source: approval.permissionSource, permissions });
     const provider = this.options.providers.get(run.provider);
-    this.enqueueRun(run, provider, permissions, approval.permissionSource, undefined, true);
+    this.enqueueRun(run, provider, permissions, approval.permissionSource, stored?.images, true);
   }
 
   private approvalWaiter(id: string): ApprovalWaiter {
@@ -659,13 +778,92 @@ export class AgentRuntime {
     context: { budget?: ToolBudget; timeoutMs?: number; signal?: AbortSignal },
   ): Promise<ApprovedToolExecution | undefined> {
     const admission = this.options.tools.previewAdmission(toolName, input, {
-      root: this.options.root,
+      root: this.runIdentity(run).workspaceRoot,
       permissions,
       ...context,
       threadId: run.threadId,
       runId: run.id,
     });
-    if (admission.definition.governance.approval !== 'profile') return undefined;
+    const forceReview = (input as Record<string, unknown> | null)?.requestApproval === true;
+    if (admission.definition.governance.approval !== 'profile' && !forceReview) return undefined;
+    const policy = this.options.store.sessionApprovalPolicy(sessionId);
+    const grant = sessionApprovalGrant(
+      toolName,
+      admission.input as Record<string, unknown>,
+      this.runIdentity(run).workspaceRoot,
+      permissionSource,
+    );
+    if (
+      policy.mode === 'unguarded' ||
+      (!forceReview && policy.grants.some((item) => item.key === grant.key))
+    ) {
+      this.emit(
+        'approval.policy.decision',
+        {
+          mode: policy.mode,
+          toolName,
+          decision: 'allow',
+          source: policy.mode === 'unguarded' ? 'unguarded' : 'session_grant',
+          scope: grant.key,
+        },
+        { sessionId, threadId: run.threadId, runId: run.id },
+      );
+      return undefined;
+    }
+    if (policy.mode === 'smart' && !forceReview) {
+      const routine = [
+        'workspace.write',
+        'workspace.edit',
+        'workspace.mkdir',
+        'workspace.copy',
+        'workspace.command',
+        'github.auth',
+        'github.repo.list',
+        'skill.create',
+      ].includes(toolName);
+      const mandatoryHuman =
+        ['workspace.trash', 'workspace.move', 'memory.forget'].includes(toolName) ||
+        ['external', 'unknown'].includes(admission.definition.governance.sideEffects);
+      const verdict =
+        routine && !mandatoryHuman
+          ? { decision: 'allow' as const, reason: 'Routine bounded local operation' }
+          : mandatoryHuman
+            ? {
+                decision: 'ask' as const,
+                reason: 'Destructive, external or unknown effect requires explicit human approval',
+              }
+            : await reviewApproval(
+                this.options.providers.get(run.provider),
+                run.model,
+                {
+                  userRequest: run.input,
+                  tool: toolName,
+                  arguments: admission.input,
+                  sideEffects: admission.definition.governance.sideEffects,
+                },
+                context.signal,
+              );
+      this.emit(
+        'approval.policy.decision',
+        { mode: 'smart', toolName, ...verdict },
+        { sessionId, threadId: run.threadId, runId: run.id },
+      );
+      // A concurrent policy change cannot be overruled by a stale model verdict.
+      if (this.options.store.sessionApprovalPolicy(sessionId).mode === 'smart') {
+        if (verdict.decision === 'deny') {
+          const error = new SmartApprovalDeniedError(toolName, verdict.reason);
+          this.addRunMessage(run, 'assistant', error.message, run.provider, run.model);
+          this.options.store.updateRun(run.id, { status: 'failed', output: error.message });
+          this.emit(
+            'run.failed',
+            { error: error.message, reason: 'approval_policy_denied', toolName },
+            { sessionId, threadId: run.threadId, runId: run.id, correlationId: run.correlationId },
+          );
+          throw error;
+        }
+        if (verdict.decision === 'allow') return undefined;
+      }
+    }
     if (!admission.input || typeof admission.input !== 'object' || Array.isArray(admission.input))
       throw new Error(`Approval arguments must be an object: ${toolName}`);
     const parsedArguments = admission.input as Record<string, unknown>;
@@ -702,7 +900,15 @@ export class AgentRuntime {
         },
         now,
       );
+      this.options.store.saveApprovalScope(approval.id, grant);
       const waiter = this.approvalWaiter(approval.id);
+      this.approvalPreviews.set(approval.id, {
+        payloadHash,
+        preview: buildTransientApprovalPreview(toolName, parsedArguments, {
+          permissionSource,
+          sessionId,
+        }),
+      });
       this.options.store.updateRun(run.id, { status: 'paused' });
       this.emitApprovalEvent('approval.requested', approval);
       this.emit(
@@ -715,6 +921,7 @@ export class AgentRuntime {
         await waiter.promise;
       } finally {
         this.approvalWaiters.delete(approval.id);
+        this.approvalPreviews.delete(approval.id);
       }
       approval = this.options.store.getApprovalRequest(approval.id) as ApprovalRequestRow;
     }
@@ -726,7 +933,7 @@ export class AgentRuntime {
     const currentPermissions = this.currentPermissions(run.id, permissionSource);
     try {
       const currentAdmission = this.options.tools.previewAdmission(toolName, input, {
-        root: this.options.root,
+        root: this.runIdentity(run).workspaceRoot,
         permissions: currentPermissions,
         ...context,
         threadId: run.threadId,
@@ -787,7 +994,7 @@ export class AgentRuntime {
         toolName,
         input,
         {
-          root: this.options.root,
+          root: this.runIdentity(run).workspaceRoot,
           permissions: approved?.permissions ?? permissions,
           ...context,
           threadId: run.threadId,
@@ -814,6 +1021,16 @@ export class AgentRuntime {
       }
       return result;
     } catch (error) {
+      if (error instanceof HostCommandError) {
+        this.addRunMessage(run, 'assistant', error.message, run.provider, run.model);
+        this.options.store.updateRun(run.id, { status: 'failed', output: error.message });
+        this.emit(
+          'run.failed',
+          { error: error.message, reason: 'host_command_partial_failure', toolName },
+          { sessionId, threadId: run.threadId, runId: run.id, correlationId: run.correlationId },
+        );
+        this.controllers.get(run.id)?.abort(error);
+      }
       if (approved) {
         const failed = this.options.store.failApprovalExecution(approved.approval.id, error);
         this.clearApprovalExpiry(approved.approval.id);
@@ -884,6 +1101,17 @@ export class AgentRuntime {
       try {
         const artifact = await this.options.artifacts.capture({
           ...candidate,
+          ...(candidate.workspacePath
+            ? {
+                workspacePath: relative(
+                  identityWorkspace(this.options.root),
+                  await assertSafeProjectFile(
+                    this.runIdentity(run).workspaceRoot,
+                    candidate.workspacePath,
+                  ),
+                ),
+              }
+            : {}),
           runId: run.id,
           threadId: thread.id,
           sourceTool,
@@ -925,14 +1153,37 @@ export class AgentRuntime {
     title?: string,
     sourceKey?: string,
     id?: string,
+    options: SessionIdentityOptions = {},
   ): { session: SessionRow; thread: ThreadRow } {
-    const created = this.options.store.createSession(
-      title,
-      Date.now(),
-      this.options.identityContext ?? '',
-      sourceKey,
-      id,
-    );
+    const sessionId = id ?? randomUUID();
+    const parent = options.parentSessionId
+      ? options.parentIdentitySnapshotId
+        ? this.options.store.getSessionIdentity(
+            options.parentSessionId,
+            options.parentIdentitySnapshotId,
+          )
+        : this.ensureSessionIdentity(options.parentSessionId)
+      : undefined;
+    if (options.parentIdentitySnapshotId && !parent)
+      throw new Error('Pinned parent identity is unavailable.');
+    if (
+      parent &&
+      options.workspaceRoot &&
+      identityWorkspace(this.options.root, options.workspaceRoot) !== parent.workspaceRoot
+    )
+      throw new Error('A child session must inherit its parent workspace.');
+    const snapshot = captureSessionIdentity({
+      root: this.options.root,
+      workspaceRoot: options.workspaceRoot,
+      sessionId,
+      parent,
+    });
+    const created = this.options.store.transaction(() => {
+      const value = this.options.store.createSession(title, Date.now(), '', sourceKey, sessionId);
+      this.options.store.saveSessionIdentity(snapshot);
+      return value;
+    });
+    this.emit('session.identity.changed', identityStatus(snapshot), { sessionId });
     this.emit(
       'session.created',
       { title: created.session.title },
@@ -949,15 +1200,86 @@ export class AgentRuntime {
   getOrCreateSession(
     sourceKey: string,
     title?: string,
+    options: SessionIdentityOptions = {},
   ): { session: SessionRow; thread: ThreadRow } {
     const existing = this.options.store.getSessionBySource(sourceKey);
     if (existing) {
+      this.ensureSessionIdentity(existing.id, options.workspaceRoot);
       const thread = this.options.store.listThreads(existing.id)[0];
       if (!thread) throw new Error(`Session has no thread: ${existing.id}`);
       this.emit('session.resumed', { title: existing.title }, { sessionId: existing.id });
       return { session: existing, thread };
     }
-    return this.createSession(title, sourceKey);
+    return this.createSession(title, sourceKey, undefined, options);
+  }
+
+  private ensureSessionIdentity(
+    sessionId: string,
+    workspaceRoot?: string,
+  ): SessionIdentitySnapshot {
+    const session = this.options.store.getSession(sessionId);
+    if (!session) throw new Error(`Unknown session: ${sessionId}`);
+    const existing = this.options.store.getSessionIdentity(sessionId);
+    if (existing) {
+      if (
+        workspaceRoot &&
+        identityWorkspace(this.options.root, workspaceRoot) !== existing.workspaceRoot
+      )
+        throw new Error('The existing session belongs to another workspace; create a new session.');
+      return existing;
+    }
+    const snapshot = captureSessionIdentity({
+      root: this.options.root,
+      workspaceRoot,
+      sessionId,
+      origin: session.context.trim() ? 'legacy-retained' : 'legacy-captured',
+      legacyContext: session.context,
+    });
+    this.options.store.saveSessionIdentity(snapshot);
+    this.emit('session.identity.changed', identityStatus(snapshot), { sessionId });
+    return snapshot;
+  }
+
+  sessionIdentityStatus(sessionId: string) {
+    return identityStatus(this.ensureSessionIdentity(sessionId));
+  }
+
+  refreshSessionIdentity(sessionId: string) {
+    const previous = this.ensureSessionIdentity(sessionId);
+    const parent = previous.inheritedFrom
+      ? this.ensureSessionIdentity(previous.inheritedFrom.sessionId)
+      : undefined;
+    const snapshot = captureSessionIdentity({
+      root: this.options.root,
+      workspaceRoot: previous.workspaceRoot,
+      sessionId,
+      revision: previous.revision + 1,
+      origin: 'refreshed',
+      parent,
+    });
+    this.options.store.transaction(() => {
+      this.options.store.saveSessionIdentity(snapshot);
+      const session = this.options.store.getSession(sessionId);
+      if (previous.origin === 'legacy-retained' && session)
+        this.options.store.updateSessionContext(sessionId, '');
+    });
+    this.emit('session.identity.changed', identityStatus(snapshot), { sessionId });
+    return identityStatus(snapshot);
+  }
+
+  private runIdentity(run: RunRow): SessionIdentitySnapshot {
+    const thread = this.options.store.getThread(run.threadId);
+    if (!thread) throw new Error(`Unknown thread: ${run.threadId}`);
+    const id = this.options.store.getRunExecutionContext(run.id)?.identitySnapshotId;
+    const snapshot = id
+      ? this.options.store.getSessionIdentity(thread.sessionId, id)
+      : this.ensureSessionIdentity(thread.sessionId);
+    if (!snapshot)
+      throw new Error('The run identity snapshot is missing; refusing to change its instructions.');
+    const physical = identityWorkspace(this.options.root, snapshot.workspaceRoot);
+    if (physical !== snapshot.workspaceRoot)
+      throw new Error('Session workspace changed its physical boundary.');
+    return snapshot;
   }
 
   startNewSession(
@@ -1098,13 +1420,25 @@ export class AgentRuntime {
     return { name, model: registry.get(name).model };
   }
 
-  startRun(request: RunRequest): RunRow {
+  startRun(incoming: RunRequest): RunRow {
     if (this.stopping) throw new Error('Runtime is shutting down');
-    if (!request.input.trim()) throw new Error('Run input is required');
+    if (!incoming.input.trim()) throw new Error('Run input is required');
+    const execution = executionRequestSchema.parse(incoming.execution ?? { mode: 'standard' });
+    const request = { ...incoming, execution };
+    if (execution.mode === 'continuous' && !this.options.onRunAdmitted)
+      throw new Error('Continuous work is unavailable without its durable goal owner');
     if (request.idempotencyKey) {
       const existing = this.options.store.getRunByCorrelationId(request.idempotencyKey);
       if (existing) {
-        if (existing.threadId !== request.threadId || existing.input !== request.input)
+        if (
+          existing.threadId !== request.threadId ||
+          existing.input !== request.input ||
+          JSON.stringify(
+            this.options.store.getRunExecutionContext(existing.id)?.requestedExecution ?? {
+              mode: 'standard',
+            },
+          ) !== JSON.stringify(execution)
+        )
           throw new Error(`Idempotency key collision: ${request.idempotencyKey}`);
         return existing;
       }
@@ -1122,6 +1456,10 @@ export class AgentRuntime {
         : (registry.selection?.(providerName).model ?? provider.model));
     const thread = this.options.store.getThread(request.threadId);
     if (!thread) throw new Error(`Unknown thread: ${request.threadId}`);
+    const identity = request.identitySnapshotId
+      ? this.options.store.getSessionIdentity(thread.sessionId, request.identitySnapshotId)
+      : this.ensureSessionIdentity(thread.sessionId);
+    if (!identity) throw new Error('Requested run identity snapshot is missing.');
     const correlationId = request.idempotencyKey ?? randomUUID();
     const run = this.options.store.createRun(
       thread.id,
@@ -1143,6 +1481,32 @@ export class AgentRuntime {
     );
     const permissions = request.permissions ?? permissionContextForProfile('read-only');
     const permissionSource = request.permissionSource ?? 'direct';
+    this.options.store.saveRunExecutionContext(run.id, {
+      identitySnapshotId: identity.id,
+      verificationInput: request.verificationInput ?? request.input,
+      requestedExecution: execution,
+      permissionSource,
+      ...(request.goalId ? { goalId: request.goalId, continuationOf: request.continuationOf } : {}),
+      permissions: {
+        approved: [...permissions.approved].filter(
+          (level): level is 'read' | 'write' | 'execute' => level !== 'secret',
+        ),
+        capabilities: { ...permissions.capabilities, secrets: false },
+      },
+      ...(request.images?.length ? { images: structuredClone(request.images) } : {}),
+    });
+    try {
+      this.options.onRunAdmitted?.(run, request);
+    } catch (error) {
+      const detail = redactText(error instanceof Error ? error.message : String(error));
+      this.options.store.updateRun(run.id, { status: 'failed', output: detail });
+      this.emit(
+        'run.failed',
+        { error: detail, failureCode: 'RUN_ADMISSION_REJECTED', executionState: 'not_executed' },
+        { runId: run.id, threadId: run.threadId, correlationId: run.correlationId },
+      );
+      throw error;
+    }
     this.runAuthorities.set(run.id, { source: permissionSource, permissions });
     this.enqueueRun(run, provider, permissions, permissionSource, request.images);
     return run;
@@ -1184,6 +1548,7 @@ export class AgentRuntime {
   }
 
   async shutdown(): Promise<void> {
+    this.approvalPreviews.clear();
     if (!this.stopping) {
       this.stopping = true;
       for (const run of this.options.store.listActiveRuns()) {
@@ -1198,18 +1563,108 @@ export class AgentRuntime {
       this.approvalExpiryTimers.clear();
     }
     await this.runQueue.drain();
+    this.releaseIntrospection();
   }
 
+  private recoverExecutionContext(runId: string) {
+    const stored = this.options.store.getRunExecutionContext(runId);
+    if (!stored) throw new RunRecoveryAuthorizationError();
+    const current =
+      this.options.resolvePermissions?.(stored.permissionSource) ??
+      (stored.permissionSource === 'direct' &&
+      stored.permissions.approved.every((level) => level === 'read')
+        ? permissionContextForProfile('read-only')
+        : undefined);
+    if (!current) throw new RunRecoveryAuthorizationError();
+    const permissions: PermissionContext = {
+      approved: new Set(stored.permissions.approved.filter((level) => current.approved.has(level))),
+      capabilities: Object.fromEntries(
+        Object.entries(stored.permissions.capabilities).map(([key, value]) => [
+          key,
+          value === true &&
+            current.capabilities[key as keyof PermissionContext['capabilities']] === true,
+        ]),
+      ),
+    };
+    return {
+      permissionSource: stored.permissionSource,
+      permissions,
+      images: stored.images,
+      verificationInput: stored.verificationInput,
+      identitySnapshotId: stored.identitySnapshotId,
+    };
+  }
+
+  continueGoalRun(runId: string, goalId: string, idempotencyKey: string): RunRow {
+    const goal = this.options.store.getGoal(goalId);
+    const previous = this.options.store.getRun(runId);
+    if (!goal || goal.status !== 'queued' || goal.currentRunId !== runId || !previous)
+      throw new Error('Goal is no longer eligible for continuation');
+    return this.startRun({
+      ...this.recoverExecutionContext(runId),
+      threadId: previous.threadId,
+      input: previous.input,
+      goalId,
+      continuationOf: runId,
+      idempotencyKey,
+    });
+  }
+
+  async waitForGoalResult(runId: string): Promise<{ status: string; output: string; run: RunRow }> {
+    const first = await this.waitForRun(runId);
+    for (;;) {
+      const goalId = this.options.store.getRunExecutionContext(runId)?.goalId;
+      const goal = goalId && this.options.store.getGoal(goalId);
+      if (!goal) return { status: first.status, output: first.output ?? '', run: first };
+      const current = this.options.store.getRun(goal.currentRunId);
+      if (!current) throw new Error('Goal current run is unavailable');
+      if (['completed', 'blocked', 'cancelled', 'superseded'].includes(goal.status))
+        return {
+          status:
+            goal.status === 'completed'
+              ? 'completed'
+              : goal.status === 'cancelled'
+                ? 'cancelled'
+                : 'failed',
+          output:
+            goal.status === 'completed'
+              ? (current.output ?? '')
+              : (goal.checkpoint.reason ?? current.output ?? ''),
+          run: current,
+        };
+      if (['failed', 'cancelled'].includes(current.status))
+        return { status: current.status, output: current.output ?? '', run: current };
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
+  childPermissions(parentRunId: string, ceiling: PermissionContext): PermissionContext {
+    const { permissions } = this.recoverExecutionContext(parentRunId);
+    return {
+      approved: new Set([...ceiling.approved].filter((level) => permissions.approved.has(level))),
+      capabilities: Object.fromEntries(
+        Object.entries(ceiling.capabilities).map(([key, value]) => [
+          key,
+          value === true &&
+            permissions.capabilities[key as keyof PermissionContext['capabilities']] === true,
+        ]),
+      ),
+    };
+  }
+
+  /** Explicit retry in a new run, not automatic replay of interrupted side effects. */
   resumeRun(runId: string): RunRow {
     const run = this.options.store.getRun(runId);
     if (!run) throw new Error(`Unknown run: ${runId}`);
     if (!['failed', 'cancelled'].includes(run.status))
       throw new Error(`Run ${runId} is not resumable`);
+    const recovery = this.recoverExecutionContext(runId);
     const resumed = this.startRun({
       threadId: run.threadId,
       input: run.input,
       provider: run.provider,
       model: run.model,
+      ...recovery,
     });
     this.emit(
       'run.resumed',
@@ -1233,8 +1688,49 @@ export class AgentRuntime {
   async providerHealth() {
     return this.options.providers.health();
   }
+  executionStatus(runId?: string) {
+    const limits = this.options.config.limits;
+    const goalId = runId ? this.options.store.getRunExecutionContext(runId)?.goalId : undefined;
+    const goal = goalId ? this.options.store.getGoal(goalId) : undefined;
+    const family = goal?.checkpoint.familyRootId
+      ? this.options.store.getGoal(goal.checkpoint.familyRootId)
+      : goal;
+    const policy = goal?.checkpoint.policy;
+    const admissionsUsed = family?.checkpoint.familyAdmissions ?? 0;
+    return {
+      automaticContinuation: Boolean(this.options.onRunAdmitted),
+      standard: executionPolicy(undefined, limits),
+      continuous: {
+        explicitAllowanceRequired: true,
+        maxDurationMs: MAX_GOAL_DURATION_MS,
+        maxRuns: MAX_GOAL_RUNS,
+      },
+      slice: {
+        runTimeoutMs: limits.runTimeoutMs,
+        modelTimeoutMs: limits.providerTimeoutMs,
+        toolTimeoutMs: limits.toolTimeoutMs,
+        maxTurns: limits.maxTurns,
+        maxToolCalls: limits.maxToolCalls,
+        maxToolCostUnits: limits.maxToolCostUnits,
+      },
+      goal:
+        goal && policy
+          ? {
+              id: goal.id,
+              status: goal.status,
+              ...policy,
+              deadlineAt: goal.checkpoint.deadlineAt,
+              sliceCount: goal.sliceCount,
+              admissionsUsed,
+              admissionsRemaining: Math.max(0, policy.maxRuns - admissionsUsed),
+            }
+          : null,
+    };
+  }
+
   status(): {
     activeRuns: number;
+    execution: ReturnType<AgentRuntime['executionStatus']>;
     queuedRuns: number;
     sessions: number;
     providers: string[];
@@ -1249,6 +1745,7 @@ export class AgentRuntime {
   } {
     return {
       activeRuns: this.controllers.size,
+      execution: this.executionStatus(),
       queuedRuns: this.runQueue.queuedRuns(),
       sessions: this.options.store.listSessions().length,
       providers: this.options.providers.list(),
@@ -1305,17 +1802,29 @@ export class AgentRuntime {
     const controller = new AbortController();
     this.controllers.set(run.id, controller);
     let writerClaimed = false;
+    const goalId = this.options.store.getRunExecutionContext(run.id)?.goalId;
+    const deadlineAt = goalId
+      ? this.options.store.getGoal(goalId)?.checkpoint.deadlineAt
+      : undefined;
+    const remaining = deadlineAt ? Date.parse(deadlineAt) - Date.now() : Number.POSITIVE_INFINITY;
+    const duration = Math.min(this.options.config.limits.runTimeoutMs, remaining);
+    const timeoutReason = duration === remaining ? 'Goal deadline reached' : 'Run timed out';
     const timeout = setTimeout(
-      () => controller.abort(new Error('Run timed out')),
-      this.options.config.limits.runTimeoutMs,
+      () => controller.abort(new Error(timeoutReason)),
+      Math.max(0, duration),
     );
+    if (remaining <= 0) controller.abort(new Error('Goal deadline reached'));
     try {
+      controller.signal.throwIfAborted();
       this.options.store.updateRun(run.id, { status: 'running' });
       const thread = this.options.store.getThread(run.threadId);
       if (!thread) throw new Error(`Unknown thread: ${run.threadId}`);
       writerClaimed = this.options.store.claimRunWriter(thread.id, run.id, this.writerOwnerId);
       if (!writerClaimed) throw new Error('Run could not claim the active transcript writer');
+      const identity = this.runIdentity(run);
+      const workspaceRoot = identity.workspaceRoot;
       const model = run.model;
+      const continuationOf = this.options.store.getRunExecutionContext(run.id)?.continuationOf;
       const existingInputMessage = resuming
         ? this.options.store
             .listMessages(thread.id, 100_000)
@@ -1323,7 +1832,16 @@ export class AgentRuntime {
             .at(-1)
         : undefined;
       const inputMessage =
-        existingInputMessage ?? this.addRunMessage(run, 'user', run.input, provider.name, model);
+        existingInputMessage ??
+        this.addRunMessage(
+          run,
+          continuationOf ? 'system' : 'user',
+          continuationOf
+            ? 'Continue the existing user request using the durable recorded outcomes. This is a runtime continuation, not a new user message. Do not repeat completed effects or infer approval from this checkpoint.'
+            : run.input,
+          provider.name,
+          model,
+        );
       if (!resuming)
         this.emit(
           'run.started',
@@ -1341,10 +1859,12 @@ export class AgentRuntime {
       let toolBudgetExhausted = false;
       let toolBudgetNoticeAdded = false;
       let toolActivity = false;
+      const verificationObservations: VerificationObservation[] = [];
       let verifiedRepositoryCount: number | null = null;
       let finalizationRequested = false;
       let recoveryRequested = false;
       let rejectedCapabilityClaim = false;
+      let capabilityCheckRequested = false;
       let modelTurnBudgetExhausted = false;
       const unresolvedToolFailures: string[] = [];
       const repeatedInvalidCalls = new Map<string, number>();
@@ -1352,44 +1872,33 @@ export class AgentRuntime {
         this.options.config.limits.maxToolCalls,
         this.options.config.limits.maxToolCostUnits,
       );
-      const verificationPolicy = classifyVerificationPolicy(run.input);
-      const requiresLiveVerification = verificationRequiresEvidence(verificationPolicy);
-      const isolatedRequest = requiresLiveVerification || requestsMemoryMutation(run.input);
+      // Attached source material is evidence/data, not additional user requirements.
+      const verificationInput =
+        this.options.store.getRunExecutionContext(run.id)?.verificationInput ?? run.input;
+      const verificationPolicy = classifyVerificationPolicy(verificationInput);
+
       let memoryContext = '';
-      if (isolatedRequest) {
-        this.emit(
-          'memory.retrieved',
-          {
-            count: 0,
-            filtered: 0,
-            skipped:
-              verificationPolicy === 'memory_mutation'
-                ? 'memory_mutation'
-                : requiresLiveVerification
-                  ? 'live_verification'
-                  : 'memory_mutation',
-          },
-          {
-            sessionId: thread.sessionId,
-            threadId: thread.id,
-            runId: run.id,
-            correlationId: run.correlationId,
-          },
-        );
-      } else {
+      {
         let retrievalMode: 'semantic' | 'lexical' = 'semantic';
-        let retrieved: Array<{ content: string }> = [];
+        let retrieved: Array<{ id: string; content: string; metadata: Record<string, unknown> }> =
+          [];
         try {
           const embedding = await this.options.providers.get('ollama').embed(run.input);
-          retrieved = this.options.store.searchMemory(embedding, 4);
+          retrieved = this.options.store.searchMemory(embedding, 4, workspaceRoot);
         } catch {
           retrievalMode = 'lexical';
-          retrieved = this.options.store.searchMemoryLexical(run.input, 4);
+          retrieved = this.options.store.searchMemoryLexical(run.input, 4, workspaceRoot);
         }
         if (!retrieved.length && retrievalMode === 'semantic') {
           retrievalMode = 'lexical';
-          retrieved = this.options.store.searchMemoryLexical(run.input, 4);
+          retrieved = this.options.store.searchMemoryLexical(run.input, 4, workspaceRoot);
         }
+        const learned = this.options.store
+          .searchMemoryLexical(run.input, 4, workspaceRoot)
+          .filter((memory) => Boolean(memory.metadata.knowledge));
+        retrieved = [
+          ...new Map([...learned, ...retrieved].map((memory) => [memory.id, memory])).values(),
+        ].slice(0, 4);
         const usableMemory = retrieved.filter((memory) => !isCapabilityRefusal(memory.content));
         const memoryEntries = usableMemory.map((memory) => `- ${memory.content}`);
         let memoryBytes = 0;
@@ -1427,7 +1936,12 @@ export class AgentRuntime {
       }
       const pinnedMemory = this.options.store
         .searchMemoryRows()
-        .filter((memory) => memory.metadata.pinned === true && !isCapabilityRefusal(memory.content))
+        .filter(
+          (memory) =>
+            memory.metadata.pinned === true &&
+            memoryVisibleInWorkspace(memory.metadata, workspaceRoot) &&
+            !isCapabilityRefusal(memory.content),
+        )
         .map((memory) => `- ${memory.content}`);
       if (pinnedMemory.length) {
         const existingEntries = new Set(memoryContext ? memoryContext.split('\n') : []);
@@ -1472,7 +1986,7 @@ export class AgentRuntime {
             this.options.tools,
             this.options.mcp,
             permissions,
-            this.options.root,
+            workspaceRoot,
             this.options.config.limits.toolTimeoutMs,
             controller.signal,
             toolBudget,
@@ -1603,31 +2117,31 @@ export class AgentRuntime {
       const providerDynamicToolsByName = new Map(
         providerDynamicTools.map((tool) => [`${tool.namespace}.${tool.name}`, tool]),
       );
-      const skillContext = isolatedRequest
-        ? 'Isolated verification mode: use only the canonical registered tool that matches the request. Do not substitute workspace.command when a dedicated tool is listed above.'
-        : (this.options.skills?.promptContext(
-            run.input,
-            30_000,
-            new Set(availableTools.map((tool) => tool.name)),
-          ) ?? 'No skills are registered.');
+      const skillContext =
+        this.options.skills?.promptContext(
+          run.input,
+          30_000,
+          new Set(availableTools.map((tool) => tool.name)),
+        ) ?? 'No skills are registered.';
       const manifest = buildCapabilityManifest({
         provider,
         model,
-        root: this.options.root,
+        root: this.runIdentity(run).workspaceRoot,
         permissions,
         tools: this.options.tools,
         dynamicTools: providerDynamicTools,
         verificationPolicy,
       });
-      const sessionContext = thread.sessionId
-        ? this.options.store.getSession(thread.sessionId)?.context
-        : undefined;
+      const context = this.options.store.getSession(thread.sessionId)?.context;
+      const sessionContext = identity.origin === 'legacy-retained' ? undefined : context;
       const assemblePrompt = (summary: ReturnType<DatabaseStore['getThreadSummary']>) =>
         assembleSystemPrompt({
-          identity: this.options.identityContext,
-          projectContext:
-            sessionContext !== this.options.identityContext ? sessionContext : undefined,
+          identity: sessionIdentityPrompt(identity),
+          approvalPolicy: this.options.store.sessionApprovalPolicy(thread.sessionId).mode,
+          projectContext: sessionContext,
           memory: memoryContext,
+          learning: this.options.knowledgeLearner?.status(),
+          execution: this.executionStatus(run.id),
           skills: skillContext,
           transcriptSummary: transcriptSummaryContext(summary),
           manifest,
@@ -1709,9 +2223,7 @@ export class AgentRuntime {
           reservedTokens: reservedTokens(false),
         });
       }
-      const selectedContextMessages = isolatedRequest
-        ? selection.messages.filter((message) => message.id === inputMessage.id)
-        : selection.messages;
+      const selectedContextMessages = selection.messages;
       const canonicalContext = canonicalProviderMessages(
         prompt.systemPrompt,
         selectedContextMessages.map((message) => ({
@@ -1724,7 +2236,40 @@ export class AgentRuntime {
         })),
       );
       const systemPrompt = canonicalContext.systemPrompt ?? '';
-      const messages = canonicalContext.messages;
+      let messages = canonicalContext.messages;
+      const contextBuffer = new ContextBufferManager({
+        maxTokens: maxContextTokens,
+        responseReserveTokens: this.options.config.limits.contextResponseReserveTokens,
+        maxSummaryTokens: this.options.config.limits.maxContextSummaryTokens,
+        goalMessage: messages.filter((message) => message.role === 'user').at(-1),
+        onCheckpoint: (active) => {
+          this.options.store.storeMessageArtifact(
+            inputMessage.id,
+            `active_context:${active.version}`,
+            { runId: run.id, ...active },
+          );
+          this.emit(
+            'context.compacted',
+            {
+              phase: 'active',
+              checkpointVersion: active.version,
+              archivedCallCount: active.archivedCallCount,
+              sourceSha256: active.sourceSha256,
+              sourceMessageCount: active.newlyArchivedCallIds.length,
+              summaryContextUnits: estimateMessageTokens({
+                role: 'assistant',
+                content: active.summary,
+              }),
+            },
+            {
+              sessionId: thread.sessionId,
+              threadId: thread.id,
+              runId: run.id,
+              correlationId: run.correlationId,
+            },
+          );
+        },
+      });
       const assembledSystemPromptTokens = estimateMessageTokens({
         role: 'system',
         content: prompt.systemPrompt,
@@ -1786,6 +2331,8 @@ export class AgentRuntime {
         'prompt.assembled',
         {
           bytes: prompt.bytes,
+          identitySnapshotId: identity.id,
+          identityRevision: identity.revision,
           sections: prompt.sections.map((section) => section.name),
           provider: provider.name,
           model,
@@ -1881,6 +2428,29 @@ export class AgentRuntime {
         const toolsDisabled = finalizationGrace || finalizationRequested || toolBudgetExhausted;
         const turnProviderTools = toolsDisabled ? [] : providerTools;
         const turnDynamicTools = toolsDisabled ? [] : providerDynamicTools;
+        messages = contextBuffer.prepare({
+          systemPrompt,
+          messages,
+          tools: turnProviderTools,
+          dynamicTools: turnDynamicTools,
+        });
+        const estimatedContextUnits = assertRequestContextBudget(
+          { systemPrompt, messages, tools: turnProviderTools, dynamicTools: turnDynamicTools },
+          maxContextTokens,
+          this.options.config.limits.contextResponseReserveTokens,
+        );
+        this.emit(
+          'context.selected',
+          {
+            phase: 'active',
+            estimatedContextUnits,
+            maxContextUnits: maxContextTokens,
+            responseReserveTokens: this.options.config.limits.contextResponseReserveTokens,
+            selectedMessageCount: messages.length,
+            estimated: true,
+          },
+          eventContext,
+        );
         this.emit(
           'model.started',
           {
@@ -1892,17 +2462,40 @@ export class AgentRuntime {
           eventContext,
         );
         let providerStreamError: unknown;
+        const modelTimeout = setTimeout(
+          () =>
+            controller.abort(
+              new Error(
+                `Model response timed out after ${this.options.config.limits.providerTimeoutMs}ms`,
+              ),
+            ),
+          this.options.config.limits.providerTimeoutMs,
+        );
         try {
-          for await (const event of provider.stream({
-            model,
-            messages,
-            tools: turnProviderTools,
-            dynamicTools: turnDynamicTools,
-            systemPrompt,
-            reasoning: turnProviderTools.length > 0,
-            conversationId: thread.id,
-            signal: controller.signal,
-          })) {
+          for await (const event of abortableStream(
+            provider.stream({
+              model,
+              messages,
+              tools: turnProviderTools,
+              dynamicTools: turnDynamicTools,
+              systemPrompt,
+              reasoning: turnProviderTools.length > 0,
+              conversationId: thread.id,
+              signal: controller.signal,
+            }),
+            controller.signal,
+            (error) => {
+              console.warn('NUAAI model stream cleanup failed', {
+                runId: run.id,
+                provider: provider.name,
+                error: redactText(error instanceof Error ? error.message : String(error)).slice(
+                  0,
+                  1024,
+                ),
+              });
+            },
+          )) {
+            controller.signal.throwIfAborted();
             if (event.type === 'delta') appendModelText(event.text);
             else {
               flushModelDelta();
@@ -2014,6 +2607,12 @@ export class AgentRuntime {
                 }
                 attestation.acknowledged = true;
                 toolActivity = true;
+                if (attestation.status === 'succeeded')
+                  verificationObservations.push({
+                    name: attestation.runtimeToolName,
+                    arguments: attestation.input,
+                    result: attestation.result,
+                  });
                 const boundedResult = serializeBoundedToolResult(
                   attestation.result,
                   this.options.config.limits.maxToolResultBytes,
@@ -2058,6 +2657,8 @@ export class AgentRuntime {
           }
         } catch (cause) {
           providerStreamError = cause;
+        } finally {
+          clearTimeout(modelTimeout);
         }
         if (!providerStreamError && providerOwnsToolLoop) {
           for (const [callId, announcement] of providerToolStarts) {
@@ -2190,9 +2791,33 @@ export class AgentRuntime {
             isCapabilityRefusal(output) &&
             availableTools.length
           ) {
-            rejectedCapabilityClaim = true;
-            output = `NUAAI rejected an unverified capability claim. Registered tools for this run: ${availableTools.map((tool) => tool.name).join(', ')}. No tool was executed, so the model's statement about missing access is not evidence.`;
-            finalResponseAccepted = false;
+            const hasCliExecution = availableTools.some((tool) =>
+              ['host.command', 'workspace.command'].includes(tool.name),
+            );
+            if (
+              !hasCliExecution &&
+              /\b(?:cli|command|himalaya|shell|executable|terminal)\b/i.test(verificationInput)
+            ) {
+              rejectedCapabilityClaim = true;
+              output =
+                'NUAAI cannot execute a CLI command under the current permissions: no CLI execution tool is exposed. No command ran. Approval mode does not add execute permission to a read-only profile.';
+              finalResponseAccepted = false;
+            } else if (!capabilityCheckRequested) {
+              capabilityCheckRequested = true;
+              output = '';
+              messages.push({
+                role: 'user',
+                content: availableTools.some((tool) => tool.name === 'host.command')
+                  ? 'Check the actual available capability before declaring access unavailable. host.command executes installed host CLIs with literal argv; workspace.command is only the read-oriented probe tool. Use host.command for the requested CLI action, or use a relevant diagnostic tool to establish the precise blocker. Approval is handled by the daemon; do not substitute a promise or a generic refusal.'
+                  : 'Use a relevant available diagnostic tool to establish the precise capability or permission limit before declaring missing access. Registered tool names alone do not prove the requested operation is supported. Report actual evidence and do not invent a successful action.',
+              });
+              continue;
+            } else {
+              rejectedCapabilityClaim = true;
+              output =
+                'NUAAI rejected an unverified capability claim after requesting a capability check. No action was executed. Tool registration alone does not prove the requested operation is supported; the model did not establish its precise blocker.';
+              finalResponseAccepted = false;
+            }
           } else if (verifiedRepositoryCount !== null && requestsExactRepositoryCount(run.input)) {
             output = String(verifiedRepositoryCount);
             finalResponseAccepted = true;
@@ -2302,7 +2927,7 @@ export class AgentRuntime {
               continue;
             }
             const toolContext = {
-              root: this.options.root,
+              root: this.runIdentity(run).workspaceRoot,
               permissions,
               budget: toolBudget,
               timeoutMs: this.options.config.limits.toolTimeoutMs,
@@ -2375,6 +3000,11 @@ export class AgentRuntime {
               this.options.config.limits.maxToolResultBytes,
             );
             const toolContent = boundedResult.content;
+            verificationObservations.push({
+              name: normalizedCall.name,
+              arguments: normalizedCall.arguments,
+              result,
+            });
             if (unresolvedToolFailures.length) unresolvedToolFailures.shift();
             const toolMessage = this.addRunMessage(run, 'tool', toolContent);
             this.options.store.storeMessageArtifact(toolMessage.id, 'tool_result', {
@@ -2435,13 +3065,25 @@ export class AgentRuntime {
             const message = error instanceof Error ? error.message : String(error);
             const budgetError = error instanceof ToolBudgetError ? error : undefined;
             if (budgetError) toolBudgetExhausted = true;
-            const toolContent = JSON.stringify({ error: message });
-            if (!budgetError) unresolvedToolFailures.push(`${normalizedCall.name}: ${message}`);
+            const failureDetails = {
+              error: message,
+              ...(error instanceof ToolExecutionError
+                ? {
+                    failureCode: error.code,
+                    executionState: error.executionState,
+                    recovery: error.recovery,
+                  }
+                : {}),
+            };
+            const toolContent = JSON.stringify(failureDetails);
+            const repairableRejection = isRepairableToolRejection(error);
+            if (!budgetError && !repairableRejection)
+              unresolvedToolFailures.push(`${normalizedCall.name}: ${message}`);
             const toolMessage = this.addRunMessage(run, 'tool', toolContent);
             this.options.store.storeMessageArtifact(toolMessage.id, 'tool_result', {
               callId: call.id,
               name: normalizedCall.name,
-              result: { error: message },
+              result: failureDetails,
             });
             messages.push({
               role: 'tool',
@@ -2459,6 +3101,14 @@ export class AgentRuntime {
                   : {}),
                 error: message,
                 ...(budgetError ? { reason: budgetError.reason } : {}),
+                ...(repairableRejection ? { reason: 'repairable_rejection' } : {}),
+                ...(error instanceof ToolExecutionError
+                  ? {
+                      executionState: error.executionState,
+                      failureCode: error.code,
+                      recovery: error.recovery,
+                    }
+                  : {}),
               },
               {
                 sessionId: thread.sessionId,
@@ -2467,6 +3117,18 @@ export class AgentRuntime {
                 correlationId: run.correlationId,
               },
             );
+            if (repairableRejection) {
+              const signature = `repair:${normalizedCall.name}:${providerToolPayloadHash(normalizedCall.arguments)}`;
+              const attempts = (repeatedInvalidCalls.get(signature) ?? 0) + 1;
+              repeatedInvalidCalls.set(signature, attempts);
+              if (attempts >= 3)
+                throw new ToolExecutionError(
+                  'Stopped after three repeated identical non-execution rejections. No schema-valid recovery was produced; inspect the recorded failure or ask for missing information instead of repeating the request.',
+                  'TOOL_REPAIR_EXHAUSTED',
+                  'not_executed',
+                  'change_approach',
+                );
+            }
           }
         }
         if (toolBudgetExhausted && !toolBudgetNoticeAdded) {
@@ -2505,9 +3167,16 @@ export class AgentRuntime {
         );
         return;
       }
-      if (verificationRequiresEvidence(verificationPolicy) && !toolActivity) {
-        output =
-          'NUAAI did not verify this request because no tool was executed. I will not report model-generated claims as facts.';
+      if (
+        !hasRelevantVerificationEvidence(
+          verificationInput,
+          verificationPolicy,
+          verificationObservations,
+        )
+      ) {
+        output = toolActivity
+          ? 'NUAAI did not verify this request: relevant successful evidence for the requested facts or action is missing. Unrelated tool activity does not establish completion.'
+          : 'NUAAI did not verify this request because no tool was executed. I will not report model-generated claims as facts.';
         this.addRunMessage(run, 'assistant', output, provider.name, model);
         this.options.store.updateRun(run.id, { status: 'failed', output });
         this.emit(
@@ -2523,17 +3192,6 @@ export class AgentRuntime {
         return;
       }
       this.addRunMessage(run, 'assistant', output, provider.name, model);
-      this.options.store.updateRun(run.id, { status: 'completed', output });
-      this.emit(
-        'run.completed',
-        { output },
-        {
-          sessionId: thread.sessionId,
-          threadId: thread.id,
-          runId: run.id,
-          correlationId: run.correlationId,
-        },
-      );
       if (
         this.options.skillLearner &&
         permissions.approved.has('write') &&
@@ -2565,6 +3223,18 @@ export class AgentRuntime {
           );
         }
       }
+      controller.signal.throwIfAborted();
+      this.options.store.updateRun(run.id, { status: 'completed', output });
+      this.emit(
+        'run.completed',
+        { output },
+        {
+          sessionId: thread.sessionId,
+          threadId: thread.id,
+          runId: run.id,
+          correlationId: run.correlationId,
+        },
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const current = this.options.store.getRun(run.id);
@@ -2579,7 +3249,16 @@ export class AgentRuntime {
       this.options.store.updateRun(run.id, { status, output: failureOutput });
       this.emit(
         status === 'cancelled' ? 'run.cancelled' : 'run.failed',
-        { error: message },
+        {
+          error: message,
+          ...(error instanceof ToolExecutionError
+            ? {
+                failureCode: error.code,
+                executionState: error.executionState,
+                recovery: error.recovery,
+              }
+            : {}),
+        },
         { runId: run.id, threadId: run.threadId, correlationId: run.correlationId },
       );
     } finally {

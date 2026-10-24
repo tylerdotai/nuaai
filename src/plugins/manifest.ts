@@ -6,8 +6,8 @@ export const pluginManifestSchema = z.object({
   apiVersion: z.string().min(1),
   entry: z.string().default('index.mjs'),
   capabilities: z.array(z.enum(['filesystem', 'subprocess', 'network', 'secrets'])).default([]),
-  dependencies: z.record(z.string()).default({}),
-  config: z.record(z.unknown()).default({}),
+  dependencies: z.record(z.string(), z.string()).default({}),
+  config: z.record(z.string(), z.unknown()).default({}),
   trusted: z.boolean().default(false),
 });
 export type PluginManifest = z.infer<typeof pluginManifestSchema>;

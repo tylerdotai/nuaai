@@ -3,8 +3,14 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { RunArtifactRegistry } from './artifacts/registry.js';
-import { loadRuntimeConfig, persistProviderSelection, workspaceDirectory } from './config/index.js';
-import { loadSessionIdentity } from './core/identity.js';
+import {
+  loadRuntimeConfig,
+  persistLearningMode,
+  persistProviderSelection,
+  workspaceDirectory,
+} from './config/index.js';
+import { ContinuityCoordinator } from './core/continuity.js';
+import { identityStatusLines } from './core/identity.js';
 import { AgentRuntime } from './core/runtime.js';
 import { Scheduler } from './core/scheduler.js';
 import { type DaemonLock, acquireDaemonLock } from './gateway/lock.js';
@@ -25,6 +31,7 @@ import { McpManager } from './integrations/mcp.js';
 import { MediaProcessor } from './integrations/media.js';
 import { SearchStack, SearxngSearchClient } from './integrations/search.js';
 import { DatabaseStore, openAppDatabase } from './memory/db.js';
+import { KnowledgeLearner } from './memory/learning.js';
 import { PluginRegistry } from './plugins/registry.js';
 import { ProviderRegistry } from './providers/registry.js';
 import type { ProviderImage } from './providers/types.js';
@@ -90,7 +97,6 @@ async function startOwnedDaemon(
         }
       : config;
   const identity = ensureRuntimeIdentity(resolvedRoot);
-  const sessionIdentity = loadSessionIdentity(resolvedRoot);
   const store = new DatabaseStore(openAppDatabase(resolvedRoot));
   const artifacts = new RunArtifactRegistry(resolvedRoot, store);
   const secrets = new SecretsManager(store, resolvedRoot);
@@ -185,20 +191,52 @@ async function startOwnedDaemon(
   const scheduler = new Scheduler(
     store,
     (type, payload, context) => runtime.publishEvent(type, payload, context),
-    async (schedule, taskId) => {
+    async (schedule, taskId, linked) => {
+      const task = store.getTask(taskId);
+      const parentRunId =
+        typeof task?.payload.parentRunId === 'string' ? task.payload.parentRunId : undefined;
+      const parentRun = parentRunId ? store.getRun(parentRunId) : undefined;
+      const parentThread = parentRun && store.getThread(parentRun.threadId);
+      const parentContext = parentRunId ? store.getRunExecutionContext(parentRunId) : undefined;
+      if (parentRunId && (!parentThread || !parentContext?.identitySnapshotId))
+        throw new Error('Bound native parent is unavailable.');
+      const ceiling = permissionContextForProfile(effectiveConfig.permissions.scheduler);
       const created = runtime.getOrCreateSession(
         `schedule:${schedule.id}`,
         `Background: ${schedule.name}`,
+        parentThread
+          ? {
+              parentSessionId: parentThread.sessionId,
+              parentIdentitySnapshotId: parentContext?.identitySnapshotId,
+            }
+          : {},
       );
       const run = runtime.startRun({
         threadId: created.thread.id,
         input: schedule.agentInput,
-        permissions: permissionContextForProfile(effectiveConfig.permissions.scheduler),
+        parentRunId,
+        permissions: parentRunId ? runtime.childPermissions(parentRunId, ceiling) : ceiling,
         permissionSource: 'scheduler',
       });
       scheduledRuns.set(taskId, run.id);
       try {
-        return await runtime.waitForRun(run.id);
+        linked({
+          runId: run.id,
+          threadId: created.thread.id,
+          sessionId: created.session.id,
+          correlationId: run.correlationId,
+        });
+        const outcome = await runtime.waitForGoalResult(run.id);
+        if (outcome.run.id !== run.id) {
+          scheduledRuns.set(taskId, outcome.run.id);
+          linked({
+            runId: outcome.run.id,
+            threadId: outcome.run.threadId,
+            sessionId: created.session.id,
+            correlationId: outcome.run.correlationId,
+          });
+        }
+        return { status: outcome.status, output: outcome.output };
       } finally {
         scheduledRuns.delete(taskId);
       }
@@ -208,6 +246,26 @@ async function startOwnedDaemon(
       if (runId) runtime.cancelRun(runId);
     },
   );
+  const knowledge = new KnowledgeLearner(
+    store,
+    providers,
+    scheduler,
+    () => effectiveConfig.learning.mode,
+    (type, payload, sourceRunId) => {
+      const run = sourceRunId ? store.getRun(sourceRunId) : undefined;
+      const thread = run && store.getThread(run.threadId);
+      runtime.publishEvent(type, payload, {
+        runId: sourceRunId,
+        threadId: run?.threadId,
+        sessionId: thread?.sessionId,
+        correlationId: run?.correlationId,
+      });
+    },
+    async (mode) => {
+      await persistLearningMode(resolvedRoot, mode);
+      effectiveConfig.learning.mode = mode;
+    },
+  );
   const tools = new ToolRegistry(
     resolvedRoot,
     search,
@@ -215,19 +273,21 @@ async function startOwnedDaemon(
       browserEnabled: effectiveConfig.features.browser,
       searchEnabled: effectiveConfig.features.search,
     },
-    { store, scheduler, providers, mcp, media, agents },
+    { store, scheduler, providers, mcp, media, agents, plugins, skills, skillLearner, knowledge },
   );
+  let continuity: ContinuityCoordinator | undefined;
   runtime = new AgentRuntime({
     root: resolvedRoot,
     config: effectiveConfig,
     store,
     providers,
     tools,
-    identityContext: sessionIdentity,
     mcp,
     skills,
     skillLearner,
     artifacts,
+    knowledgeLearner: knowledge,
+    onRunAdmitted: (run, request) => continuity?.admit(run, request),
     resolvePermissions: (source) =>
       permissionContextForProfile(
         source === 'matrix'
@@ -237,9 +297,23 @@ async function startOwnedDaemon(
             : effectiveConfig.permissions.web,
       ),
   });
+  continuity = new ContinuityCoordinator(store, runtime, scheduler, effectiveConfig);
+  const unsubscribeKnowledge = runtime.subscribe((event) => {
+    if (event.type !== 'run.completed' || !event.runId) return;
+    try {
+      knowledge.consider(event.runId);
+    } catch (error) {
+      runtime.publishEvent(
+        'knowledge.review.failed',
+        { error: error instanceof Error ? error.message : String(error), phase: 'enqueue' },
+        { runId: event.runId, threadId: event.threadId, correlationId: event.correlationId },
+      );
+    }
+  });
   let gateway: GatewayHandle;
   try {
     scheduler.start();
+    continuity.recover();
     gateway = await startServer({
       root: resolvedRoot,
       host: effectiveConfig.host,
@@ -250,6 +324,7 @@ async function startOwnedDaemon(
       runPermissions: permissionContextForProfile(effectiveConfig.permissions.web),
       runtime,
       store,
+      knowledge,
       artifacts,
       providers,
       scheduler,
@@ -260,8 +335,9 @@ async function startOwnedDaemon(
     });
   } catch (error) {
     mcp.stop();
-    scheduler.stop();
+    await scheduler.stop();
     await runtime.shutdown();
+    await scheduler.drain();
     await daemonLock.release();
     store.close();
     throw error;
@@ -409,6 +485,33 @@ async function startOwnedDaemon(
           }
           if (command.name === 'help' || command.name === 'start') {
             await matrix.sendText(message.roomId, matrixHelpText(), replyOptions);
+            return;
+          }
+          if (command.name === 'identity') {
+            const session = runtime
+              .listSessionsForSource(sourceKey)
+              .find((entry) => entry.sourceKey === sourceKey);
+            if (!session) {
+              await matrix.sendText(
+                message.roomId,
+                'No active session. Send a normal message to create one.',
+                replyOptions,
+              );
+              return;
+            }
+            if (command.args.length > 1 || (command.args[0] && command.args[0] !== 'refresh')) {
+              await matrix.sendText(message.roomId, 'Usage: /identity [refresh]', replyOptions);
+              return;
+            }
+            const status =
+              command.args[0] === 'refresh'
+                ? runtime.refreshSessionIdentity(session.id)
+                : runtime.sessionIdentityStatus(session.id);
+            await matrix.sendText(
+              message.roomId,
+              identityStatusLines(status).join('\n'),
+              replyOptions,
+            );
             return;
           }
           if (command.name === 'status') {
@@ -657,8 +760,12 @@ async function startOwnedDaemon(
     matrix?.stop();
     await matrixSinceWrite;
     unsubscribeMatrixRuntime?.();
-    scheduler.stop();
+    unsubscribeKnowledge();
+    continuity?.close();
+    await scheduler.stop();
     await runtime.shutdown();
+    await scheduler.drain();
+    plugins.stop();
     mcp.stop();
     await gateway.close();
     await providers.close();

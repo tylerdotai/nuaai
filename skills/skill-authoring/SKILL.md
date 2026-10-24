@@ -7,7 +7,7 @@ metadata:
   author: tylerdotai
   version: "1.0"
   triggers: "skill, skills, SKILL.md, create skill, author skill, validate skill, learn workflow, trigger words"
-allowed-tools: "workspace.list workspace.read workspace.write workspace.command"
+allowed-tools: "skill.list skill.search skill.load skill.create workspace.list workspace.read workspace.write workspace.command"
 ---
 
 # Skill Authoring
@@ -48,6 +48,12 @@ Optional frontmatter:
 6. Keep the main file below 500 lines and avoid secrets, private tokens, fabricated examples, and transient task results.
 7. Validate metadata, directory/name equality, frontmatter boundaries, field lengths, and Markdown presence before loading.
 8. Test trigger matching with both a matching phrase and a near miss.
+
+## Native tool workflow
+
+Use `skill.search` or `skill.list` to discover existing reusable procedures and `skill.load` to retrieve their instructions. For an explicitly requested instruction-only learned skill, call `skill.create` with a valid lowercase slug and the procedure in `instructions`; approve the exact action through the normal boundary. Then call `skill.load` using the **returned name** to verify persisted instructions. A collision can return a suffixed name. Never bypass private storage protection by writing `.nuaai/skills` through `workspace.write`. Creation does not run scripts or execute the stored procedure.
+
+The TUI offers `/skill <name>` and `/skill-create <name>|<instructions>` for the same explicit operator workflows.
 
 ## Learned skills
 

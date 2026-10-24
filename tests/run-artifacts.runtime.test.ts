@@ -37,6 +37,18 @@ function provider(toolName: string, argumentsValue: Record<string, unknown>): Pr
         yield { type: 'tool_call', id: 'call-1', name: toolName, arguments: argumentsValue };
         return;
       }
+      if (
+        toolName === 'workspace.write' &&
+        !request.messages.some((message) => message.toolName === 'workspace.read')
+      ) {
+        yield {
+          type: 'tool_call',
+          id: 'readback-1',
+          name: 'workspace.read',
+          arguments: { path: argumentsValue.path },
+        };
+        return;
+      }
       yield { type: 'done', text: 'Artifact work completed.' };
     },
     embed: async () => [],

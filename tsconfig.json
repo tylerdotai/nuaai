@@ -15,5 +15,5 @@
     "skipLibCheck": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src", "tests", ".config"]
+  "include": ["src", "tests", ".config", "scripts/eval-behavior.ts"]
 }

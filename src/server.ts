@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
@@ -6,12 +7,17 @@ import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
 import { type WebSocket, WebSocketServer } from 'ws';
 
+import { z } from 'zod';
 import { RunArtifactRegistry } from './artifacts/registry.js';
-import { harnessConfig } from './config/index.js';
+import { harnessConfig, learningModeSchema } from './config/index.js';
+import type { KnowledgeLearner } from './memory/learning.js';
+
 import { ApprovalStateError, approvalStatuses } from './core/approvals.js';
+import { executionRequestSchema } from './core/execution-policy.js';
 import type { AgentRuntime } from './core/runtime.js';
 import type { Scheduler } from './core/scheduler.js';
 import { createToken, inspectToken, validateToken } from './gateway/token.js';
+import { decodeInputAttachments } from './integrations/input-attachments.js';
 import type { McpManager } from './integrations/mcp.js';
 import type { DatabaseStore, EventPage, RunArtifactRow, RunRow } from './memory/db.js';
 import type { PluginRegistry } from './plugins/registry.js';
@@ -22,6 +28,7 @@ import {
   permissionContextForProfile,
 } from './security/permissions.js';
 import type { SecretsManager } from './security/secrets.js';
+import { SkillLearner } from './skills/learner.js';
 import type { SkillRegistry } from './skills/registry.js';
 import { getVersion } from './version.js';
 import { buildThreadPresentation } from './web/presentation.js';
@@ -113,6 +120,11 @@ function artifactDownloadHeaders(artifact: RunArtifactRow): Record<string, strin
   };
 }
 
+function publicSession<T extends { context: string }>(value: T): Omit<T, 'context'> {
+  const { context: _context, ...session } = value;
+  return session;
+}
+
 export interface GatewayServices {
   root: string;
   port: number;
@@ -132,6 +144,7 @@ export interface GatewayServices {
   plugins: PluginRegistry;
   secrets: SecretsManager;
   mcp?: McpManager;
+  knowledge?: KnowledgeLearner;
 }
 
 function tokenFromRequest(request: Request): string | null {
@@ -244,6 +257,37 @@ export function createApp(services: GatewayServices): Hono {
       webPermissionProfile: runPermissionProfile,
     }),
   );
+  app.get('/api/sessions/:id/permissions', (context) => {
+    if (!services.store.getSession(context.req.param('id')))
+      return context.json({ error: 'Session not found' }, 404);
+    return context.json(services.runtime.sessionApprovalPolicy(context.req.param('id')));
+  });
+  app.post('/api/sessions/:id/permissions', async (context) => {
+    if (!services.store.getSession(context.req.param('id')))
+      return context.json({ error: 'Session not found' }, 404);
+    const parsed = z
+      .object({
+        mode: z.enum(['manual', 'smart', 'unguarded']),
+        revokeGrants: z.boolean().default(false),
+        confirmUnguarded: z.boolean().default(false),
+      })
+      .safeParse(await context.req.json().catch(() => ({})));
+    if (!parsed.success || (parsed.data.mode === 'unguarded' && !parsed.data.confirmUnguarded))
+      return context.json(
+        { error: 'Valid mode and explicit Unguarded confirmation required' },
+        400,
+      );
+    return context.json(
+      services.runtime.setSessionApprovalPolicy(
+        context.req.param('id'),
+        parsed.data.mode,
+        parsed.data.revokeGrants,
+      ),
+    );
+  });
+  app.get('/api/goals', (context) =>
+    context.json({ goals: services.store.listGoals(context.req.query('threadId')) }),
+  );
   app.get('/api/approvals', (context) => {
     const requestedStatus = context.req.query('status');
     if (requestedStatus && !approvalStatuses.includes(requestedStatus as never))
@@ -257,12 +301,21 @@ export function createApp(services: GatewayServices): Hono {
     return approval ? context.json(approval) : context.json({ error: 'Approval not found' }, 404);
   });
   app.post('/api/approvals/:id/approve', async (context) => {
-    const body = (await context.req.json().catch(() => ({}))) as { payloadHash?: string };
+    const body = (await context.req.json().catch(() => ({}))) as {
+      payloadHash?: string;
+      scope?: string;
+    };
     if (!body.payloadHash?.match(/^[a-f0-9]{64}$/u))
       return context.json({ error: 'payloadHash is required' }, 400);
+    if (body.scope !== undefined && !['once', 'session'].includes(body.scope))
+      return context.json({ error: 'Invalid approval scope' }, 400);
     try {
       return context.json(
-        services.runtime.approveApproval(context.req.param('id'), body.payloadHash),
+        services.runtime.approveApproval(
+          context.req.param('id'),
+          body.payloadHash,
+          (body.scope ?? 'once') as 'once' | 'session',
+        ),
       );
     } catch (error) {
       const status =
@@ -274,7 +327,10 @@ export function createApp(services: GatewayServices): Hono {
     }
   });
   app.post('/api/approvals/:id/deny', async (context) => {
-    const body = (await context.req.json().catch(() => ({}))) as { payloadHash?: string };
+    const body = (await context.req.json().catch(() => ({}))) as {
+      payloadHash?: string;
+      scope?: string;
+    };
     if (!body.payloadHash?.match(/^[a-f0-9]{64}$/u))
       return context.json({ error: 'payloadHash is required' }, 400);
     try {
@@ -290,23 +346,43 @@ export function createApp(services: GatewayServices): Hono {
   });
   app.get('/api/sessions', (context) =>
     context.json({
-      sessions: services.runtime.listSessions(context.req.query('includeOrphans') === 'true'),
+      sessions: services.runtime
+        .listSessions(context.req.query('includeOrphans') === 'true')
+        .map(publicSession),
     }),
   );
   app.post('/api/sessions', async (context) => {
     const body = (await context.req.json().catch(() => ({}))) as {
       title?: string;
       sourceKey?: string;
+      workspaceRoot?: string;
+      parentSessionId?: string;
     };
-    return context.json(services.runtime.createSession(body.title, body.sourceKey));
+    try {
+      const created = services.runtime.createSession(body.title, body.sourceKey, undefined, {
+        workspaceRoot: body.workspaceRoot,
+        parentSessionId: body.parentSessionId,
+      });
+      return context.json({ ...created, session: publicSession(created.session) });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
   });
   app.post('/api/sessions/resolve', async (context) => {
     const body = (await context.req.json().catch(() => ({}))) as {
       title?: string;
       sourceKey?: string;
+      workspaceRoot?: string;
     };
     if (!body.sourceKey?.trim()) return context.json({ error: 'sourceKey is required' }, 400);
-    return context.json(services.runtime.getOrCreateSession(body.sourceKey, body.title));
+    try {
+      const created = services.runtime.getOrCreateSession(body.sourceKey, body.title, {
+        workspaceRoot: body.workspaceRoot,
+      });
+      return context.json({ ...created, session: publicSession(created.session) });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
   });
   app.post('/api/sessions/:id/threads', async (context) => {
     try {
@@ -326,14 +402,40 @@ export function createApp(services: GatewayServices): Hono {
   app.get('/api/sessions/:id', (context) => {
     const session = services.runtime.getSession(context.req.param('id'));
     return session
-      ? context.json({ session, threads: services.runtime.listThreads(session.id) })
+      ? context.json({
+          session: publicSession(session),
+          threads: services.runtime.listThreads(session.id),
+          identity: services.runtime.sessionIdentityStatus(session.id),
+        })
       : context.json({ error: 'Session not found' }, 404);
   });
   app.post('/api/sessions/:id/switch', (context) => {
     const session = services.runtime.getSession(context.req.param('id'));
     return session
-      ? context.json({ session, threads: services.runtime.listThreads(session.id), active: true })
+      ? context.json({
+          session: publicSession(session),
+          threads: services.runtime.listThreads(session.id),
+          active: true,
+        })
       : context.json({ error: 'Session not found' }, 404);
+  });
+  app.get('/api/sessions/:id/identity', (context) => {
+    if (!services.runtime.getSession(context.req.param('id')))
+      return context.json({ error: 'Session not found' }, 404);
+    try {
+      return context.json(services.runtime.sessionIdentityStatus(context.req.param('id')));
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+  app.post('/api/sessions/:id/identity/refresh', (context) => {
+    if (!services.runtime.getSession(context.req.param('id')))
+      return context.json({ error: 'Session not found' }, 404);
+    try {
+      return context.json(services.runtime.refreshSessionIdentity(context.req.param('id')));
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
   });
   app.put('/api/sessions/:id', (context) => {
     const { title } = context.req.query();
@@ -409,6 +511,9 @@ export function createApp(services: GatewayServices): Hono {
   });
   app.post('/api/runs', async (context) => {
     const body = (await context.req.json()) as {
+      attachments?: unknown;
+      execution?: unknown;
+      idempotencyKey?: unknown;
       threadId?: string;
       input?: string;
       provider?: string;
@@ -417,14 +522,29 @@ export function createApp(services: GatewayServices): Hono {
     if (!body.threadId || !body.input)
       return context.json({ error: 'threadId and input are required' }, 400);
     try {
+      if (
+        body.idempotencyKey !== undefined &&
+        (typeof body.idempotencyKey !== 'string' ||
+          !body.idempotencyKey.trim() ||
+          body.idempotencyKey.length > 256)
+      )
+        return context.json(
+          { error: 'idempotencyKey must be a nonempty string of at most 256 characters' },
+          400,
+        );
+      const attachments = decodeInputAttachments(body.attachments);
       return context.json(
         services.runtime.startRun({
           threadId: body.threadId,
-          input: body.input,
+          input: [body.input, attachments.text].filter(Boolean).join('\n\n'),
+          verificationInput: body.input,
+          execution: executionRequestSchema.parse(body.execution ?? { mode: 'standard' }),
+          images: attachments.images,
           provider: body.provider,
           model: body.model,
           permissions: runPermissions,
           permissionSource: 'web',
+          idempotencyKey: body.idempotencyKey,
         }),
       );
     } catch (error) {
@@ -560,6 +680,68 @@ export function createApp(services: GatewayServices): Hono {
   app.get('/api/mcp', (context) =>
     context.json(services.mcp?.status() ?? { servers: [], failures: {} }),
   );
+  app.get('/api/memory/learning', (context) =>
+    context.json(services.knowledge?.status() ?? { available: false, enabled: false, mode: 'off' }),
+  );
+  app.post('/api/memory/learning', async (context) => {
+    if (!services.knowledge)
+      return context.json({ error: 'Learning controls are unavailable' }, 503);
+    const parsed = z
+      .object({ mode: learningModeSchema })
+      .strict()
+      .safeParse(await context.req.json());
+    if (!parsed.success)
+      return context.json(
+        { error: 'A valid exact learning mode is required: automatic, manual, or off' },
+        400,
+      );
+    try {
+      return context.json(await services.knowledge.setMode(parsed.data.mode));
+    } catch (error) {
+      const correlationId = randomUUID();
+      const code =
+        error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+          ? error.code
+          : error instanceof SyntaxError
+            ? 'CONFIG_PARSE_FAILED'
+            : 'CONFIG_UPDATE_FAILED';
+      services.runtime.publishEvent(
+        'knowledge.mode.failed',
+        {
+          requestedMode: parsed.data.mode,
+          failureCode: code,
+          failureClass: error instanceof Error ? error.name : 'unknown',
+        },
+        { correlationId },
+      );
+      return context.json(
+        {
+          error:
+            'Learning mode update could not be persisted and verified; reload the actual setting before retrying',
+          failureCode: code,
+          correlationId,
+        },
+        500,
+      );
+    }
+  });
+  app.post('/api/memory/:id/revert', (context) => {
+    if (!services.knowledge)
+      return context.json({ error: 'Learning history controls are unavailable' }, 503);
+    try {
+      return context.json(services.knowledge.revert(context.req.param('id')));
+    } catch (error) {
+      return context.json(
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Learning history could not be safely reverted',
+        },
+        409,
+      );
+    }
+  });
   app.get('/api/memory', (context) =>
     context.json({
       memories: services.store
@@ -570,6 +752,11 @@ export function createApp(services: GatewayServices): Hono {
   app.post('/api/memory', async (context) => {
     try {
       const { content, metadata } = await context.req.json();
+      if (metadata && typeof metadata === 'object' && Object.hasOwn(metadata, 'knowledge'))
+        return context.json(
+          { error: 'Knowledge provenance is reserved for daemon-owned memory operations' },
+          400,
+        );
       if (typeof content !== 'string' || !content.trim()) {
         return context.json({ error: 'content is required' }, 400);
       }
@@ -597,6 +784,10 @@ export function createApp(services: GatewayServices): Hono {
     }
   });
   app.get('/api/schedules', (context) => context.json({ schedules: services.scheduler.list() }));
+  app.get('/api/tasks/:id', (context) => {
+    const diagnostics = services.scheduler.inspectTask(context.req.param('id'));
+    return diagnostics ? context.json(diagnostics) : context.json({ error: 'Task not found' }, 404);
+  });
   app.get('/api/tasks', (context) => context.json({ tasks: services.scheduler.listTasks() }));
   app.post('/api/tasks/:id/cancel', (context) => {
     try {
@@ -667,6 +858,25 @@ export function createApp(services: GatewayServices): Hono {
     }
   });
   app.get('/api/skills', (context) => context.json({ skills: services.skills.list() }));
+  app.get('/api/skills/:name', (context) => {
+    try {
+      return context.json(services.skills.load(context.req.param('name')));
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 404);
+    }
+  });
+  app.post('/api/skills', async (context) => {
+    try {
+      const body = (await context.req.json()) as { name?: unknown; instructions?: unknown };
+      if (typeof body.name !== 'string' || typeof body.instructions !== 'string')
+        return context.json({ error: 'Skill name and instructions are required.' }, 400);
+      return context.json(
+        await new SkillLearner(services.root, services.skills).create(body.name, body.instructions),
+      );
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
   app.post('/api/skills/:name/enable', (context) => {
     try {
       services.skills.enable(context.req.param('name'));

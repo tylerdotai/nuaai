@@ -15,6 +15,31 @@ afterEach(async () => {
 });
 
 describe('CLI daemon diagnostics', () => {
+  it('uses the home runtime from an unrelated directory without creating local state', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'nuaai-home-'));
+    const cwd = await mkdtemp(join(tmpdir(), 'nuaai-caller-'));
+    roots.push(home, cwd);
+    await initWorkspace(home);
+    const configPath = join(workspaceDirectory(home), 'config.json');
+    const config = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>;
+    config.port = 59_998;
+    await writeFile(configPath, JSON.stringify(config), { mode: 0o600 });
+    const result = await execa(
+      resolve('node_modules/.bin/tsx'),
+      [resolve('src/cli.tsx'), 'doctor'],
+      {
+        cwd,
+        env: { HOME: home, NUAAI_ROOT: '' },
+        reject: false,
+        timeout: 10_000,
+      },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('NUAAI daemon is not reachable at http://127.0.0.1:59998');
+    await expect(readFile(join(cwd, '.nuaai/runtime.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
   it('reports an actionable endpoint and start command when the daemon is stopped', async () => {
     const root = await mkdtemp(join(tmpdir(), 'nuaai-cli-'));
     roots.push(root);
@@ -27,7 +52,7 @@ describe('CLI daemon diagnostics', () => {
     const result = await execa(
       resolve('node_modules/.bin/tsx'),
       [resolve('src/cli.tsx'), 'doctor'],
-      { cwd: root, reject: false, timeout: 10_000 },
+      { cwd: root, env: { NUAAI_ROOT: root }, reject: false, timeout: 10_000 },
     );
 
     expect(result.exitCode).toBe(1);
@@ -43,7 +68,7 @@ describe('CLI daemon diagnostics', () => {
     const result = await execa(
       resolve('node_modules/.bin/tsx'),
       [resolve('src/cli.tsx'), 'pair', 'https://agent.example/nuaai/'],
-      { cwd: root, reject: false, timeout: 10_000 },
+      { cwd: root, env: { NUAAI_ROOT: root }, reject: false, timeout: 10_000 },
     );
 
     expect(result.exitCode).toBe(0);

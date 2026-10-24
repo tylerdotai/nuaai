@@ -20,10 +20,29 @@ import {
 } from '../core/approvals.js';
 import { type ContextMessage, estimateMessageTokens, estimateTokens } from '../core/context.js';
 import type { EventRecord } from '../core/events.js';
-import type { ProviderToolCall } from '../providers/types.js';
+import type { ExecutionPolicy, ExecutionRequest } from '../core/execution-policy.js';
+import { type SessionIdentitySnapshot, sessionIdentitySchema } from '../core/identity.js';
+import type { ProviderImage, ProviderToolCall } from '../providers/types.js';
+import type { PermissionContext } from '../security/permissions.js';
 import { redactValue } from '../security/redaction.js';
+import { memoryVisibleInWorkspace } from './scope.js';
 
 export type MemoryDatabase = Database.Database;
+
+// Recovery authority and attachments are private, never part of RunRow or events.
+export interface StoredRunExecutionContext {
+  identitySnapshotId?: string;
+  verificationInput?: string;
+  permissionSource: string;
+  permissions: {
+    approved: Array<'read' | 'write' | 'execute'>;
+    capabilities: PermissionContext['capabilities'];
+  };
+  images?: ProviderImage[];
+  goalId?: string;
+  continuationOf?: string;
+  requestedExecution?: ExecutionRequest;
+}
 
 export type DrizzleDatabase = ReturnType<typeof drizzle>;
 
@@ -106,6 +125,27 @@ export interface MessageArtifactRow {
   createdAt: number;
 }
 
+export interface GoalRow {
+  id: string;
+  threadId: string;
+  rootRunId: string;
+  currentRunId: string;
+  status: string;
+  sliceCount: number;
+  checkpoint: {
+    runIds: string[];
+    consumedTaskIds: string[];
+    reason?: string;
+    familyRootId?: string;
+    familyAdmissions?: number;
+    familyBudget?: number;
+    policy?: ExecutionPolicy;
+    deadlineAt?: string;
+  };
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface RunRow {
   id: string;
   threadId: string;
@@ -182,6 +222,21 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       context TEXT NOT NULL DEFAULT '',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS approval_session_scopes (
+      approval_id TEXT PRIMARY KEY REFERENCES approval_requests(id) ON DELETE CASCADE,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS session_approval_policies (
+      session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS session_identity_snapshots (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL,
+      snapshot TEXT NOT NULL,
+      UNIQUE(session_id, revision)
     );
     CREATE TABLE IF NOT EXISTS threads (
       id TEXT PRIMARY KEY,
@@ -306,6 +361,18 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       embedding_dimensions INTEGER,
       created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS goals (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      root_run_id TEXT NOT NULL UNIQUE,
+      current_run_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      slice_count INTEGER NOT NULL,
+      checkpoint TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS goals_thread_idx ON goals(thread_id, created_at);
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
       kind TEXT NOT NULL,
@@ -333,6 +400,10 @@ function createSchema(db: MemoryDatabase, vector = false): void {
       ciphertext TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS run_execution_contexts (
+      run_id TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS skills (
       name TEXT PRIMARY KEY,
@@ -453,7 +524,7 @@ function createSchema(db: MemoryDatabase, vector = false): void {
        END`,
   ).run(legacyApprovalPreview);
   db.prepare(
-    "UPDATE schema_meta SET value = '7' WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 7",
+    "UPDATE schema_meta SET value = '9' WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 9",
   ).run();
   if (vector) {
     db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(embedding float[768]);');
@@ -631,8 +702,44 @@ function extractiveSummary(
   throw new Error('Extractive summary exceeded its token budget');
 }
 
+import type { SessionApprovalGrant, SessionApprovalPolicy } from '../core/approval-policy.js';
+
 export class DatabaseStore {
   constructor(readonly database: AppDatabase) {}
+
+  saveApprovalScope(id: string, value: SessionApprovalGrant): void {
+    this.database.raw
+      .prepare('INSERT INTO approval_session_scopes (approval_id, value) VALUES (?, ?)')
+      .run(id, JSON.stringify(value));
+  }
+
+  approvalScope(id: string): SessionApprovalGrant | undefined {
+    const row = this.database.raw
+      .prepare('SELECT value FROM approval_session_scopes WHERE approval_id = ?')
+      .get(id) as { value: string } | undefined;
+    return row ? JSON.parse(row.value) : undefined;
+  }
+
+  sessionApprovalPolicy(sessionId: string): SessionApprovalPolicy {
+    if (!this.getSession(sessionId)) throw new Error('Session not found');
+    const row = this.database.raw
+      .prepare('SELECT value FROM session_approval_policies WHERE session_id = ?')
+      .get(sessionId) as { value: string } | undefined;
+    if (!row) return { mode: 'manual', grants: [] };
+    const value = JSON.parse(row.value) as SessionApprovalPolicy;
+    if (!['manual', 'smart', 'unguarded'].includes(value.mode) || !Array.isArray(value.grants))
+      throw new Error('Invalid stored approval policy');
+    return value;
+  }
+
+  saveSessionApprovalPolicy(sessionId: string, value: SessionApprovalPolicy): void {
+    if (!this.getSession(sessionId)) throw new Error('Session not found');
+    this.database.raw
+      .prepare(
+        'INSERT INTO session_approval_policies (session_id, value) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET value = excluded.value',
+      )
+      .run(sessionId, JSON.stringify(value));
+  }
 
   transaction<T>(action: () => T): T {
     return this.database.raw.transaction(action)();
@@ -695,6 +802,74 @@ export class DatabaseStore {
       )
       .all(runId, boundedLimit) as Array<Record<string, unknown>>;
     return rows.map((row) => this.eventFromRow(row));
+  }
+
+  latestEventForRun(runId: string, type: string): (EventRecord & { id: number }) | undefined {
+    const row = this.database.raw
+      .prepare('SELECT * FROM events WHERE run_id = ? AND type = ? ORDER BY id DESC LIMIT 1')
+      .get(runId, type) as Record<string, unknown> | undefined;
+    return row ? this.eventFromRow(row) : undefined;
+  }
+
+  listRunObservations(runId: string, offsetEntries: number, limitEntries: number) {
+    const rows = this.database.raw
+      .prepare(`
+      SELECT observation.message_id AS messageId,
+        json_extract(observation.payload, '$.callId') AS callId,
+        json_extract(observation.payload, '$.name') AS toolName,
+        length(json_quote(json_extract(observation.payload, '$.result'))) AS totalCharacters
+      FROM message_artifacts observation
+      JOIN message_artifacts owner ON owner.message_id = observation.message_id AND owner.kind = 'run_link'
+      WHERE observation.kind = 'tool_result' AND json_extract(owner.payload, '$.runId') = ?
+      ORDER BY observation.created_at ASC, observation.message_id ASC LIMIT ? OFFSET ?
+    `)
+      .all(runId, limitEntries + 1, offsetEntries) as Array<{
+      messageId: string;
+      callId: string;
+      toolName: string;
+      totalCharacters: number;
+    }>;
+    const entries = rows.slice(0, limitEntries);
+    return {
+      entries,
+      offsetEntries,
+      nextOffsetEntries: offsetEntries + entries.length,
+      hasMore: rows.length > limitEntries,
+    };
+  }
+
+  readRunObservation(runId: string, callId: string, offsetCharacters = 0, limitCharacters = 1024) {
+    const rows = this.database.raw
+      .prepare(`
+      SELECT observation.message_id AS messageId,
+        json_extract(observation.payload, '$.name') AS toolName,
+        length(json_quote(json_extract(observation.payload, '$.result'))) AS totalCharacters,
+        substr(json_quote(json_extract(observation.payload, '$.result')), ?, ?) AS text
+      FROM message_artifacts observation
+      JOIN message_artifacts owner ON owner.message_id = observation.message_id AND owner.kind = 'run_link'
+      WHERE observation.kind = 'tool_result' AND json_extract(observation.payload, '$.callId') = ?
+        AND json_extract(owner.payload, '$.runId') = ?
+      ORDER BY observation.created_at ASC LIMIT 2
+    `)
+      .all(offsetCharacters + 1, limitCharacters, callId, runId) as Array<{
+      messageId: string;
+      toolName: string;
+      totalCharacters: number;
+      text: string;
+    }>;
+    if (rows.length > 1) throw new Error('Observation call ID is ambiguous in this run');
+    const row = rows[0];
+    if (!row) return undefined;
+    if (offsetCharacters > row.totalCharacters)
+      throw new Error('Observation offset exceeds its recorded length');
+    const nextOffsetCharacters = offsetCharacters + Array.from(row.text).length;
+    return {
+      ...row,
+      callId,
+      offsetCharacters,
+      nextOffsetCharacters,
+      hasMore: nextOffsetCharacters < row.totalCharacters,
+    };
   }
 
   listProjectionEventsForRun(
@@ -795,6 +970,41 @@ export class DatabaseStore {
     return { session, thread };
   }
 
+  saveSessionIdentity(snapshot: SessionIdentitySnapshot): void {
+    const value = sessionIdentitySchema.parse(snapshot);
+    this.database.raw
+      .prepare(
+        'INSERT INTO session_identity_snapshots (id, session_id, revision, snapshot) VALUES (?, ?, ?, ?)',
+      )
+      .run(value.id, value.sessionId, value.revision, JSON.stringify(value));
+  }
+
+  getSessionIdentity(sessionId: string, snapshotId?: string): SessionIdentitySnapshot | undefined {
+    const row = snapshotId
+      ? this.database.raw
+          .prepare(
+            'SELECT snapshot FROM session_identity_snapshots WHERE session_id = ? AND id = ?',
+          )
+          .get(sessionId, snapshotId)
+      : this.database.raw
+          .prepare(
+            'SELECT snapshot FROM session_identity_snapshots WHERE session_id = ? ORDER BY revision DESC LIMIT 1',
+          )
+          .get(sessionId);
+    if (!row) return undefined;
+    let snapshot: SessionIdentitySnapshot;
+    try {
+      snapshot = sessionIdentitySchema.parse(JSON.parse((row as { snapshot: string }).snapshot));
+    } catch {
+      throw new Error(
+        'Stored session identity is invalid; explicit operator recovery is required.',
+      );
+    }
+    if (snapshot.sessionId !== sessionId || (snapshotId && snapshot.id !== snapshotId))
+      throw new Error('Stored session identity binding is invalid.');
+    return snapshot;
+  }
+
   listSessions(includeOrphans = true): SessionRow[] {
     const query = includeOrphans
       ? 'SELECT id, title, status, source_key AS sourceKey, context, created_at AS createdAt, updated_at AS updatedAt FROM sessions ORDER BY updated_at DESC, rowid DESC'
@@ -863,9 +1073,19 @@ export class DatabaseStore {
     const thread = this.getThread(id);
     if (!thread) return false;
     const tx = this.database.raw.transaction(() => {
+      this.database.raw
+        .prepare(
+          'DELETE FROM run_execution_contexts WHERE run_id IN (SELECT id FROM runs WHERE thread_id = ?)',
+        )
+        .run(id);
+      this.database.raw
+        .prepare(
+          'DELETE FROM message_artifacts WHERE message_id IN (SELECT id FROM messages WHERE thread_id = ?)',
+        )
+        .run(id);
       this.database.raw.prepare('DELETE FROM messages WHERE thread_id = ?').run(id);
-      this.database.raw.prepare('DELETE FROM message_artifacts WHERE thread_id = ?').run(id);
       this.database.raw.prepare('DELETE FROM threads WHERE id = ?').run(id);
+      return true;
     });
     return Boolean(tx());
   }
@@ -875,14 +1095,9 @@ export class DatabaseStore {
     if (!session) return false;
     const tx = this.database.raw.transaction(() => {
       const threads = this.listThreads(id);
-      for (const thread of threads) {
-        this.database.raw.prepare('DELETE FROM messages WHERE thread_id = ?').run(thread.id);
-        this.database.raw
-          .prepare('DELETE FROM message_artifacts WHERE thread_id = ?')
-          .run(thread.id);
-        this.database.raw.prepare('DELETE FROM threads WHERE id = ?').run(thread.id);
-      }
+      for (const thread of threads) this.deleteThread(thread.id);
       this.database.raw.prepare('DELETE FROM sessions WHERE id = ?').run(id);
+      return true;
     });
     return Boolean(tx());
   }
@@ -1275,6 +1490,50 @@ export class DatabaseStore {
       },
       ...through.slice(summaryIndex + 1).slice(-limit),
     ];
+  }
+
+  getSkillEnabled(name: string): boolean | undefined {
+    const row = this.database.raw.prepare('SELECT enabled FROM skills WHERE name = ?').get(name) as
+      | { enabled: number }
+      | undefined;
+    return row ? Boolean(row.enabled) : undefined;
+  }
+
+  saveSkill(skill: {
+    name: string;
+    description: string;
+    version?: string;
+    source?: string;
+    enabled?: boolean;
+  }): void {
+    this.database.raw
+      .prepare(
+        'INSERT INTO skills (name, description, version, source, enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET description = excluded.description, version = excluded.version, source = excluded.source, enabled = excluded.enabled, updated_at = excluded.updated_at',
+      )
+      .run(
+        skill.name,
+        skill.description,
+        skill.version ?? '1.0.0',
+        skill.source ?? 'registered',
+        skill.enabled === false ? 0 : 1,
+        Date.now(),
+      );
+  }
+
+  saveRunExecutionContext(runId: string, value: StoredRunExecutionContext): void {
+    if (!this.getRun(runId)) throw new Error('Run not found');
+    this.database.raw
+      .prepare(
+        'INSERT INTO run_execution_contexts (run_id, value) VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET value = excluded.value',
+      )
+      .run(runId, JSON.stringify(value));
+  }
+
+  getRunExecutionContext(runId: string): StoredRunExecutionContext | undefined {
+    const row = this.database.raw
+      .prepare('SELECT value FROM run_execution_contexts WHERE run_id = ?')
+      .get(runId) as { value: string } | undefined;
+    return row ? (JSON.parse(row.value) as StoredRunExecutionContext) : undefined;
   }
 
   createRun(
@@ -1787,6 +2046,7 @@ export class DatabaseStore {
   searchMemory(
     embedding: number[],
     limit = 8,
+    workspaceRoot?: string,
   ): Array<{
     id: string;
     content: string;
@@ -1805,7 +2065,11 @@ export class DatabaseStore {
           .all() as Array<{ memory_id: string; vector_rowid: number }>
       ).map((reference) => [reference.vector_rowid, reference.memory_id]),
     );
-    const memories = new Map(this.searchMemoryRows().map((memory) => [memory.id, memory]));
+    const memories = new Map(
+      this.searchMemoryRows()
+        .filter((memory) => memoryVisibleInWorkspace(memory.metadata, workspaceRoot))
+        .map((memory) => [memory.id, memory]),
+    );
     return vectorRows
       .map((row) => {
         const memoryId = references.get(row.rowid);
@@ -1826,6 +2090,7 @@ export class DatabaseStore {
   searchMemoryLexical(
     query: string,
     limit = 8,
+    workspaceRoot?: string,
   ): Array<{
     id: string;
     content: string;
@@ -1835,6 +2100,7 @@ export class DatabaseStore {
   }> {
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
     return this.searchMemoryRows()
+      .filter((memory) => memoryVisibleInWorkspace(memory.metadata, workspaceRoot))
       .map((memory) => {
         const haystack = memory.content.toLowerCase();
         const score = terms.reduce((total, term) => total + (haystack.includes(term) ? 1 : 0), 0);
@@ -1880,7 +2146,20 @@ export class DatabaseStore {
         'SELECT id, content, metadata, embedding, created_at AS createdAt FROM memory_records ORDER BY created_at DESC',
       )
       .all() as Array<Record<string, unknown>>;
-    return rows.map((row) => ({
+    return rows.map((row) => this.decodeMemoryRow(row));
+  }
+
+  getMemory(id: string) {
+    const row = this.database.raw
+      .prepare(
+        'SELECT id, content, metadata, embedding, created_at AS createdAt FROM memory_records WHERE id = ?',
+      )
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.decodeMemoryRow(row) : undefined;
+  }
+
+  private decodeMemoryRow(row: Record<string, unknown>) {
+    return {
       id: String(row.id),
       content: String(row.content),
       metadata: JSON.parse(String(row.metadata)) as Record<string, unknown>,
@@ -1894,7 +2173,7 @@ export class DatabaseStore {
           )
         : null,
       createdAt: Number(row.createdAt),
-    }));
+    };
   }
 
   putSecret(name: string, ciphertext: string, now = Date.now()): void {
@@ -2052,6 +2331,22 @@ export class DatabaseStore {
   deletePlugin(name: string): void {
     this.database.raw.prepare('DELETE FROM plugins WHERE name = ?').run(name);
   }
+  queuedTasks(kind: string, limit = 16): TaskRow[] {
+    const rows = this.database.raw
+      .prepare(
+        "SELECT id FROM tasks WHERE kind = ? AND status = 'queued' ORDER BY created_at ASC LIMIT ?",
+      )
+      .all(kind, limit) as Array<{ id: string }>;
+    return rows.map((row) => this.getTask(row.id)).filter((row): row is TaskRow => Boolean(row));
+  }
+  taskForSource(kind: string, sourceRunId: string): TaskRow | undefined {
+    const row = this.database.raw
+      .prepare(
+        "SELECT id FROM tasks WHERE kind = ? AND json_extract(payload, '$.sourceRunId') = ? ORDER BY created_at ASC LIMIT 1",
+      )
+      .get(kind, sourceRunId) as { id: string } | undefined;
+    return row ? this.getTask(row.id) : undefined;
+  }
   createTask(
     kind: string,
     payload: Record<string, unknown>,
@@ -2090,6 +2385,84 @@ export class DatabaseStore {
     this.database.raw
       .prepare('UPDATE tasks SET status = ?, payload = ?, updated_at = ? WHERE id = ?')
       .run(status, JSON.stringify(payload ?? JSON.parse(String(current.payload))), Date.now(), id);
+  }
+  legacyBackgroundRunCandidates(task: TaskRow): RunRow[] {
+    if (task.kind !== 'background.run' || typeof task.payload.agentInput !== 'string') return [];
+    const rows = this.database.raw
+      .prepare(
+        'SELECT runs.id FROM runs JOIN threads ON threads.id = runs.thread_id JOIN sessions ON sessions.id = threads.session_id WHERE sessions.source_key = ? AND runs.input = ? AND runs.created_at >= ? AND runs.created_at <= ? ORDER BY runs.created_at DESC LIMIT 2',
+      )
+      .all(
+        `schedule:task:${task.id}`,
+        task.payload.agentInput,
+        task.createdAt,
+        task.updatedAt,
+      ) as Array<{ id: string }>;
+    return rows.map((row) => this.getRun(row.id)).filter((run): run is RunRow => Boolean(run));
+  }
+  getTask(id: string): TaskRow | undefined {
+    const row = this.database.raw.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) return undefined;
+    return {
+      id: String(row.id),
+      kind: String(row.kind),
+      status: String(row.status),
+      payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
+      scheduleId: row.schedule_id ? String(row.schedule_id) : null,
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+  saveGoal(goal: GoalRow): void {
+    this.database.raw
+      .prepare(
+        'INSERT INTO goals (id, thread_id, root_run_id, current_run_id, status, slice_count, checkpoint, created_at, updated_at) VALUES (@id, @threadId, @rootRunId, @currentRunId, @status, @sliceCount, @checkpoint, @createdAt, @updatedAt) ON CONFLICT(id) DO UPDATE SET current_run_id=excluded.current_run_id, status=excluded.status, slice_count=excluded.slice_count, checkpoint=excluded.checkpoint, updated_at=excluded.updated_at',
+      )
+      .run({ ...goal, checkpoint: JSON.stringify(goal.checkpoint) });
+  }
+  getGoal(id: string): GoalRow | undefined {
+    const row = this.database.raw.prepare('SELECT * FROM goals WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    if (!row) return;
+    return {
+      id: String(row.id),
+      threadId: String(row.thread_id),
+      rootRunId: String(row.root_run_id),
+      currentRunId: String(row.current_run_id),
+      status: String(row.status),
+      sliceCount: Number(row.slice_count),
+      checkpoint: JSON.parse(String(row.checkpoint)) as GoalRow['checkpoint'],
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+  listGoals(threadId?: string): GoalRow[] {
+    const rows = this.database.raw
+      .prepare(
+        'SELECT id FROM goals WHERE (? IS NULL OR thread_id = ?) ORDER BY created_at DESC LIMIT 200',
+      )
+      .all(threadId ?? null, threadId ?? null) as Array<{ id: string }>;
+    return rows.map((row) => this.getGoal(row.id)).filter((goal): goal is GoalRow => Boolean(goal));
+  }
+  tasksForRuns(runIds: string[]): TaskRow[] {
+    if (!runIds.length) return [];
+    const rows = this.database.raw
+      .prepare(
+        `SELECT id FROM tasks WHERE kind='background.run' AND json_extract(payload, '$.parentRunId') IN (${runIds.map(() => '?').join(',')})`,
+      )
+      .all(...runIds) as Array<{ id: string }>;
+    return rows.map((row) => this.getTask(row.id)).filter((task): task is TaskRow => Boolean(task));
+  }
+  pendingTaskDeliveries(parentRunId?: string): TaskRow[] {
+    const rows = this.database.raw
+      .prepare(
+        `SELECT tasks.id FROM tasks JOIN runs parent ON parent.id = json_extract(tasks.payload, '$.parentRunId') WHERE tasks.kind = 'background.run' AND tasks.status IN ('completed', 'failed', 'cancelled') AND parent.status NOT IN ('queued', 'running') AND json_extract(tasks.payload, '$.parentDelivery') IS NULL AND (? IS NULL OR parent.id = ?) ORDER BY tasks.created_at LIMIT 200`,
+      )
+      .all(parentRunId ?? null, parentRunId ?? null) as Array<{ id: string }>;
+    return rows.map((row) => this.getTask(row.id)).filter((task): task is TaskRow => Boolean(task));
   }
   listTasks(): TaskRow[] {
     const rows = this.database.raw

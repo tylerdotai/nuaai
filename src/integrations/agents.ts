@@ -24,6 +24,10 @@ export class ExternalAgentDispatcher {
     private readonly config: ExternalAgentConfig,
   ) {}
 
+  available(): boolean {
+    return this.config.enabled && Object.keys(this.config.commands).length > 0;
+  }
+
   list(): Array<{ name: string; command: string; args: string[] }> {
     return Object.entries(this.config.commands)
       .sort(([left], [right]) => left.localeCompare(right))

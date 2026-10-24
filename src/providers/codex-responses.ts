@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 
+import { decodeToolArguments as parseToolArguments } from '../core/tool-input.js';
 import { sanitizedSubprocessEnvironment } from '../security/environment.js';
 import { redactText } from '../security/redaction.js';
 import { getVersion } from '../version.js';
@@ -175,20 +176,6 @@ function responseInput(
     }
   }
   return input;
-}
-
-function parseToolArguments(value: unknown): Record<string, unknown> {
-  if (value && typeof value === 'object' && !Array.isArray(value))
-    return value as Record<string, unknown>;
-  if (typeof value !== 'string') throw new Error('Codex returned malformed tool arguments');
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
-      return parsed as Record<string, unknown>;
-  } catch {
-    // Normalized below.
-  }
-  throw new Error('Codex returned malformed tool arguments');
 }
 
 function toolCallFromItem(

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
+import type { SessionIdentityStatus } from '../core/identity.js';
 import {
   isAuthenticationErrorMessage,
   isRequestAbort,
@@ -8,16 +9,18 @@ import {
   parseApiResponse,
   webSocketCloseDisposition,
 } from './auth.js';
-import { AgentComposer } from './components/AgentComposer.js';
+import { AgentComposer, type ComposerAttachment } from './components/AgentComposer.js';
 import { ArtifactCards } from './components/ArtifactCards.js';
 import { MarkdownContent } from './components/MarkdownContent.js';
 import { RunStatusSummary } from './components/RunStatusSummary.js';
+import { SessionIdentityPanel } from './components/SessionIdentityPanel.js';
 import { type ComposerCommand, draftStorageKey, resolveComposerCommand } from './composer.js';
 import type {
   ActiveProvider,
   ApprovalRequest,
   CommandId,
   ConnectionState,
+  LearningStatus,
   MemoryRecord,
   MessageView,
   PermissionProfile,
@@ -99,9 +102,15 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return parseApiResponse<T>(response);
 }
 
+import { encodeAttachments } from './attachments.js';
+
 function App(): React.JSX.Element {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [identitySessionId, setIdentitySessionId] = useState<string | null>(null);
+  useEffect(() => {
+    if (identitySessionId !== selectedSessionId) setIdentitySessionId(null);
+  }, [selectedSessionId, identitySessionId]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageView[]>([]);
@@ -110,8 +119,11 @@ function App(): React.JSX.Element {
   const [activeProvider, setActiveProvider] = useState<ActiveProvider | null>(null);
   const [webPermissionProfile, setWebPermissionProfile] = useState<PermissionProfile>('read-only');
   const [schedules, setSchedules] = useState<Schedule[]>([]);
-  const [tasks, setTasks] = useState<Task[]>([]);
+  const [, setTasks] = useState<Task[]>([]);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
+  const [learning, setLearning] = useState<LearningStatus | null>(null);
+  const [changingLearning, setChangingLearning] = useState(false);
+  const [revertingMemoryId, setRevertingMemoryId] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [plugins, setPlugins] = useState<PluginRecord[]>([]);
@@ -120,7 +132,15 @@ function App(): React.JSX.Element {
   const [decidingApprovalIds, setDecidingApprovalIds] = useState<Set<string>>(new Set());
   const [view, setView] = useState<ViewId>('conversation');
   const [connection, setConnection] = useState<ConnectionState>('connecting');
-  const [input, setInput] = useState('');
+  const [input, setInputValue] = useState('');
+  const [attachmentDrafts, setAttachmentDrafts] = useState<Record<string, ComposerAttachment[]>>(
+    {},
+  );
+  const inputRevision = useRef(0);
+  const setInput = useCallback((value: string) => {
+    inputRevision.current += 1;
+    setInputValue(value);
+  }, []);
   const [activeRunsByThread, setActiveRunsByThread] = useState<ActiveRunsByThread>({});
   const [liveOutputByRun, setLiveOutputByRun] = useState<LiveOutputByRun>({});
   const [queuedRunsByThread, setQueuedRunsByThread] = useState<QueuedRunsByThread>({});
@@ -308,7 +328,7 @@ function App(): React.JSX.Element {
         `Draft storage is unavailable: ${cause instanceof Error ? cause.message : String(cause)}`,
       );
     }
-  }, [selectedThreadId]);
+  }, [selectedThreadId, setInput]);
 
   useEffect(() => {
     const key = draftStorageKey(selectedThreadId);
@@ -343,6 +363,7 @@ function App(): React.JSX.Element {
       scheduleResult,
       taskResult,
       memoryResult,
+      learningResult,
       skillResult,
       pluginResult,
       approvalResult,
@@ -355,6 +376,7 @@ function App(): React.JSX.Element {
       request<{ schedules: Schedule[] }>('/api/schedules', { signal }),
       request<{ tasks: Task[] }>('/api/tasks', { signal }),
       request<{ memories: MemoryRecord[] }>('/api/memory', { signal }),
+      request<LearningStatus>('/api/memory/learning', { signal }),
       request<{ skills: SkillRecord[] }>('/api/skills', { signal }),
       request<{ plugins: PluginRecord[]; health: PluginHealth[] }>('/api/plugins', { signal }),
       request<{ approvals: ApprovalRequest[] }>('/api/approvals?status=pending', { signal }),
@@ -365,6 +387,7 @@ function App(): React.JSX.Element {
     setSchedules(scheduleResult.schedules);
     setTasks(taskResult.tasks);
     setMemories(memoryResult.memories);
+    setLearning(learningResult);
     setSkills(skillResult.skills);
     setPlugins(pluginResult.plugins);
     setPluginHealth(pluginResult.health);
@@ -896,10 +919,23 @@ function App(): React.JSX.Element {
       threadId: selectedThreadRef.current,
     };
     try {
+      const identity = expectedSelection.sessionId
+        ? await request<SessionIdentityStatus>(
+            `/api/sessions/${encodeURIComponent(expectedSelection.sessionId)}/identity`,
+          )
+        : null;
+      if (
+        !selectionIdentityMatches(expectedSelection, {
+          sessionId: selectedSessionRef.current,
+          threadId: selectedThreadRef.current,
+        })
+      )
+        return;
       const created = await request<{ session: Session }>('/api/sessions', {
         method: 'POST',
         body: JSON.stringify({
           title: newConversationTitle(),
+          ...(identity ? { workspaceRoot: identity.workspaceRoot } : {}),
           sourceKey: `web:${crypto.randomUUID()}`,
         }),
       });
@@ -1048,23 +1084,39 @@ function App(): React.JSX.Element {
     else setView('system');
   };
 
-  const send = async (mode: 'next' | 'interrupt' = 'next'): Promise<void> => {
+  const send = async (
+    mode: 'next' | 'interrupt' = 'next',
+    files: File[] = [],
+  ): Promise<boolean> => {
     const value = input.trim();
     const command = resolveComposerCommand(value);
-    if (command) {
+    if (command && files.length === 0) {
       await executeComposerCommand(command);
-      return;
+      return true;
     }
-    if (!value || !selectedThreadId || connection !== 'connected') return;
+    if ((!value && files.length === 0) || !selectedThreadId || connection !== 'connected')
+      return false;
     const threadId = selectedThreadId;
     const sessionId = selectedSessionRef.current;
     const expectedSelection = { sessionId, threadId };
     const currentRunId = activeRunId;
+    const submittedRevision = inputRevision.current;
     followNextOutput();
-    setInput('');
     setError(null);
     let runAccepted = false;
     try {
+      const attachments = await encodeAttachments(files);
+      const payload = { threadId, input: value || 'Describe the attached files.', attachments };
+      const digest = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(JSON.stringify(payload)),
+      );
+      const fingerprint = Array.from(new Uint8Array(digest), (byte) =>
+        byte.toString(16).padStart(2, '0'),
+      ).join('');
+      const pendingKey = `nuaai.pending-run.${fingerprint}`;
+      const idempotencyKey = window.localStorage.getItem(pendingKey) ?? crypto.randomUUID();
+      window.localStorage.setItem(pendingKey, idempotencyKey);
       if (mode === 'interrupt' && currentRunId)
         await request(
           `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(currentRunId)}/cancel`,
@@ -1072,13 +1124,17 @@ function App(): React.JSX.Element {
         );
       const run = await request<{ id: string }>('/api/runs', {
         method: 'POST',
-        body: JSON.stringify({ threadId, input: value }),
+        body: JSON.stringify({ ...payload, idempotencyKey }),
       });
+      if (typeof run.id !== 'string' || !run.id)
+        throw new Error('Run acceptance was not confirmed. Retry retains the same submission key.');
       runAccepted = true;
+      window.localStorage.removeItem(pendingKey);
       const stillSelected = selectionIdentityMatches(expectedSelection, {
         sessionId: selectedSessionRef.current,
         threadId: selectedThreadRef.current,
       });
+      if (stillSelected && inputRevision.current === submittedRevision) setInput('');
       if (currentRunId) {
         setQueuedRunsByThread((current) => ({
           ...current,
@@ -1102,11 +1158,13 @@ function App(): React.JSX.Element {
         }) ||
         isRequestAbort(cause)
       )
-        return;
+        return runAccepted;
       const message = cause instanceof Error ? cause.message : String(cause);
-      if (!runAccepted) setInput(value);
-      setError(runAccepted ? `Run accepted, but conversation refresh failed: ${message}` : message);
+      setError(
+        runAccepted ? `Run accepted, but client reconciliation failed: ${message}` : message,
+      );
     }
+    return runAccepted;
   };
 
   const cancel = async (): Promise<void> => {
@@ -1272,6 +1330,36 @@ function App(): React.JSX.Element {
     }
   };
 
+  const changeLearning = async (mode: LearningStatus['mode']): Promise<void> => {
+    setChangingLearning(true);
+    try {
+      await request('/api/memory/learning', { method: 'POST', body: JSON.stringify({ mode }) });
+      const actual = await request<LearningStatus>('/api/memory/learning');
+      setLearning(actual);
+      if (actual.mode !== mode)
+        throw new Error('Learning changed concurrently; showing the actual setting.');
+      setNotice(`Agent learning: ${actual.mode}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setChangingLearning(false);
+    }
+  };
+
+  const revertMemory = async (id: string): Promise<void> => {
+    setRevertingMemoryId(id);
+    try {
+      await request(`/api/memory/${encodeURIComponent(id)}/revert`, { method: 'POST' });
+      const actual = await request<{ memories: MemoryRecord[] }>('/api/memory');
+      setMemories(actual.memories);
+      setNotice('Learning undone; revision history retained');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRevertingMemoryId(null);
+    }
+  };
+
   const saveMemory = async (content: string): Promise<void> => {
     setSaveStatus('saving');
     try {
@@ -1300,7 +1388,11 @@ function App(): React.JSX.Element {
   };
 
   const [sessionRailCollapsed, setSessionRailCollapsed] = useState(false);
-  const [sessionContextMenu, setSessionContextMenu] = useState<{ x: number; y: number; sessionId: string } | null>(null);
+  const [sessionContextMenu, setSessionContextMenu] = useState<{
+    x: number;
+    y: number;
+    sessionId: string;
+  } | null>(null);
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingSessionTitle, setEditingSessionTitle] = useState('');
 
@@ -1480,6 +1572,7 @@ function App(): React.JSX.Element {
     setCommandPaletteOpen(false);
     if (id === 'new-session') await createSession();
     else if (id === 'new-thread') await createThread();
+    else if (id === 'identity') setIdentitySessionId(selectedSessionRef.current);
     else if (id === 'refresh') {
       if (await refresh(selectedSessionRef.current)) setNotice('Runtime refreshed');
     } else if (id === 'focus-composer') {
@@ -1533,6 +1626,14 @@ function App(): React.JSX.Element {
         </div>
       </header>
 
+      {identitySessionId === selectedSessionId && selectedSessionId && (
+        <SessionIdentityPanel
+          key={selectedSessionId}
+          sessionId={selectedSessionId}
+          request={request}
+          onClose={() => setIdentitySessionId(null)}
+        />
+      )}
       <div className={`app-frame ${sessionRailCollapsed ? 'rail-collapsed' : ''}`}>
         <aside
           ref={sessionRailRef}
@@ -1606,7 +1707,11 @@ function App(): React.JSX.Element {
                             key={session.id}
                             onContextMenu={(e) => {
                               e.preventDefault();
-                              setSessionContextMenu({ x: e.clientX, y: e.clientY, sessionId: session.id });
+                              setSessionContextMenu({
+                                x: e.clientX,
+                                y: e.clientY,
+                                sessionId: session.id,
+                              });
                             }}
                           >
                             {isEditing ? (
@@ -1614,12 +1719,13 @@ function App(): React.JSX.Element {
                                 className="session-edit-form"
                                 onSubmit={(e) => {
                                   e.preventDefault();
-                                  if (editingSessionTitle.trim()) renameSession(session.id, editingSessionTitle.trim());
+                                  if (editingSessionTitle.trim())
+                                    renameSession(session.id, editingSessionTitle.trim());
                                   else setEditingSessionId(null);
                                 }}
                               >
                                 <input
-                                  autoFocus
+                                  ref={(element) => element?.focus()}
                                   value={editingSessionTitle}
                                   onChange={(e) => setEditingSessionTitle(e.target.value)}
                                   onKeyDown={(e) => {
@@ -1641,7 +1747,9 @@ function App(): React.JSX.Element {
                                 <span className="session-glyph" aria-hidden="true" />
                                 <span>
                                   <strong>{session.title}</strong>
-                                  <small>{selectedSessionId === session.id ? 'Current' : 'Saved'}</small>
+                                  <small>
+                                    {selectedSessionId === session.id ? 'Current' : 'Saved'}
+                                  </small>
                                 </span>
                               </button>
                             )}
@@ -1664,7 +1772,8 @@ function App(): React.JSX.Element {
                                 title="Delete"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  if (confirm(`Delete "${session.title}"?`)) deleteSession(session.id);
+                                  if (confirm(`Delete "${session.title}"?`))
+                                    deleteSession(session.id);
                                 }}
                               >
                                 ×
@@ -1791,6 +1900,15 @@ function App(): React.JSX.Element {
                           New thread
                         </button>
                       )}
+                      {selectedSession && (
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => setIdentitySessionId(selectedSessionId)}
+                        >
+                          Instruction sources
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1915,6 +2033,7 @@ function App(): React.JSX.Element {
                 )}
 
                 <AgentComposer
+                  key={selectedThreadId}
                   input={input}
                   selectedThread={Boolean(selectedThread)}
                   connection={connection}
@@ -1926,8 +2045,17 @@ function App(): React.JSX.Element {
                   expanded={composerExpanded}
                   textareaRef={composerRef}
                   onInput={setInput}
+                  attachments={attachmentDrafts[selectedThreadId ?? ''] ?? []}
+                  onAttachmentsChange={(value) => {
+                    const owner = selectedThreadId;
+                    if (!owner) return;
+                    setAttachmentDrafts((current) => ({
+                      ...current,
+                      [owner]: typeof value === 'function' ? value(current[owner] ?? []) : value,
+                    }));
+                  }}
                   onExpanded={setComposerExpanded}
-                  onSubmit={(mode) => void send(mode)}
+                  onSubmit={send}
                   onStop={() => void cancel()}
                   onSwitchProvider={(provider, model) => void switchProvider(provider, model)}
                   onCommand={(command) => void executeComposerCommand(command)}
@@ -1939,6 +2067,11 @@ function App(): React.JSX.Element {
           {view === 'memory' && (
             <MemoryView
               memories={memories}
+              learning={learning}
+              changingLearning={changingLearning}
+              revertingId={revertingMemoryId}
+              onRevert={(id) => void revertMemory(id)}
+              onLearningMode={(mode) => void changeLearning(mode)}
               onDelete={deleteMemory}
               saveMemory={saveMemory}
               saveStatus={saveStatus}

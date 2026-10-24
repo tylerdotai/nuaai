@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 
 import type { DatabaseStore, TaskRow } from '../memory/db.js';
+import { redactText } from '../security/redaction.js';
+import { publicApprovalRequest } from './approvals.js';
 import type { EventType } from './events.js';
 
 export type ScheduleType = 'once' | 'interval' | 'cron' | 'manual' | 'startup';
@@ -123,14 +125,83 @@ function nextRun(type: ScheduleType, expression: string, now: number): number | 
 
 // biome-ignore lint/suspicious/noConfusingVoidType: observation-only callbacks intentionally return void.
 type ScheduleRunResult = void | { status: string; output?: string };
+export interface TaskRunReference {
+  runId: string;
+  threadId: string;
+  sessionId: string;
+  correlationId: string;
+}
 
 export class Scheduler {
   private timer: NodeJS.Timeout | undefined;
-  private readonly running = new Map<string, number>();
+  private running = new Map<string, number>();
+  private nativeRunning = new Map<string, Promise<void>>();
+  private internalHandlers = new Map<
+    string,
+    (task: TaskRow, signal: AbortSignal) => Promise<void>
+  >();
+  private internalRunning = new Map<
+    string,
+    { controller: AbortController; promise: Promise<void> }
+  >();
+
+  registerInternalHandler(
+    kind: string,
+    handler: (task: TaskRow, signal: AbortSignal) => Promise<void>,
+  ): void {
+    if (this.internalHandlers.has(kind))
+      throw new Error(`Internal task handler already registered: ${kind}`);
+    this.internalHandlers.set(kind, handler);
+  }
+
+  wake(): void {
+    if (this.timer) void this.poll();
+  }
+
+  private launchInternal(task: TaskRow): void {
+    const handler = this.internalHandlers.get(task.kind);
+    if (!handler || this.internalRunning.has(task.id)) return;
+    const controller = new AbortController();
+    this.store.updateTask(task.id, 'running', {
+      ...task.payload,
+      attempts: Number(task.payload.attempts ?? 0) + 1,
+    });
+    const promise = Promise.resolve()
+      .then(() => handler(task, controller.signal))
+      .then(() => {
+        if (this.store.getTask(task.id)?.status === 'cancelled') return;
+        this.store.updateTask(task.id, 'completed');
+        this.onEvent('task.completed', { kind: task.kind, internal: true }, { taskId: task.id });
+      })
+      .catch((error: unknown) => {
+        if (this.store.getTask(task.id)?.status === 'cancelled') return;
+        const state = this.store.getTask(task.id);
+        const retry =
+          controller.signal.aborted && !this.timer && Number(state?.payload.attempts ?? 0) < 2;
+        this.store.updateTask(task.id, retry ? 'queued' : 'failed', {
+          ...state?.payload,
+          error: redactText(error instanceof Error ? error.message : String(error)),
+        });
+        this.onEvent(
+          retry ? 'task.queued' : 'task.failed',
+          { kind: task.kind, internal: true },
+          { taskId: task.id },
+        );
+      })
+      .finally(() => {
+        this.internalRunning.delete(task.id);
+        if (this.timer) this.wake();
+      });
+    this.internalRunning.set(task.id, { controller, promise });
+  }
   constructor(
     private readonly store: DatabaseStore,
     private readonly onEvent: SchedulerEvent,
-    private readonly onRun: (schedule: Schedule, taskId: string) => Promise<ScheduleRunResult>,
+    private readonly onRun: (
+      schedule: Schedule,
+      taskId: string,
+      linked: (run: TaskRunReference) => void,
+    ) => Promise<ScheduleRunResult>,
     private readonly onCancel?: (taskId: string) => void,
   ) {}
 
@@ -176,10 +247,25 @@ export class Scheduler {
     this.timer = setInterval(() => void this.poll(), 1_000);
     void this.poll();
   }
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    for (const active of this.internalRunning.values())
+      active.controller.abort(new Error('Daemon stopping; internal work retained for recovery'));
+    await Promise.all([...this.internalRunning.values()].map((active) => active.promise));
   }
+  async drain(): Promise<void> {
+    await Promise.all([...this.nativeRunning.values()]);
+  }
+
+  private trackTask(task: TaskRow, schedule: Schedule): Promise<void> {
+    const execution = this.executeTask(task, schedule).finally(() =>
+      this.nativeRunning.delete(task.id),
+    );
+    this.nativeRunning.set(task.id, execution);
+    return execution;
+  }
+
   async trigger(id: string): Promise<void> {
     const schedule = this.list().find((entry) => entry.id === id);
     if (!schedule) throw new Error(`Unknown schedule: ${id}`);
@@ -232,13 +318,148 @@ export class Scheduler {
     return this.store.listTasks();
   }
 
-  createTask(agentInput: string, name = 'Background task'): TaskRow {
+  inspectTask(id: string) {
+    const task = this.store.getTask(id);
+    if (!task) return undefined;
+    const ref = task.payload.execution as Partial<TaskRunReference> | undefined;
+    let execution: TaskRunReference | undefined =
+      ref &&
+      typeof ref.runId === 'string' &&
+      typeof ref.threadId === 'string' &&
+      typeof ref.sessionId === 'string' &&
+      typeof ref.correlationId === 'string'
+        ? {
+            runId: ref.runId,
+            threadId: ref.threadId,
+            sessionId: ref.sessionId,
+            correlationId: ref.correlationId,
+          }
+        : undefined;
+    let linkage = execution ? 'recorded' : 'unavailable';
+    if (!execution && !task.payload.execution) {
+      const candidates = this.store.legacyBackgroundRunCandidates(task);
+      if (candidates.length === 1) {
+        const candidate = candidates[0];
+        const thread = this.store.getThread(candidate.threadId);
+        if (thread) {
+          execution = {
+            runId: candidate.id,
+            threadId: candidate.threadId,
+            sessionId: thread.sessionId,
+            correlationId: candidate.correlationId,
+          };
+          linkage = 'legacy_unique_task_session';
+        }
+      } else if (candidates.length > 1) linkage = 'ambiguous';
+    }
+    const candidate = execution ? this.store.getRun(execution.runId) : undefined;
+    const run =
+      candidate &&
+      candidate.threadId === execution?.threadId &&
+      candidate.correlationId === execution.correlationId &&
+      this.store.getThread(candidate.threadId)?.sessionId === execution.sessionId
+        ? candidate
+        : undefined;
+    const events = run
+      ? this.store
+          .listRecentEventsForRun(run.id, 100)
+          .filter((event) =>
+            [
+              'run.failed',
+              'run.cancelled',
+              'run.paused',
+              'tool.failed',
+              'approval.failed',
+              'approval.denied',
+              'capabilities.assembled',
+            ].includes(event.type),
+          )
+          .map((event) => ({
+            id: event.id,
+            type: event.type,
+            ...(typeof event.payload.reason === 'string'
+              ? { reason: redactText(event.payload.reason).slice(0, 500) }
+              : {}),
+            ...(typeof event.payload.approvalId === 'string'
+              ? { approvalId: event.payload.approvalId }
+              : {}),
+            ...(typeof event.payload.name === 'string' ? { tool: event.payload.name } : {}),
+            ...(typeof event.payload.error === 'string'
+              ? { error: redactText(event.payload.error).slice(0, 8000) }
+              : {}),
+            ...(typeof event.payload.verificationPolicy === 'string'
+              ? { verificationPolicy: event.payload.verificationPolicy }
+              : {}),
+          }))
+      : [];
+    const pausedEvent =
+      run?.status === 'paused'
+        ? [...events].reverse().find((event) => event.type === 'run.paused')
+        : undefined;
+    const pendingApproval = pausedEvent?.approvalId
+      ? this.store.getApprovalRequest(pausedEvent.approvalId)
+      : undefined;
+    const pause =
+      run?.status === 'paused'
+        ? {
+            reason: pausedEvent?.reason ?? 'unknown',
+            ...(pausedEvent ? { eventId: pausedEvent.id } : {}),
+            ...(pendingApproval?.runId === run.id
+              ? { approval: publicApprovalRequest(pendingApproval) }
+              : {}),
+            review: {
+              sessionId: execution?.sessionId,
+              threadId: run.threadId,
+              instruction:
+                'Open the child conversation and review the pending action card; task inspection does not authorize it.',
+            },
+          }
+        : undefined;
+    const terminal = [...events]
+      .reverse()
+      .find((event) => ['run.failed', 'run.cancelled'].includes(event.type));
+    const message =
+      terminal?.error ??
+      (task.status === 'failed' && typeof task.payload.error === 'string'
+        ? redactText(task.payload.error).slice(0, 8000)
+        : undefined);
+    return {
+      found: true,
+      task: {
+        id: task.id,
+        kind: task.kind,
+        status: task.status,
+        attempts: task.payload.attempts ?? 0,
+      },
+      linkage: run || linkage === 'ambiguous' ? linkage : 'unavailable',
+      execution,
+      ...(run
+        ? { run: { id: run.id, status: run.status, provider: run.provider, model: run.model } }
+        : {}),
+      ...(message
+        ? {
+            failure: {
+              message,
+              source: terminal?.type ?? 'task',
+              ...(terminal ? { eventId: terminal.id } : {}),
+            },
+          }
+        : {}),
+      ...(pause ? { pause } : {}),
+      events,
+    };
+  }
+
+  createTask(agentInput: string, name = 'Background task', parentRunId?: string): TaskRow {
     if (!agentInput.trim()) throw new Error('Background task input is required');
+    if (parentRunId && !this.store.getRunExecutionContext(parentRunId)?.identitySnapshotId)
+      throw new Error('Native parent execution identity is unavailable.');
     const task = this.store.createTask(
       'background.run',
       {
         name: name.trim() || 'Background task',
         agentInput,
+        ...(parentRunId ? { parentRunId } : {}),
         attempts: 0,
         maxAttempts: defaultSchedulePolicy.maxAttempts,
         retryDelayMs: defaultSchedulePolicy.retryDelayMs,
@@ -257,7 +478,12 @@ export class Scheduler {
       policy: defaultSchedulePolicy,
     };
     this.onEvent('task.queued', { kind: task.kind }, { taskId: task.id });
-    void this.executeTask(task, pseudoSchedule);
+    void this.trackTask(task, pseudoSchedule).catch((error) =>
+      console.error('NUAAI native task finalization failed', {
+        taskId: task.id,
+        error: redactText(error instanceof Error ? error.message : String(error)),
+      }),
+    );
     return task;
   }
 
@@ -270,6 +496,7 @@ export class Scheduler {
       ...task.payload,
       error: 'Task cancelled',
     });
+    this.internalRunning.get(id)?.controller.abort(new Error('Task cancelled'));
     this.onCancel?.(id);
     this.onEvent('task.cancelled', { kind: task.kind, error: 'Task cancelled' }, { taskId: id });
   }
@@ -279,6 +506,15 @@ export class Scheduler {
     const schedules = new Map(this.list().map((schedule) => [schedule.id, schedule]));
     for (const task of this.store.listTasks()) {
       if (!['queued', 'running'].includes(task.status)) continue;
+      if (this.internalHandlers.has(task.kind)) {
+        if (task.status === 'running')
+          this.store.updateTask(
+            task.id,
+            Number(task.payload.attempts ?? 0) < 2 ? 'queued' : 'failed',
+            { ...task.payload, recovery: 'Internal review interrupted by restart' },
+          );
+        continue;
+      }
       this.store.updateTask(task.id, 'failed', {
         ...task.payload,
         error: 'Task interrupted by daemon restart',
@@ -298,6 +534,12 @@ export class Scheduler {
   }
 
   private async poll(): Promise<void> {
+    for (const kind of this.internalHandlers.keys()) {
+      if ([...this.internalRunning.keys()].some((id) => this.store.getTask(id)?.kind === kind))
+        continue;
+      const task = this.store.queuedTasks(kind, 1)[0];
+      if (task) this.launchInternal(task);
+    }
     const now = Date.now();
     for (const schedule of this.list()) {
       if (!schedule.enabled || schedule.nextRunAt === null || schedule.nextRunAt > now) continue;
@@ -348,7 +590,7 @@ export class Scheduler {
       { name: schedule.name, agentInput: schedule.agentInput },
       { taskId: schedule.id },
     );
-    await this.executeTask(task, { ...schedule, lastRunAt: now, nextRunAt: next });
+    await this.trackTask(task, { ...schedule, lastRunAt: now, nextRunAt: next });
   }
 
   private async executeTask(task: TaskRow, schedule: Schedule): Promise<void> {
@@ -356,9 +598,14 @@ export class Scheduler {
     if (active >= schedule.policy.concurrencyLimit) return;
     this.running.set(schedule.id, active + 1);
     let taskPayload = { ...task.payload };
+    let execution: TaskRunReference | undefined;
+    const context = () => ({
+      taskId: task.id,
+      ...(execution ? { correlationId: execution.correlationId } : {}),
+    });
     try {
       this.store.updateTask(task.id, 'running', taskPayload);
-      this.onEvent('task.started', { kind: task.kind }, { taskId: task.id });
+      this.onEvent('task.started', { kind: task.kind }, context());
       let attempt = 0;
       while (attempt < schedule.policy.maxAttempts) {
         const current = this.store.listTasks().find((entry) => entry.id === task.id);
@@ -367,21 +614,33 @@ export class Scheduler {
         taskPayload = { ...taskPayload, attempts: attempt };
         this.store.updateTask(task.id, 'running', taskPayload);
         try {
-          const outcome = await this.onRun(schedule, task.id);
+          const outcome = await this.onRun(schedule, task.id, (linked) => {
+            execution = linked;
+            taskPayload = { ...taskPayload, execution: linked };
+            this.store.updateTask(task.id, 'running', taskPayload);
+            this.onEvent('task.run.linked', { ...linked, attempt }, context());
+          });
           if (outcome && outcome.status !== 'completed')
-            throw new Error(`Agent run ended with status: ${outcome.status}`);
+            throw new Error(
+              outcome.output?.trim()
+                ? redactText(outcome.output).slice(0, 8000)
+                : `Agent run ended with status: ${outcome.status}`,
+            );
           const completed = this.store.listTasks().find((entry) => entry.id === task.id);
           if (completed?.status !== 'cancelled') {
             this.store.updateTask(task.id, 'completed', taskPayload);
             this.onEvent(
               'task.completed',
-              { kind: task.kind, attempts: attempt },
-              { taskId: task.id },
+              { kind: task.kind, attempts: attempt, execution },
+              context(),
             );
           }
           return;
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
+          const message = redactText(error instanceof Error ? error.message : String(error)).slice(
+            0,
+            8000,
+          );
           taskPayload = { ...taskPayload, lastError: message };
           if (attempt >= schedule.policy.maxAttempts) throw error;
           this.store.updateTask(task.id, 'queued', taskPayload);
@@ -393,17 +652,20 @@ export class Scheduler {
               nextAttempt: attempt + 1,
               error: message,
             },
-            { taskId: task.id },
+            context(),
           );
           await sleep(schedule.policy.retryDelayMs * 2 ** (attempt - 1));
         }
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = redactText(error instanceof Error ? error.message : String(error)).slice(
+        0,
+        8000,
+      );
       const current = this.store.listTasks().find((entry) => entry.id === task.id);
       if (current?.status !== 'cancelled') {
         this.store.updateTask(task.id, 'failed', { ...taskPayload, error: message });
-        this.onEvent('task.failed', { kind: task.kind, error: message }, { taskId: task.id });
+        this.onEvent('task.failed', { kind: task.kind, error: message, execution }, context());
       }
     } finally {
       const remaining = (this.running.get(schedule.id) ?? 1) - 1;

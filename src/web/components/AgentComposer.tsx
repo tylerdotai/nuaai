@@ -1,4 +1,5 @@
 import { type RefObject, useEffect, useMemo, useRef, useState } from 'react';
+import { attachmentAccept } from '../attachments.js';
 
 import {
   type ComposerCommand,
@@ -12,6 +13,8 @@ import type {
   PermissionProfile,
   ProviderHealth,
 } from '../contracts.js';
+
+export type ComposerAttachment = File & { id: string };
 
 const slashCommands: Array<{ command: string; id: ComposerCommand; label: string }> = [
   { command: '/new', id: 'new-session', label: 'New conversation' },
@@ -33,6 +36,8 @@ export function AgentComposer({
   expanded,
   textareaRef,
   onInput,
+  attachments,
+  onAttachmentsChange: setAttachments,
   onExpanded,
   onSubmit,
   onStop,
@@ -49,18 +54,25 @@ export function AgentComposer({
   queuedItems: Array<{ id: string; prompt: string }>;
   expanded: boolean;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
+  attachments: ComposerAttachment[];
+  onAttachmentsChange: (
+    value: ComposerAttachment[] | ((current: ComposerAttachment[]) => ComposerAttachment[]),
+  ) => void;
   onInput: (value: string) => void;
   onExpanded: (expanded: boolean) => void;
-  onSubmit: (mode: 'next' | 'interrupt') => void;
+  onSubmit: (mode: 'next' | 'interrupt', files: File[]) => Promise<boolean> | undefined;
   onStop: () => void;
   onSwitchProvider: (provider: string, model: string) => void;
   onCommand: (command: ComposerCommand) => void;
 }): React.JSX.Element {
   const [focused, setFocused] = useState(false);
   const [followupMode, setFollowupMode] = useState<'next' | 'interrupt'>('next');
-  const [attachments, setAttachments] = useState<Array<File & { id: string }>>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const action = composerAction({ input, activeRunId });
+  const [submitting, setSubmitting] = useState(false);
+  const action = composerAction({
+    input: input || (attachments.length ? 'Attached files' : ''),
+    activeRunId,
+  });
   const capabilities = capabilitySummary(permissionProfile);
   const modelOptions = useMemo(() => {
     const options = providers.flatMap((provider) =>
@@ -100,13 +112,23 @@ export function AgentComposer({
     if (!activeRunId) setFollowupMode('next');
   }, [activeRunId]);
 
-  const submit = (): void => {
+  const submit = async (): Promise<void> => {
+    if (submitting) return;
     if (action === 'stop') {
       onStop();
       return;
     }
-    if (action === 'send') onSubmit('next');
-    else if (action === 'queue') onSubmit(followupMode);
+    if (action !== 'send' && action !== 'queue') return;
+    setSubmitting(true);
+    try {
+      const submitted = attachments;
+      if (await onSubmit(action === 'send' ? 'next' : followupMode, submitted))
+        setAttachments((current) =>
+          current.filter((file) => !submitted.some((sent) => sent.id === file.id)),
+        );
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -136,6 +158,7 @@ export function AgentComposer({
               <button
                 type="button"
                 aria-label={`Remove ${file.name}`}
+                disabled={submitting}
                 onClick={() => setAttachments((current) => current.filter((f) => f.id !== file.id))}
               >
                 ×
@@ -148,6 +171,8 @@ export function AgentComposer({
       <input
         ref={fileInputRef}
         type="file"
+        accept={attachmentAccept}
+        disabled={submitting}
         multiple
         className="sr-only"
         tabIndex={-1}
@@ -196,7 +221,7 @@ export function AgentComposer({
             onKeyDown={(event) => {
               if (event.nativeEvent.isComposing || event.key !== 'Enter' || event.shiftKey) return;
               event.preventDefault();
-              if (input.trim()) submit();
+              if (input.trim() || attachments.length) void submit();
             }}
           />
         </label>
@@ -213,7 +238,9 @@ export function AgentComposer({
                   : 'Send next'
                 : 'Send message'
           }
-          disabled={action === 'disabled' || !selectedThread || connection !== 'connected'}
+          disabled={
+            submitting || action === 'disabled' || !selectedThread || connection !== 'connected'
+          }
           onClick={submit}
         >
           <span aria-hidden="true">{action === 'stop' ? '■' : '↑'}</span>
@@ -284,7 +311,8 @@ export function AgentComposer({
             type="button"
             className="composer-attach"
             aria-label="Attach files"
-            title="Attach files"
+            title="UTF-8 text/source files, PNG, JPEG, WebP · 4 files · 512 KiB total"
+            disabled={submitting || connection !== 'connected' || !selectedThread}
             onClick={() => fileInputRef.current?.click()}
           >
             📎
