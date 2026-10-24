@@ -20,12 +20,22 @@ import { ToolRegistry } from '../src/tools/registry.js';
 import { Tui } from '../src/ui/tui.js';
 import { initWorkspace } from '../src/workspace/fs.js';
 
+function gate() {
+  let release = () => {};
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
 it('carries attached bytes from real TUI keys through authenticated HTTP/runtime and saves the resulting approved artifact', async () => {
   const root = await mkdtemp(join(tmpdir(), 'nuaai-tui-runtime-'));
   await initWorkspace(root);
   const store = new DatabaseStore(openAppDatabase(root));
   const artifacts = new RunArtifactRegistry(root, store);
   const observed: ProviderRequest[] = [];
+  const finalTurnReady = gate();
+  const finalTurn = gate();
   const provider = {
     name: 'fixture',
     model: 'fixture',
@@ -45,11 +55,14 @@ it('carries attached bytes from real TUI keys through authenticated HTTP/runtime
           name: 'workspace.read',
           arguments: { path: 'result.txt' },
         };
-      } else
+      } else {
+        finalTurnReady.release();
+        await finalTurn.promise;
         yield {
           type: 'done' as const,
           text: 'The attached source was used.\n```txt\nVERIFIED_ARTIFACT_BYTES Ω\n```',
         };
+      }
     },
     health: async () => ({
       name: 'fixture',
@@ -169,7 +182,18 @@ it('carries attached bytes from real TUI keys through authenticated HTTP/runtime
         { timeout: 5000 },
       )
       .toBe('VERIFIED_ARTIFACT_BYTES Ω');
-    await expect.poll(() => store.getLatestRun(thread.id)?.status).toBe('completed');
+    await finalTurnReady.promise;
+    expect(observed).toHaveLength(3);
+    expect(observed.at(-1)?.messages.some((message) => message.toolName === 'workspace.read')).toBe(
+      true,
+    );
+    const admittedRun = store.getLatestRun(thread.id);
+    if (!admittedRun) throw new Error('Missing admitted workflow run');
+    expect(admittedRun.status).toBe('running');
+    const completion = runtime.waitForRun(admittedRun.id);
+    finalTurn.release();
+    expect((await completion).status).toBe('completed');
+    expect(store.getLatestRun(thread.id)?.status).toBe('completed');
     await expect.poll(frame).toContain('Artifact: result.txt');
     await expect.poll(frame).not.toContain('Applying…');
     await send('\u001bo', 'Conversation outputs');
@@ -185,6 +209,7 @@ it('carries attached bytes from real TUI keys through authenticated HTTP/runtime
       'VERIFIED_ARTIFACT_BYTES Ω',
     );
   } finally {
+    finalTurn.release();
     app.unmount();
     app.cleanup();
     await runtime.shutdown();
