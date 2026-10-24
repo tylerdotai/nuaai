@@ -218,6 +218,7 @@ it(
 
 it('T06 retries a lost acceptance across reconnect with the same key and preserves edits made in flight', async () => {
   const held = gate();
+  const nextAcceptance = gate();
   const submissions: Array<{ threadId: string; input: string; idempotencyKey?: string }> = [];
   const durable = new Map<string, string>();
   let drop = true;
@@ -236,6 +237,7 @@ it('T06 retries a lost acceptance across reconnect with the same key and preserv
       return true;
     }
     if (hold) await held.promise;
+    if (submissions.length === 3) await nextAcceptance.promise;
     json(res, { id: `run-${key}` });
     return true;
   });
@@ -262,10 +264,17 @@ it('T06 retries a lost acceptance across reconnect with the same key and preserv
     f.stdin.write('\r');
     await expect.poll(() => submissions.length).toBe(3);
     expect(submissions[2]?.idempotencyKey).not.toBe(submissions[0]?.idempotencyKey);
-    await expect.poll(f.frame).toContain('Run accepted');
-    expect(f.frame()).not.toContain('› retry safely plus next draft');
+    await expect.poll(f.frame).toContain('Applying…');
+    // The previous acceptance notice is still visible while this response is held;
+    // it cannot prove that the new submission has been accepted or rendered.
+    expect(f.frame()).toContain('Run accepted');
+    expect(f.frame()).toContain('› retry safely plus next draft');
+    nextAcceptance.release();
+    await expect.poll(f.frame).not.toContain('› retry safely plus next draft');
+    expect([...durable.values()]).toEqual(['retry safely', 'retry safely plus next draft']);
   } finally {
     held.release();
+    nextAcceptance.release();
     await f.close();
   }
 });
