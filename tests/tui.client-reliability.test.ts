@@ -273,6 +273,8 @@ it('T06 retries a lost acceptance across reconnect with the same key and preserv
 it.each(['presentation', 'run-state', 'catalog', 'subscribe'])(
   'T03 reconciles completion at the %s boundary without manual refresh',
   async (boundary) => {
+    const terminalReplay = gate();
+    if (boundary !== 'run-state') terminalReplay.release();
     let completed = false;
     let live: WebSocket | undefined;
     const terminal = {
@@ -323,20 +325,30 @@ it.each(['presentation', 'run-state', 'catalog', 'subscribe'])(
       (socket, message) => {
         live = socket;
         if (boundary === 'subscribe') finish();
-        if (completed && message.after < 3)
-          socket.send(JSON.stringify({ type: 'event', event: terminal }));
-        socket.send(
-          JSON.stringify({
-            type: 'replay.complete',
-            nextCursor: completed ? 3 : message.after,
-            hasMore: false,
-          }),
-        );
+        void terminalReplay.promise.then(() => {
+          if (socket.readyState !== WebSocket.OPEN) return;
+          if (completed && message.after < 3)
+            socket.send(JSON.stringify({ type: 'event', event: terminal }));
+          socket.send(
+            JSON.stringify({
+              type: 'replay.complete',
+              nextCursor: completed ? 3 : message.after,
+              hasMore: false,
+            }),
+          );
+        });
       },
     );
     try {
       await expect.poll(f.frame).toContain('FINAL-RECONCILED');
-      expect(f.frame()).not.toContain('Working…');
+      if (boundary === 'run-state') {
+        // The cursor is captured before presentation. A completed answer can
+        // render with the older active-run snapshot until terminal replay arrives.
+        await expect.poll(() => f.subscriptions.length).toBeGreaterThan(0);
+        expect(f.frame()).toContain('Working…');
+        terminalReplay.release();
+      }
+      await expect.poll(f.frame).not.toContain('Working…');
       expect(f.frame().split('FINAL-RECONCILED')).toHaveLength(2);
       expect(
         f.subscriptions.every(
@@ -344,6 +356,7 @@ it.each(['presentation', 'run-state', 'catalog', 'subscribe'])(
         ),
       ).toBe(true);
     } finally {
+      terminalReplay.release();
       await f.close();
     }
   },
