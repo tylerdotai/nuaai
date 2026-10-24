@@ -7,13 +7,13 @@ import {
   isRequestAbort,
   pairingFailureMessage,
   parseApiResponse,
-  webSocketCloseDisposition,
 } from './auth.js';
 import { AgentComposer, type ComposerAttachment } from './components/AgentComposer.js';
 import { ArtifactCards } from './components/ArtifactCards.js';
 import { MarkdownContent } from './components/MarkdownContent.js';
 import { RunStatusSummary } from './components/RunStatusSummary.js';
 import { SessionIdentityPanel } from './components/SessionIdentityPanel.js';
+import { ToastContainer } from './components/Toast.js';
 import { type ComposerCommand, draftStorageKey, resolveComposerCommand } from './composer.js';
 import type {
   ActiveProvider,
@@ -52,8 +52,6 @@ import {
 } from './scroll.js';
 import {
   type ActiveRunsByThread,
-  EventReplayBuffer,
-  EventReplayCursor,
   type LiveOutputByRun,
   type QueuedRunsByThread,
   type SelectionIdentity,
@@ -75,8 +73,10 @@ import {
 import {
   ApprovalInbox,
   AutomationsView,
+  BottomPanel,
   CommandPalette,
   ErrorToast,
+  KeyboardShortcutsOverlay,
   MemoryView,
   NavigationTabs,
   SystemView,
@@ -111,6 +111,7 @@ function App(): React.JSX.Element {
   useEffect(() => {
     if (identitySessionId !== selectedSessionId) setIdentitySessionId(null);
   }, [selectedSessionId, identitySessionId]);
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageView[]>([]);
@@ -124,6 +125,7 @@ function App(): React.JSX.Element {
   const [learning, setLearning] = useState<LearningStatus | null>(null);
   const [changingLearning, setChangingLearning] = useState(false);
   const [revertingMemoryId, setRevertingMemoryId] = useState<string | null>(null);
+  const [isLoadingMemories, setIsLoadingMemories] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [plugins, setPlugins] = useState<PluginRecord[]>([]);
@@ -152,20 +154,33 @@ function App(): React.JSX.Element {
   } | null>(null);
   const [scheduleName, setScheduleName] = useState('');
   const [scheduleInput, setScheduleInput] = useState('');
+  const [scheduleType, setScheduleType] = useState<'manual' | 'interval' | 'cron'>('manual');
+  const [scheduleExpression, setScheduleExpression] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<
+    Array<{
+      id: string;
+      variant: 'info' | 'success' | 'warning' | 'error';
+      title?: string;
+      message: string;
+    }>
+  >([]);
   const [showNewResponse, setShowNewResponse] = useState(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [loadingEarlierMessages, setLoadingEarlierMessages] = useState(false);
   const [composerExpanded, setComposerExpanded] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [shortcutsOverlayOpen, setShortcutsOverlayOpen] = useState(false);
+  const [bottomPanelOpen, setBottomPanelOpen] = useState(false);
   const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState('');
 
   const selectedSessionRef = useRef<string | null>(null);
   const selectedThreadRef = useRef<string | null>(null);
   const lastEventId = useRef(0);
+  const snapshotFloors = useRef<Record<string, number>>({});
   const selectionLoads = useRef(new SelectionLoadCoordinator());
   const backgroundLoads = useRef(new SelectionLoadCoordinator());
   const snapshotEpoch = useRef(0);
@@ -358,6 +373,7 @@ function App(): React.JSX.Element {
   }, [commandPaletteOpen]);
 
   const loadSystem = useCallback(async (signal?: AbortSignal): Promise<void> => {
+    setIsLoadingMemories(true);
     const [
       providerResult,
       scheduleResult,
@@ -392,6 +408,7 @@ function App(): React.JSX.Element {
     setPlugins(pluginResult.plugins);
     setPluginHealth(pluginResult.health);
     setApprovals(approvalResult.approvals);
+    setIsLoadingMemories(false);
   }, []);
 
   const loadThread = useCallback(
@@ -432,6 +449,7 @@ function App(): React.JSX.Element {
         subscriptionWillReset,
       );
       if (replaceLiveState) {
+        snapshotFloors.current[threadId] = runState.lastEventId;
         setEvents(runState.events);
         setLiveOutputByRun(liveOutputSnapshot(runState));
         setActiveRunsByThread((current) => ({
@@ -581,19 +599,25 @@ function App(): React.JSX.Element {
 
   useEffect(() => {
     if (!eventSubscription) return;
-    const subscribedSessionId = eventSubscription.sessionId;
-    let stopped = false;
-    let socket: WebSocket | undefined;
-    let reconnectTimer: number | undefined;
-    let eventFrame: number | undefined;
-    const eventBuffer = new EventReplayBuffer();
-    const replayCursor = new EventReplayCursor(eventSubscription.after);
-    let retry = 0;
-    lastEventId.current = eventSubscription.after;
+    const sessionId = eventSubscription.sessionId;
 
-    const flushEvents = (): void => {
+    let stopped = false;
+    let reconnectTimer: number | undefined;
+    lastEventId.current = eventSubscription.after;
+    let eventSource: EventSource | undefined;
+    let eventFrame: number | undefined;
+    const pendingEvents: WebEventRecord[] = [];
+
+    const processEvents = (): void => {
       eventFrame = undefined;
-      const batch = eventBuffer.drain();
+      const batch = pendingEvents
+        .splice(0)
+        .filter(
+          (event) =>
+            !event.threadId ||
+            event.id === undefined ||
+            event.id > (snapshotFloors.current[event.threadId] ?? 0),
+        );
       if (!batch.length) return;
       setActiveRunsByThread((current) => batch.reduce(reduceActiveRunsByThread, current));
       setLiveOutputByRun((current) => batch.reduce(reduceLiveOutputByRun, current));
@@ -629,97 +653,97 @@ function App(): React.JSX.Element {
     };
 
     const scheduleEvent = (event: WebEventRecord): void => {
-      if (!eventBuffer.add(event)) return;
-      if (!replayCursor.isReplaying()) eventFrame ??= window.requestAnimationFrame(flushEvents);
+      pendingEvents.push(event);
+      eventFrame ??= window.requestAnimationFrame(processEvents);
     };
 
-    const subscribe = (after: number): void => {
-      socket?.send(
-        JSON.stringify({
-          type: 'subscribe',
-          sessionId: subscribedSessionId,
-          after,
-          limit: 250,
-        }),
-      );
+    const handleSSEEvent = (event: MessageEvent): void => {
+      if (stopped) return;
+      try {
+        const data = JSON.parse(event.data) as { id?: number; event?: WebEventRecord };
+        if (!data.event) return;
+        const nextEvent = { ...data.event, ...(data.id !== undefined ? { id: data.id } : {}) };
+        if (nextEvent.sessionId && nextEvent.sessionId !== sessionId) return;
+        if (nextEvent.id !== undefined && nextEvent.id <= lastEventId.current) return;
+        lastEventId.current = Math.max(lastEventId.current, nextEvent.id ?? 0);
+        scheduleEvent(nextEvent);
+        if (
+          nextEvent.type.startsWith('approval.') ||
+          nextEvent.type.startsWith('knowledge.') ||
+          nextEvent.type === 'memory.stored'
+        )
+          void loadSystem().catch(reportBackgroundFailure);
+        if (
+          terminalRunStates.has(nextEvent.type.replace('run.', '')) &&
+          nextEvent.threadId === selectedThreadRef.current
+        ) {
+          const threadId = selectedThreadRef.current;
+          if (threadId && selectedSessionRef.current === sessionId) {
+            const expectedSelection = { sessionId, threadId };
+            const load = beginBackgroundLoad(expectedSelection);
+            void loadThread(threadId, load, backgroundLoads.current, expectedSelection).catch(
+              reportBackgroundFailure,
+            );
+          }
+          void loadSystem().catch(reportBackgroundFailure);
+        }
+      } catch {
+        setError('NUAAI received an invalid live event. Refresh the runtime state.');
+      }
     };
 
     const connect = (): void => {
       if (stopped) return;
-      const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-      socket = new WebSocket(`${protocol}://${location.host}${appPath('/ws')}`);
-      socket.onopen = () => {
-        retry = 0;
-        setConnection('connected');
-        subscribe(replayCursor.beginReplay());
-      };
-      socket.onmessage = (message) => {
-        try {
-          const value = JSON.parse(String(message.data)) as {
-            type: string;
-            event?: WebEventRecord;
-            nextCursor?: number;
-            hasMore?: boolean;
-          };
-          if (value.type === 'replay.complete') {
-            const continuation = replayCursor.completePage(
-              value.nextCursor ?? 0,
-              value.hasMore === true,
-            );
-            lastEventId.current = Math.max(lastEventId.current, replayCursor.highWater());
-            if (continuation !== null) subscribe(continuation);
-            else if (eventBuffer.size) eventFrame ??= window.requestAnimationFrame(flushEvents);
-            return;
-          }
-          if (value.type !== 'event' || !value.event) return;
-          const nextEvent = value.event;
-          if (nextEvent.sessionId && nextEvent.sessionId !== subscribedSessionId) return;
-          if (nextEvent.id !== undefined) replayCursor.observe(nextEvent.id);
-          lastEventId.current = Math.max(lastEventId.current, nextEvent.id ?? 0);
-          scheduleEvent(nextEvent);
-          if (nextEvent.type.startsWith('approval.'))
-            void loadSystem().catch(reportBackgroundFailure);
-          if (
-            terminalRunStates.has(nextEvent.type.replace('run.', '')) &&
-            nextEvent.threadId === selectedThreadRef.current
-          ) {
-            const sessionId = selectedSessionRef.current;
-            const threadId = selectedThreadRef.current;
-            if (sessionId && threadId) {
-              const expectedSelection = { sessionId, threadId };
-              const load = beginBackgroundLoad(expectedSelection);
-              void loadThread(threadId, load, backgroundLoads.current, expectedSelection).catch(
-                reportBackgroundFailure,
-              );
-            }
-            if (sessionId) void loadSystem().catch(reportBackgroundFailure);
-          }
-        } catch {
-          setError('NUAAI received an invalid live event. Refresh the runtime state.');
-        }
-      };
-      socket.onerror = () => socket?.close();
-      socket.onclose = (event) => {
-        if (stopped) return;
-        const disposition = webSocketCloseDisposition(event.code, event.reason);
-        if (!disposition.reconnect) {
-          stopped = true;
-          setConnection('offline');
-          setError(disposition.message ?? 'Pair this device to continue.');
-          return;
-        }
-        retry += 1;
-        setConnection(retry >= 6 ? 'offline' : 'reconnecting');
-        reconnectTimer = window.setTimeout(connect, Math.min(1_000 * 2 ** (retry - 1), 10_000));
+      const url = new URL(appPath('/api/agent/stream'), location.href);
+      url.searchParams.set('session_id', sessionId ?? '');
+      if (lastEventId.current > 0) {
+        url.searchParams.set('Last-Event-ID', String(lastEventId.current));
+      }
+      eventSource = new EventSource(url.toString());
+      eventSource.onopen = () => setConnection('connected');
+      eventSource.onmessage = handleSSEEvent;
+      for (const type of [
+        'token',
+        'tool_start',
+        'tool_end',
+        'done',
+        'status',
+        'error',
+        'run.created',
+        'run.queued',
+        'run.paused',
+        'run.resumed',
+        'run.cancel_requested',
+        'run.cancelled',
+        'approval.requested',
+        'approval.approved',
+        'approval.denied',
+        'approval.expired',
+        'approval.executed',
+        'approval.failed',
+        'approval.policy.changed',
+        'knowledge.reverted',
+        'knowledge.mode.changed',
+        'knowledge.review.completed',
+        'memory.stored',
+      ])
+        eventSource.addEventListener(type, (event) => {
+          if (event instanceof MessageEvent) handleSSEEvent(event);
+        });
+      eventSource.onerror = (event) => {
+        if (event instanceof MessageEvent || stopped) return;
+        eventSource?.close();
+        setConnection('reconnecting');
+        reconnectTimer = window.setTimeout(connect, 2000);
       };
     };
 
     connect();
     return () => {
       stopped = true;
-      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      eventSource?.close();
       if (eventFrame) window.cancelAnimationFrame(eventFrame);
-      socket?.close();
     };
   }, [beginBackgroundLoad, eventSubscription, loadSystem, loadThread, reportBackgroundFailure]);
 
@@ -835,8 +859,23 @@ function App(): React.JSX.Element {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
         setCommandPaletteOpen(true);
+      } else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') {
+        event.preventDefault();
+        setBottomPanelOpen((prev) => !prev);
+      } else if (
+        (event.key === '?' || (event.shiftKey && event.key === '/')) &&
+        !(
+          event.target instanceof HTMLElement &&
+          (event.target.closest('input, textarea, select') || event.target.isContentEditable)
+        )
+      ) {
+        event.preventDefault();
+        setShortcutsOverlayOpen((prev) => !prev);
       } else if (event.key === 'Escape') {
+        setSelectedSessionIds(new Set());
         setCommandPaletteOpen(false);
+        setShortcutsOverlayOpen(false);
+        setBottomPanelOpen(false);
         setSessionDrawerOpen(false);
       }
     };
@@ -879,7 +918,12 @@ function App(): React.JSX.Element {
     [activeRunId, messages],
   );
   const liveMessage = useMemo<MessageView | null>(() => {
-    if (!runProjection || terminalRunStates.has(runProjection.status)) return null;
+    if (!runProjection) return null;
+    const isTerminal = terminalRunStates.has(runProjection.status);
+    const completedMessageExists = messages.some(
+      (m) => m.role === 'assistant' && m.runId === runProjection.runId,
+    );
+    if (isTerminal && completedMessageExists) return null;
     const startedAt =
       threadEvents.find(
         (event) => event.runId === runProjection.runId && event.type === 'run.started',
@@ -891,17 +935,18 @@ function App(): React.JSX.Element {
       markdown: liveOutputByRun[runProjection.runId] ?? runProjection.liveOutput,
       createdAt: startedAt,
       ...(activeProvider ? { provider: activeProvider } : {}),
-      status: 'streaming',
+      status: isTerminal ? 'completed' : 'streaming',
       activities: [
         {
           runId: runProjection.runId,
-          status: 'streaming',
+          status: isTerminal ? 'completed' : 'streaming',
           startedAt,
           items: runProjection.tools.map((tool) => ({
             id: tool.id,
             name: tool.name,
             status: tool.status,
             startedAt: tool.createdAt,
+            ...(tool.arguments ? { arguments: tool.arguments } : {}),
           })),
         },
       ],
@@ -909,7 +954,7 @@ function App(): React.JSX.Element {
       attachments: [],
       artifacts: [],
     };
-  }, [activeProvider, liveOutputByRun, runProjection, threadEvents]);
+  }, [activeProvider, liveOutputByRun, messages, runProjection, threadEvents]);
 
   const createSession = async (): Promise<void> => {
     followNextOutput();
@@ -1311,20 +1356,27 @@ function App(): React.JSX.Element {
 
   const createSchedule = async (): Promise<void> => {
     if (!scheduleName.trim() || !scheduleInput.trim()) return;
+    const type = scheduleType;
+    const expression = type === 'manual' ? '' : scheduleExpression;
     try {
       await request('/api/schedules', {
         method: 'POST',
         body: JSON.stringify({
           name: scheduleName.trim(),
-          type: 'manual',
-          expression: '',
+          type,
+          expression,
           agentInput: scheduleInput.trim(),
         }),
       });
       setScheduleName('');
       setScheduleInput('');
+      setScheduleExpression('');
+      setScheduleType('manual');
       await loadSystem();
-      setNotice('Automation created');
+      setToasts((t) => [
+        ...t,
+        { id: `toast-${Date.now()}`, variant: 'success', message: 'Automation created' },
+      ]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -1381,7 +1433,23 @@ function App(): React.JSX.Element {
     try {
       await request(`/api/memory/${encodeURIComponent(id)}`, { method: 'DELETE' });
       setMemories((current) => current.filter((m) => m.id !== id));
-      setNotice('Memory deleted');
+      setToasts((t) => [
+        ...t,
+        { id: `toast-${Date.now()}`, variant: 'info', message: 'Memory deleted' },
+      ]);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const updateMemory = async (id: string, content: string): Promise<void> => {
+    try {
+      await request(`/api/memory/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ content }),
+      });
+      setMemories((current) => current.map((m) => (m.id === id ? { ...m, content } : m)));
+      setNotice('Memory updated');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -1412,7 +1480,28 @@ function App(): React.JSX.Element {
 
   const deleteSession = async (id: string): Promise<void> => {
     try {
-      await request(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const response = await fetch(appPath(`/api/sessions/${encodeURIComponent(id)}`), {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+      });
+      if (response.status === 404) {
+        setSessions((current) => {
+          const next = current.filter((s) => s.id !== id);
+          if (selectedSessionId === id && next.length > 0) {
+            void chooseSession(next[0].id);
+          }
+          return next;
+        });
+        setSessionContextMenu(null);
+        setToasts((t) => [
+          ...t,
+          { id: `toast-${Date.now()}`, variant: 'info', message: 'Session already deleted' },
+        ]);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(`Delete failed: ${response.status}`);
+      }
       setSessions((current) => {
         const next = current.filter((s) => s.id !== id);
         if (selectedSessionId === id && next.length > 0) {
@@ -1421,10 +1510,22 @@ function App(): React.JSX.Element {
         return next;
       });
       setSessionContextMenu(null);
-      setNotice('Session deleted');
+      setToasts((t) => [
+        ...t,
+        { id: `toast-${Date.now()}`, variant: 'success', message: 'Session deleted' },
+      ]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
+  };
+
+  const deleteSelectedSessions = async (): Promise<void> => {
+    const ids = Array.from(selectedSessionIds);
+    if (ids.length === 0) return;
+    for (const id of ids) {
+      await deleteSession(id);
+    }
+    setSelectedSessionIds(new Set());
   };
 
   const scheduleAction = async (
@@ -1652,6 +1753,17 @@ function App(): React.JSX.Element {
               >
                 ☰
               </button>
+              <button
+                type="button"
+                className="collapsed-rail-btn"
+                onClick={() => {
+                  setSessionRailCollapsed(false);
+                  setSessionSearch('');
+                }}
+                title="Search sessions"
+              >
+                ⌕
+              </button>
               {sessions.slice(0, 8).map((session) => (
                 <button
                   type="button"
@@ -1659,6 +1771,7 @@ function App(): React.JSX.Element {
                   className={`collapsed-session-btn ${selectedSessionId === session.id ? 'selected' : ''}`}
                   onClick={() => {
                     void chooseSession(session.id);
+                    setSessionRailCollapsed(false);
                   }}
                   title={session.title}
                 >
@@ -1703,7 +1816,8 @@ function App(): React.JSX.Element {
                         const isEditing = editingSessionId === session.id;
                         return (
                           <div
-                            className={`session-row-wrap ${selectedSessionId === session.id ? 'selected' : ''}`}
+                            className={`session-row-wrap ${selectedSessionId === session.id ? 'selected' : ''} ${selectedSessionIds.has(session.id) ? 'multi-selected' : ''}`}
+                            data-selected={selectedSessionIds.has(session.id)}
                             key={session.id}
                             onContextMenu={(e) => {
                               e.preventDefault();
@@ -1738,7 +1852,19 @@ function App(): React.JSX.Element {
                                 type="button"
                                 className="session-row"
                                 aria-current={selectedSessionId === session.id ? 'page' : undefined}
-                                onClick={() => void chooseSession(session.id)}
+                                onClick={(e) => {
+                                  if (e.shiftKey || e.metaKey || e.ctrlKey) {
+                                    e.preventDefault();
+                                    setSelectedSessionIds((prev) => {
+                                      const next = new Set(prev);
+                                      if (next.has(session.id)) next.delete(session.id);
+                                      else next.add(session.id);
+                                      return next;
+                                    });
+                                  } else {
+                                    void chooseSession(session.id);
+                                  }
+                                }}
                                 onDoubleClick={() => {
                                   setEditingSessionId(session.id);
                                   setEditingSessionTitle(session.title);
@@ -1837,8 +1963,7 @@ function App(): React.JSX.Element {
               role="menuitem"
               className="danger"
               onClick={() => {
-                const session = sessions.find((s) => s.id === sessionContextMenu.sessionId);
-                if (session && confirm(`Delete "${session.title}"?`)) deleteSession(session.id);
+                deleteSession(sessionContextMenu.sessionId);
                 setSessionContextMenu(null);
               }}
             >
@@ -1962,7 +2087,7 @@ function App(): React.JSX.Element {
                         Start a conversation
                       </button>
                     </div>
-                  ) : transcript.length === 0 && !runProjection?.liveOutput ? (
+                  ) : transcript.length === 0 && !runProjection ? (
                     <div className="conversation-empty">
                       <span className="empty-mark" aria-hidden="true">
                         N
@@ -1986,7 +2111,13 @@ function App(): React.JSX.Element {
                       {transcript.map((message) => (
                         <article className={`message message-${message.role}`} key={message.id}>
                           <div className="message-meta">
-                            <span>{message.role === 'user' ? 'You' : 'NUAAI'}</span>
+                            <span>
+                              {message.role === 'user'
+                                ? 'You'
+                                : message.provider
+                                  ? `${message.provider.name} · ${message.provider.model}`
+                                  : 'NUAAI'}
+                            </span>
                             <time>{relativeTime(message.createdAt)}</time>
                           </div>
                           <MarkdownContent markdown={message.markdown} />
@@ -2004,7 +2135,11 @@ function App(): React.JSX.Element {
                       {liveMessage && (
                         <article className="message message-assistant message-live">
                           <div className="message-meta">
-                            <span>NUAAI</span>
+                            <span>
+                              {liveMessage.provider
+                                ? `${liveMessage.provider.name} · ${liveMessage.provider.model}`
+                                : 'NUAAI'}
+                            </span>
                             <span>{runLabel(runProjection?.status)}</span>
                           </div>
                           <div className="message-live-body">
@@ -2060,6 +2195,13 @@ function App(): React.JSX.Element {
                   onSwitchProvider={(provider, model) => void switchProvider(provider, model)}
                   onCommand={(command) => void executeComposerCommand(command)}
                 />
+                <BottomPanel
+                  isOpen={bottomPanelOpen}
+                  onToggle={() => setBottomPanelOpen((prev) => !prev)}
+                  activeRunId={activeRunId}
+                  runProjection={runProjection ?? null}
+                  liveOutput={liveMessage?.markdown ?? null}
+                />
               </div>
             </section>
           )}
@@ -2073,8 +2215,10 @@ function App(): React.JSX.Element {
               onRevert={(id) => void revertMemory(id)}
               onLearningMode={(mode) => void changeLearning(mode)}
               onDelete={deleteMemory}
+              onUpdate={updateMemory}
               saveMemory={saveMemory}
               saveStatus={saveStatus}
+              isLoading={isLoadingMemories}
             />
           )}
 
@@ -2083,8 +2227,12 @@ function App(): React.JSX.Element {
               schedules={schedules}
               scheduleName={scheduleName}
               scheduleInput={scheduleInput}
+              scheduleType={scheduleType}
+              scheduleExpression={scheduleExpression}
               onScheduleName={setScheduleName}
               onScheduleInput={setScheduleInput}
+              onScheduleType={setScheduleType}
+              onScheduleExpression={setScheduleExpression}
               onCreate={() => void createSchedule()}
               onAction={(id, action) => void scheduleAction(id, action)}
               onDelete={deleteSchedule}
@@ -2139,6 +2287,39 @@ function App(): React.JSX.Element {
           onClose={() => setCommandPaletteOpen(false)}
         />
       )}
+
+      {shortcutsOverlayOpen && (
+        <KeyboardShortcutsOverlay onClose={() => setShortcutsOverlayOpen(false)} />
+      )}
+
+      {selectedSessionIds.size > 0 && (
+        <div
+          className="floating-action-bar"
+          style={{ bottom: 24, left: '50%', transform: 'translateX(-50%)' }}
+        >
+          <span className="fab-count">{selectedSessionIds.size} selected</span>
+          <button
+            type="button"
+            className="fab-delete-btn"
+            onClick={() => void deleteSelectedSessions()}
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            className="fab-cancel-btn"
+            onClick={() => setSelectedSessionIds(new Set())}
+            aria-label="Cancel selection"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      <ToastContainer
+        toasts={toasts}
+        onDismiss={(id) => setToasts((t) => t.filter((toast) => toast.id !== id))}
+      />
     </div>
   );
 }

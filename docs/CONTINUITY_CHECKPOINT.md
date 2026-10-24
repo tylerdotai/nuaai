@@ -1,8 +1,10 @@
 # Agent continuity checkpoint — work in progress
 
-This is a reviewable source checkpoint, not a finished release or deployment. It is based on `88e7919`; newer main-branch UI, SSE transport and test-infrastructure changes require deliberate integration. Do not replace those changes wholesale with this branch. The working source used for this checkpoint passed check/typecheck and 649 tests in 159 files before publication-specific validation; the PR records the candidate's actual results separately.
+This is a reviewable source checkpoint, not a finished release or deployment. Originally based on `88e7919`, it now integrates the five newer main-branch commits through `43fb133`, preserving both implementations. The combined candidate passes lint/typecheck, 704 tests in 166 files, Node/web release builds, and all 16 browser end-to-end tests in isolation. The stricter coverage gate still fails in `src/core/context-buffer.ts`, `src/core/introspection.ts`, and `src/memory/scope.ts`; thresholds have not been weakened. Keep this PR draft pending those and the remaining acceptance gates.
 
 ## Implemented source
+
+- Integrated main's SSE-first clients, memory search/bulk controls, session/toast/slash/drop UI and test infrastructure with the checkpoint's learning, identity, attachments and continuation features. Retained authenticated legacy WebSocket compatibility, real HTTP stream/replay checks, bounded registered-upload support and scoped cancellation events.
 
 - Pinned session/workspace identity and permission-limited child execution; governed literal host CLI execution, approval controls and durable task diagnostics.
 - TUI navigation, editor/forms, chronological activity, feed scrolling/reading-anchor and persistent-menu work, plus authenticated client/attachment improvements.
@@ -20,7 +22,7 @@ This is a reviewable source checkpoint, not a finished release or deployment. It
 - Web/TUI/CLI long-work controls and cohesive end-to-end goal/task/approval/error state, full installed scrolling and browser/terminal/release acceptance.
 - Conversation-first web redesign, compact and genuinely cited sources, final Transfer integration, labels/icons/spacing and responsive visual acceptance.
 - Fair dispatch/backpressure, isolated worker lease/submission contracts, controlled 1,000-assignment capacity evidence and reproducible evaluations. **No claim of 1,000 simultaneous production workers.**
-- Current-main integration and final release checks. Do not merge or activate based only on the checkpoint's passing source tests.
+- Coverage completion, installed-terminal/package and mutation acceptance, remote CI and final release checks. Do not merge or activate based only on passing source and browser tests.
 
 ## Architecture direction
 

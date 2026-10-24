@@ -73,6 +73,56 @@ export function AgentComposer({
     input: input || (attachments.length ? 'Attached files' : ''),
     activeRunId,
   });
+  const [isDragOver, setIsDragOver] = useState(false);
+  const commandSuggestions = input.trim().startsWith('/')
+    ? slashCommands.filter(({ command }) => command.startsWith(input.trim().toLowerCase()))
+    : [];
+
+  const addFiles = (files: FileList | File[]): void => {
+    if (submitting || !selectedThread || connection !== 'connected') return;
+    setAttachments((current) => [
+      ...current,
+      ...Array.from(files, (file) => Object.assign(file, { id: crypto.randomUUID() })),
+    ]);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+    if (e.dataTransfer.files?.length) {
+      addFiles(e.dataTransfer.files);
+    }
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imageItems = Array.from(items).filter(
+      (item) => item.kind === 'file' && item.type.startsWith('image/'),
+    );
+    if (imageItems.length) {
+      e.preventDefault();
+      const files = imageItems.flatMap((item) => {
+        const file = item.getAsFile();
+        return file ? [file] : [];
+      });
+      addFiles(files);
+    }
+  };
+
   const capabilities = capabilitySummary(permissionProfile);
   const modelOptions = useMemo(() => {
     const options = providers.flatMap((provider) =>
@@ -81,24 +131,29 @@ export function AgentComposer({
         provider: provider.name,
         model,
         available: provider.available,
+        detail: provider.detail,
       })),
     );
     if (activeProvider) {
       const activeValue = `${activeProvider.name}:${activeProvider.model}`;
+      const activeHealth = providers.find((provider) => provider.name === activeProvider.name);
       if (!options.some((option) => option.value === activeValue))
         options.unshift({
           value: activeValue,
           provider: activeProvider.name,
           model: activeProvider.model,
-          available:
-            providers.find((provider) => provider.name === activeProvider.name)?.available ?? true,
+          available: activeHealth?.available ?? true,
+          detail: activeHealth?.detail ?? 'unknown',
         });
     }
     return options;
   }, [activeProvider, providers]);
-  const commandSuggestions = input.trim().startsWith('/')
-    ? slashCommands.filter(({ command }) => command.startsWith(input.trim().toLowerCase()))
-    : [];
+
+  const getHealthTitle = (detail: string, available: boolean): string => {
+    if (!available) return `Unavailable: ${detail}`;
+    if (detail === 'ready') return 'Ready';
+    return detail || 'Unknown';
+  };
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -133,11 +188,14 @@ export function AgentComposer({
 
   return (
     <form
-      className={`composer ${expanded ? 'composer-expanded' : ''}`}
+      className={`composer ${expanded ? 'composer-expanded' : ''} ${isDragOver ? 'composer-drag-over' : ''}`}
       onSubmit={(event) => {
         event.preventDefault();
-        submit();
+        void submit();
       }}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
     >
       {queuedItems.length > 0 && (
         <div className="composer-queue" aria-label="Queued follow-ups">
@@ -223,6 +281,7 @@ export function AgentComposer({
               event.preventDefault();
               if (input.trim() || attachments.length) void submit();
             }}
+            onPaste={handlePaste}
           />
         </label>
         <button
@@ -247,7 +306,7 @@ export function AgentComposer({
         </button>
       </div>
 
-      {activeRunId && input.trim() && (
+      {activeRunId && (input.trim() || attachments.length > 0) && (
         <div className="composer-followup-modes" aria-label="Follow-up behavior">
           <button
             type="button"
@@ -268,23 +327,36 @@ export function AgentComposer({
 
       <div className="composer-toolbar">
         <div className="composer-controls">
-          <select
-            aria-label="Model"
-            value={activeProvider ? `${activeProvider.name}:${activeProvider.model}` : ''}
-            disabled={!modelOptions.length}
-            onChange={(event) => {
-              const option = modelOptions.find(
-                (candidate) => candidate.value === event.target.value,
-              );
-              if (option) onSwitchProvider(option.provider, option.model);
-            }}
-          >
-            {modelOptions.map((option) => (
-              <option key={option.value} value={option.value} disabled={!option.available}>
-                {option.provider} · {option.model}
-              </option>
-            ))}
-          </select>
+          <div className="model-selector">
+            {activeProvider &&
+              (() => {
+                const health = providers.find((p) => p.name === activeProvider.name);
+                return (
+                  <span
+                    className={`health-dot ${health?.available ? 'available' : 'unavailable'}`}
+                    title={getHealthTitle(health?.detail ?? '', health?.available ?? false)}
+                    aria-label={getHealthTitle(health?.detail ?? '', health?.available ?? false)}
+                  />
+                );
+              })()}
+            <select
+              aria-label="Model"
+              value={activeProvider ? `${activeProvider.name}:${activeProvider.model}` : ''}
+              disabled={!modelOptions.length}
+              onChange={(event) => {
+                const option = modelOptions.find(
+                  (candidate) => candidate.value === event.target.value,
+                );
+                if (option) onSwitchProvider(option.provider, option.model);
+              }}
+            >
+              {modelOptions.map((option) => (
+                <option key={option.value} value={option.value} disabled={!option.available}>
+                  {option.provider} · {option.model}
+                </option>
+              ))}
+            </select>
+          </div>
           <details className="composer-popover">
             <summary>{capabilities.label}</summary>
             <div>

@@ -41,9 +41,9 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await expect(page.locator('.session-row')).toHaveCount(initialSessionCount);
   await page.locator('.new-conversation-button').click();
   await expect(page.locator('.session-row')).toHaveCount(initialSessionCount + 1);
-  const selectedSession = page.locator('.session-row[aria-current="page"]');
+  const selectedSession = page.locator('.session-row-wrap.selected');
   await expect(selectedSession).toContainText('Current');
-  const createdSessionTitle = await selectedSession.locator('strong').textContent();
+  const createdSessionTitle = await selectedSession.locator('.session-row strong').textContent();
   expect(createdSessionTitle).toBeTruthy();
   expect(createdSessionTitle).not.toMatch(/^Session \d+$/);
 
@@ -177,7 +177,6 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await expect(toolResponse).toContainText('NUAAI deterministic test response', {
     timeout: 30_000,
   });
-  await toolResponse.getByRole('button', { name: 'Inspect run activity' }).click();
   await expect(toolResponse).toContainText('workspace.list');
   await expect(toolResponse.locator('[data-activity-id]')).toHaveCount(1);
 
@@ -200,7 +199,6 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await expect(writeResponse).toContainText('NUAAI deterministic test response', {
     timeout: 30_000,
   });
-  await writeResponse.getByRole('button', { name: 'Inspect run activity' }).click();
   await expect(writeResponse).toContainText('workspace.write');
   await expect(writeResponse.getByRole('region', { name: 'Run artifacts' })).toContainText(
     'work-sample-output.txt',
@@ -372,9 +370,6 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await expect(page.locator('[data-status="failed"]')).toContainText(
     'Deterministic browser failure',
   );
-  const inspectButtons = page.getByRole('button', { name: 'Inspect run activity' });
-  await expect(inspectButtons).toHaveCount(2);
-  await inspectButtons.first().click();
   await expect(page.getByText('workspace.list', { exact: true })).toBeVisible();
 
   await page
@@ -485,20 +480,20 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   expect(browserErrors).toEqual([]);
 });
 
-test('HTTP polling surfaces paused approvals when WebSocket approval events are lost', async ({
+test('HTTP polling surfaces paused approvals when SSE approval events are lost', async ({
   page,
 }) => {
   test.setTimeout(60_000);
   const e2eRoot = process.env.NUAAI_E2E_ROOT;
   if (!e2eRoot) throw new Error('NUAAI_E2E_ROOT is required');
-  await page.routeWebSocket(/\/ws(?:\?|$)/, (socket) => {
-    const server = socket.connectToServer();
-    socket.onMessage((message) => server.send(message));
-    server.onMessage((message) => {
-      const text = String(message);
-      if (text.includes('approvals.invalidated') || text.includes('approval.requested')) return;
-      socket.send(message);
-    });
+  await page.route(/\/api\/agent\/stream/, async (route) => {
+    const url = new URL(route.request().url());
+    if (!url.searchParams.has('drop')) {
+      url.searchParams.set('drop', 'approval.requested');
+      await route.continue({ url: url.toString() });
+      return;
+    }
+    await route.continue();
   });
   await page.goto(`/#token=${encodeURIComponent(createBrowserPairingToken(e2eRoot))}`);
   await expect(page.locator('.connection')).toContainText('Connected', { timeout: 30_000 });

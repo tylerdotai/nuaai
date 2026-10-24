@@ -9,35 +9,6 @@ export interface WebEventRecord {
   runId?: string;
 }
 
-export class EventReplayBuffer {
-  private readonly keyedEvents = new Map<number, WebEventRecord>();
-  private readonly unkeyedEvents: WebEventRecord[] = [];
-
-  get size(): number {
-    return this.keyedEvents.size + this.unkeyedEvents.length;
-  }
-
-  add(event: WebEventRecord): boolean {
-    if (event.id === undefined) {
-      this.unkeyedEvents.push(event);
-      return true;
-    }
-    if (this.keyedEvents.has(event.id)) return false;
-    this.keyedEvents.set(event.id, event);
-    return true;
-  }
-
-  drain(): WebEventRecord[] {
-    const events = [...this.keyedEvents.values()].sort(
-      (left, right) => (left.id ?? 0) - (right.id ?? 0),
-    );
-    events.push(...this.unkeyedEvents);
-    this.keyedEvents.clear();
-    this.unkeyedEvents.length = 0;
-    return events;
-  }
-}
-
 export type WebRunStatus = 'queued' | 'running' | 'action' | 'completed' | 'failed' | 'cancelled';
 
 export interface WebToolActivity {
@@ -45,6 +16,7 @@ export interface WebToolActivity {
   name: string;
   status: 'running' | 'completed' | 'failed';
   createdAt: number;
+  arguments?: Record<string, unknown>;
 }
 
 export interface WebRunProjection {
@@ -53,6 +25,8 @@ export interface WebRunProjection {
   liveOutput: string;
   tools: WebToolActivity[];
   error?: string;
+  startedAt?: number;
+  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
 }
 
 export interface WebRunSnapshotRecord {
@@ -176,44 +150,6 @@ export class SelectionLoadCoordinator {
     this.controller?.abort();
     this.controller = null;
     this.generation += 1;
-  }
-}
-
-export class EventReplayCursor {
-  private committedCursor: number;
-  private observedCursor: number;
-  private replaying = false;
-
-  constructor(initialCursor: number) {
-    this.committedCursor = initialCursor;
-    this.observedCursor = initialCursor;
-  }
-
-  beginReplay(): number {
-    if (!this.replaying) {
-      this.committedCursor = Math.max(this.committedCursor, this.observedCursor);
-      this.replaying = true;
-    }
-    return this.committedCursor;
-  }
-
-  observe(eventId: number): void {
-    if (Number.isFinite(eventId)) this.observedCursor = Math.max(this.observedCursor, eventId);
-  }
-
-  completePage(nextCursor: number, hasMore: boolean): number | null {
-    if (Number.isFinite(nextCursor))
-      this.committedCursor = Math.max(this.committedCursor, nextCursor);
-    this.replaying = hasMore;
-    return hasMore ? this.committedCursor : null;
-  }
-
-  highWater(): number {
-    return Math.max(this.committedCursor, this.observedCursor);
-  }
-
-  isReplaying(): boolean {
-    return this.replaying;
   }
 }
 
@@ -347,20 +283,27 @@ export function projectRunEvents(
   let status: WebRunStatus = 'queued';
   let liveOutput = '';
   let error: string | undefined;
+  let startedAt: number | undefined;
+  let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined;
   const tools = new Map<string, WebToolActivity>();
   for (const event of events) {
     if (event.runId !== selectedRunId) continue;
     if (event.type === 'run.created' || event.type === 'run.queued') status = 'queued';
-    else if (event.type === 'run.started') status = 'running';
-    else if (event.type === 'model.started') {
+    else if (event.type === 'run.started') {
+      status = 'running';
+      startedAt = startedAt ?? event.createdAt;
+    } else if (event.type === 'model.started') {
       status = 'running';
       liveOutput = '';
+      startedAt = startedAt ?? event.createdAt;
     } else if (event.type === 'model.delta') {
       status = 'running';
       liveOutput += String(event.payload.text ?? '');
     } else if (event.type === 'model.completed' && typeof event.payload.text === 'string') {
       status = 'running';
       liveOutput = event.payload.text;
+    } else if (event.type === 'model.usage') {
+      usage = event.payload.usage as typeof usage;
     } else if (event.type === 'tool.started') {
       status = 'action';
       const id = String(event.payload.id ?? event.id ?? tools.size);
@@ -369,6 +312,9 @@ export function projectRunEvents(
         name: String(event.payload.name ?? 'Action'),
         status: 'running',
         createdAt: event.createdAt,
+        ...(event.payload.arguments && typeof event.payload.arguments === 'object'
+          ? { arguments: event.payload.arguments as Record<string, unknown> }
+          : {}),
       });
     } else if (event.type === 'tool.completed' || event.type === 'tool.failed') {
       status = 'running';
@@ -384,6 +330,7 @@ export function projectRunEvents(
         status:
           event.type === 'tool.failed' || event.payload.isError === true ? 'failed' : 'completed',
         createdAt: event.createdAt,
+        ...(previous?.arguments ? { arguments: previous.arguments } : {}),
       });
     }
 
@@ -413,5 +360,7 @@ export function projectRunEvents(
     liveOutput,
     tools: [...tools.values()],
     ...(error ? { error } : {}),
+    ...(startedAt ? { startedAt } : {}),
+    ...(usage ? { usage } : {}),
   };
 }

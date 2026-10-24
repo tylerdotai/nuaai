@@ -53,6 +53,12 @@ export interface ProviderRequest {
   signal?: AbortSignal;
 }
 
+export interface ProviderUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+}
+
 export type ProviderStreamEvent =
   | { type: 'delta'; text: string }
   | { type: 'tool_call'; id: string; name: string; arguments: Record<string, unknown> }
@@ -70,7 +76,7 @@ export type ProviderStreamEvent =
       result: unknown;
       isError: boolean;
     }
-  | { type: 'done'; text: string };
+  | { type: 'done'; text: string; usage?: ProviderUsage };
 
 export interface ProviderHealth {
   name: string;

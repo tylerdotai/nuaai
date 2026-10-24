@@ -452,14 +452,13 @@ export function Tui({
           typeof status.revision !== 'number'
         )
           throw new Error('Daemon identity status is unavailable.');
-        if (
-          !mounted.current ||
-          sequence !== identityReadSequence.current ||
-          selectedSessionRef.current !== sessionId
-        )
-          return null;
-        setSessionIdentity(status);
-        setIdentityError(null);
+        if (!mounted.current || selectedSessionRef.current !== sessionId) return null;
+        if (sequence === identityReadSequence.current) {
+          setSessionIdentity(status);
+          setIdentityError(null);
+        }
+        // A concurrent stream-triggered read may own rendering; this response is
+        // still valid readback evidence for its caller in the same session.
         return status;
       } catch (cause) {
         if (
@@ -751,6 +750,9 @@ export function Tui({
   useEffect(() => {
     let stopped = false;
     let socket: WebSocket | null = null;
+    let streamAbort: AbortController | null = null;
+    let streamConnected = false;
+    let lastStreamId = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let approvalFallbackTimer: ReturnType<typeof setInterval> | null = null;
     let retry = 0;
@@ -758,13 +760,42 @@ export function Tui({
     const pendingReplays: Array<{ generation: number; sessionId: string; after: number }> = [];
     let subscribedGeneration = -1;
     subscribeRef.current = (sessionId, after, generation, nextPage = false) => {
-      if (stopped || socket?.readyState !== WebSocket.OPEN) return;
+      if (stopped) return;
+      if (streamConnected) {
+        if (!nextPage && subscribedGeneration === generation) return;
+        subscribedGeneration = generation;
+        void (async () => {
+          let cursor = after;
+          while (!stopped && hydrationGeneration.current === generation) {
+            const response = await fetch(
+              `${baseUrl}/api/events?sessionId=${encodeURIComponent(sessionId)}&after=${cursor}&limit=250`,
+              { headers: { authorization: `Bearer ${token}` }, signal: streamAbort?.signal },
+            );
+            if (!response.ok) throw new Error(`Event replay HTTP ${response.status}`);
+            const page = (await response.json()) as {
+              events: DaemonEvent[];
+              nextCursor: number;
+              hasMore: boolean;
+            };
+            if (hydrationGeneration.current !== generation) return;
+            for (const event of page.events)
+              handleMessage({ data: JSON.stringify({ type: 'event', event }) });
+            if (!page.hasMore || page.nextCursor <= cursor) return;
+            cursor = page.nextCursor;
+          }
+        })().catch((cause) => {
+          if (!stopped && !streamAbort?.signal.aborted)
+            setError(cause instanceof Error ? cause.message : String(cause));
+        });
+        return;
+      }
+      if (socket?.readyState !== WebSocket.OPEN) return;
       if (!nextPage && subscribedGeneration === generation) return;
       subscribedGeneration = generation;
       pendingReplays.push({ generation, sessionId, after });
       socket.send(JSON.stringify({ type: 'subscribe', sessionId, after, limit: 250 }));
     };
-    const handleMessage: NonNullable<WebSocket['onmessage']> = (event) => {
+    const handleMessage = (event: { data: unknown }) => {
       let value: { type: string; event?: DaemonEvent; nextCursor?: number; hasMore?: boolean };
       try {
         value = JSON.parse(String(event.data)) as typeof value;
@@ -815,7 +846,7 @@ export function Tui({
       }
     };
 
-    const connect = (): void => {
+    const connectLegacy = (): void => {
       if (stopped) return;
       const current = new WebSocket(
         `${baseUrl.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}`,
@@ -854,13 +885,120 @@ export function Tui({
       };
     };
 
+    const connect = (): void => {
+      if (stopped) return;
+      const controller = new AbortController();
+      streamAbort = controller;
+      const headerDeadline = setTimeout(
+        () => controller.abort(new Error('SSE connection timed out')),
+        10_000,
+      );
+      void (async () => {
+        try {
+          const response = await fetch(`${baseUrl}/api/agent/stream`, {
+            headers: {
+              authorization: `Bearer ${token}`,
+              Accept: 'text/event-stream',
+              ...(lastStreamId ? { 'Last-Event-ID': String(lastStreamId) } : {}),
+            },
+            signal: controller.signal,
+          });
+          clearTimeout(headerDeadline);
+          if (stopped || streamAbort !== controller) {
+            await response.body?.cancel();
+            return;
+          }
+          if (response.status === 401 || response.status === 403) {
+            stopped = true;
+            setStatus('Disconnected');
+            setError('Session expired or access denied — pair this device again.');
+            dispatch({ type: 'connection.changed', status: 'disconnected' });
+            await response.body?.cancel();
+            return;
+          }
+          if (
+            response.status === 404 ||
+            response.status === 405 ||
+            (response.ok && !response.headers.get('content-type')?.includes('text/event-stream'))
+          ) {
+            await response.body?.cancel();
+            connectLegacy();
+            return;
+          }
+          if (!response.ok || !response.body) throw new Error(`SSE HTTP ${response.status}`);
+          streamConnected = true;
+          subscribedGeneration = -1;
+          retry = 0;
+          setStatus('Connected');
+          dispatch({ type: 'connection.changed', status: 'connected' });
+          void refresh().then(() => {
+            const fence = eventFence.current;
+            if (
+              !stopped &&
+              selectedSessionRef.current &&
+              fence.generation === hydrationGeneration.current
+            )
+              subscribeRef.current(selectedSessionRef.current, fence.floor, fence.generation);
+          });
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          try {
+            while (!stopped) {
+              const frame = await reader.read();
+              if (frame.done) break;
+              buffer += decoder.decode(frame.value, { stream: true }).replace(/\r\n/g, '\n');
+              let boundary = buffer.indexOf('\n\n');
+              while (boundary >= 0) {
+                const block = buffer.slice(0, boundary);
+                buffer = buffer.slice(boundary + 2);
+                const data = block
+                  .split('\n')
+                  .filter((line) => line.startsWith('data:'))
+                  .map((line) => line.slice(5).trimStart())
+                  .join('\n');
+                if (data) {
+                  const value = JSON.parse(data) as { event?: DaemonEvent };
+                  if (value.event) {
+                    if (typeof value.event.id === 'number')
+                      lastStreamId = Math.max(lastStreamId, value.event.id);
+                    if (value.event.type.startsWith('approval.'))
+                      handleMessage({ data: JSON.stringify({ type: 'approvals.invalidated' }) });
+                    handleMessage({ data: JSON.stringify({ type: 'event', event: value.event }) });
+                  }
+                }
+                boundary = buffer.indexOf('\n\n');
+              }
+            }
+          } finally {
+            await reader.cancel();
+          }
+          if (!stopped) throw new Error('SSE disconnected');
+        } catch (cause) {
+          if (stopped || streamAbort !== controller) return;
+          streamConnected = false;
+          setStatus('Reconnecting…');
+          dispatch({
+            type: 'connection.changed',
+            status: 'disconnected',
+            error: cause instanceof Error ? cause.message : String(cause),
+          });
+          retry += 1;
+          reconnectTimer = setTimeout(connect, tuiReconnectDelayMs(retry));
+        } finally {
+          clearTimeout(headerDeadline);
+        }
+      })();
+    };
+
     void refresh();
     connect();
     approvalFallbackTimer = setInterval(() => {
-      if (stopped || socket?.readyState === WebSocket.OPEN) return;
+      if (stopped || streamConnected || socket?.readyState === WebSocket.OPEN) return;
       void loadCatalog(baseUrl, token)
         .then((catalog) => {
-          if (!stopped && socket?.readyState !== WebSocket.OPEN) dispatch(catalog);
+          if (!stopped && !streamConnected && socket?.readyState !== WebSocket.OPEN)
+            dispatch(catalog);
         })
         .catch((cause: unknown) => {
           if (!stopped) setError(cause instanceof Error ? cause.message : String(cause));
@@ -872,6 +1010,7 @@ export function Tui({
       subscribeRef.current = () => {};
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (approvalFallbackTimer) clearInterval(approvalFallbackTimer);
+      streamAbort?.abort();
       socket?.close();
     };
   }, [baseUrl, refresh, token, loadCatalog, loadIdentity, loadPolicy]);
@@ -1862,12 +2001,10 @@ export function Tui({
       }
       const id = command === 'rename' ? selectedSessionRef.current : thread?.id;
       if (!id) throw new Error('No conversation selected.');
-      await request(
-        baseUrl,
-        token,
-        `/api/${command === 'rename' ? 'sessions' : 'threads'}/${id}?title=${encodeURIComponent(argument)}`,
-        { method: 'PUT' },
-      );
+      await request(baseUrl, token, `/api/${command === 'rename' ? 'sessions' : 'threads'}/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ title: argument }),
+      });
       await refresh();
       setNotice('Title saved');
       navigation.close();

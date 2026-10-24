@@ -31,6 +31,7 @@ import type { SkillRegistry } from '../skills/registry.js';
 import {
   type ToolBudget,
   ToolBudgetError,
+  type ToolDescription,
   type ToolRegistry,
   createToolBudget,
 } from '../tools/registry.js';
@@ -1062,7 +1063,12 @@ export class AgentRuntime {
       Pick<EventRecord, 'sessionId' | 'threadId' | 'runId' | 'taskId' | 'correlationId' | 'source'>
     > = {},
   ): void {
-    const event = this.options.store.appendEvent(createEvent(type, payload, context));
+    const sessionId =
+      context.sessionId ??
+      (context.threadId ? this.options.store.getThread(context.threadId)?.sessionId : undefined);
+    const event = this.options.store.appendEvent(
+      createEvent(type, payload, { ...context, sessionId }),
+    );
     for (const listener of this.listeners) listener(event);
   }
 
@@ -1728,6 +1734,18 @@ export class AgentRuntime {
     };
   }
 
+  listTools(): ToolDescription[] {
+    return this.options.tools.listTools();
+  }
+
+  getTool(name: string): ToolDescription | null {
+    return this.options.tools.getTool(name);
+  }
+
+  getToolSchema(name: string): Record<string, unknown> | null {
+    return this.options.tools.getToolSchema(name);
+  }
+
   status(): {
     activeRuns: number;
     execution: ReturnType<AgentRuntime['executionStatus']>;
@@ -2081,6 +2099,7 @@ export class AgentRuntime {
                   id: callId,
                   name: qualifiedName,
                   providerOwned: true,
+                  arguments: input,
                   attestation: { version: 1, payloadHash, status: 'running' },
                 },
                 {
@@ -2653,6 +2672,14 @@ export class AgentRuntime {
                 });
               else if (event.type === 'done' && !turnOutput.text && event.text)
                 appendModelText(event.text);
+              if (event.type === 'done' && event.usage) {
+                const usageEvent = event as {
+                  type: 'done';
+                  text: string;
+                  usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+                };
+                this.emit('model.usage', { turn, usage: usageEvent.usage }, eventContext);
+              }
             }
           }
         } catch (cause) {

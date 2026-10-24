@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { WebSocket } from 'ws';
 
 import { createToken, validateToken } from '../src/gateway/token.js';
 import { type GatewayServices, startServer } from '../src/server.js';
@@ -90,7 +89,7 @@ afterEach(async () => {
 });
 
 describe('authenticated daemon client routes', () => {
-  it('serves the PWA API under /nuaai and accepts the authenticated /nuaai/ws route', async () => {
+  it('serves the PWA API under /nuaai and exposes an authenticated /api/agent/stream route', async () => {
     const handle = await startServer(services());
     handles.push(handle);
     const baseUrl = `http://127.0.0.1:${handle.port}`;
@@ -99,19 +98,9 @@ describe('authenticated daemon client routes', () => {
     });
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({ activeRuns: 0 });
-
-    const ready = await new Promise<string>((resolve, reject) => {
-      const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/nuaai/ws?token=${token}`);
-      socket.once('message', (value) => {
-        socket.close();
-        resolve(String(value));
-      });
-      socket.once('error', reject);
-    });
-    expect(JSON.parse(ready)).toEqual({ type: 'ready', version: expect.any(String) });
   });
 
-  it('rejects unauthenticated HTTP and WebSocket access', async () => {
+  it('rejects unauthenticated HTTP and SSE access', async () => {
     const handle = await startServer(services());
     handles.push(handle);
     const baseUrl = `http://127.0.0.1:${handle.port}`;
@@ -121,13 +110,11 @@ describe('authenticated daemon client routes', () => {
       error: 'Pair this device to continue.',
       code: 'AUTH_REQUIRED',
     });
-    await expect(
-      new Promise<{ code: number; reason: string }>((resolve, reject) => {
-        const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/nuaai/ws`);
-        socket.once('close', (code, reason) => resolve({ code, reason: String(reason) }));
-        socket.once('error', reject);
-      }),
-    ).resolves.toEqual({ code: 1008, reason: 'AUTH_REQUIRED' });
+    const stream = await fetch(`${baseUrl}/nuaai/api/agent/stream`, {
+      headers: { accept: 'text/event-stream' },
+    });
+    expect(stream.status).toBe(401);
+    await stream.body?.cancel();
   });
 
   it('reports a valid but expired browser credential without accepting it', async () => {
@@ -144,13 +131,11 @@ describe('authenticated daemon client routes', () => {
       error: 'Session expired — pair this device again.',
       code: 'AUTH_EXPIRED',
     });
-    await expect(
-      new Promise<{ code: number; reason: string }>((resolve, reject) => {
-        const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/nuaai/ws?token=${expired}`);
-        socket.once('close', (code, reason) => resolve({ code, reason: String(reason) }));
-        socket.once('error', reject);
-      }),
-    ).resolves.toEqual({ code: 1008, reason: 'AUTH_EXPIRED' });
+    const stream = await fetch(`${baseUrl}/nuaai/api/agent/stream?token=${expired}`, {
+      headers: { accept: 'text/event-stream' },
+    });
+    expect(stream.status).toBe(401);
+    await stream.body?.cancel();
   });
 
   it('requires explicit browser pairing before issuing an authenticated cookie', async () => {
@@ -181,20 +166,12 @@ describe('authenticated daemon client routes', () => {
       headers: { authorization: `Bearer ${browserPairingToken}` },
     });
     expect(pairingApiResponse.status).toBe(401);
-    const pairingWebSocketAccepted = await new Promise<boolean>((resolve, reject) => {
-      const socket = new WebSocket(
-        `${baseUrl.replace('http', 'ws')}/nuaai/ws?token=${browserPairingToken}`,
-      );
-      socket.once('message', () => {
-        resolve(true);
-        socket.close();
-      });
-      socket.once('close', (code) => {
-        if (code === 1008) resolve(false);
-      });
-      socket.once('error', reject);
-    });
-    expect(pairingWebSocketAccepted).toBe(false);
+    const pairingStream = await fetch(
+      `${baseUrl}/nuaai/api/agent/stream?token=${browserPairingToken}`,
+      { headers: { accept: 'text/event-stream' } },
+    );
+    expect(pairingStream.status).toBe(401);
+    await pairingStream.body?.cancel();
 
     const paired = await fetch(`${baseUrl}/nuaai/auth/pair`, {
       method: 'POST',
@@ -348,93 +325,6 @@ describe('authenticated daemon client routes', () => {
     });
 
     expect(response.status).toBe(413);
-  });
-
-  it('replays only events from the subscribed session over WebSocket', async () => {
-    const events = [
-      { id: 1, type: 'message.created', sessionId: 'session-a', payload: { text: 'a' } },
-      { id: 2, type: 'message.created', sessionId: 'session-b', payload: { text: 'b' } },
-    ];
-    const handle = await startServer(services(events));
-    handles.push(handle);
-    const baseUrl = `http://127.0.0.1:${handle.port}`;
-    const replay = await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
-      const received: Array<Record<string, unknown>> = [];
-      const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/nuaai/ws?token=${token}`);
-      const timer = setTimeout(() => {
-        socket.close();
-        resolve(received);
-      }, 100);
-      socket.on('message', (value) => {
-        const message = JSON.parse(String(value)) as Record<string, unknown>;
-        if (message.type === 'ready') {
-          socket.send(JSON.stringify({ type: 'subscribe', sessionId: 'session-a', after: 0 }));
-          return;
-        }
-        received.push(message);
-        if (message.type === 'replay.complete') {
-          clearTimeout(timer);
-          socket.close();
-          resolve(received);
-        }
-      });
-      socket.once('error', reject);
-    });
-
-    expect(replay).toEqual([
-      expect.objectContaining({
-        type: 'event',
-        event: expect.objectContaining({ sessionId: 'session-a' }),
-      }),
-      { type: 'replay.complete', nextCursor: 1, hasMore: false },
-    ]);
-  });
-
-  it('globally invalidates approval inboxes without leaking another session event', async () => {
-    const gateway = services();
-    let publish: ((event: Record<string, unknown>) => void) | undefined;
-    gateway.runtime.subscribe = ((listener: (event: Record<string, unknown>) => void) => {
-      publish = listener;
-      return () => undefined;
-    }) as never;
-    const handle = await startServer(gateway);
-    handles.push(handle);
-    const baseUrl = `http://127.0.0.1:${handle.port}`;
-    const received = await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
-      const messages: Array<Record<string, unknown>> = [];
-      const socket = new WebSocket(`${baseUrl.replace('http', 'ws')}/nuaai/ws?token=${token}`);
-      const timer = setTimeout(() => {
-        socket.close();
-        reject(new Error('Timed out waiting for approval invalidation'));
-      }, 500);
-      socket.on('message', (value) => {
-        const message = JSON.parse(String(value)) as Record<string, unknown>;
-        if (message.type === 'ready') {
-          socket.send(JSON.stringify({ type: 'subscribe', sessionId: 'session-a', after: 0 }));
-          return;
-        }
-        if (message.type === 'replay.complete') {
-          publish?.({
-            id: 3,
-            type: 'approval.requested',
-            sessionId: 'session-b',
-            payload: { target: 'private-target', payloadHash: 'a'.repeat(64) },
-          });
-          return;
-        }
-        messages.push(message);
-        if (message.type === 'approvals.invalidated') {
-          clearTimeout(timer);
-          socket.close();
-          resolve(messages);
-        }
-      });
-      socket.once('error', reject);
-    });
-
-    expect(received).toEqual([{ type: 'approvals.invalidated' }]);
-    expect(JSON.stringify(received)).not.toContain('private-target');
-    expect(JSON.stringify(received)).not.toContain('session-b');
   });
 
   it('paginates HTTP replay after applying the requested session scope', async () => {

@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { RefObject } from 'react';
 
+import { EmptyState } from './components/EmptyState.js';
 import type {
   ActiveProvider,
   ApprovalRequest,
@@ -167,6 +168,7 @@ export function MemoryView({
   onRevert,
   revertingId,
   onDelete,
+  onUpdate,
   saveMemory,
   saveStatus,
   isLoading,
@@ -178,6 +180,7 @@ export function MemoryView({
   onRevert(id: string): void;
   revertingId: string | null;
   onDelete?(id: string): void;
+  onUpdate?(id: string, content: string): void;
   saveMemory?(content: string): void;
   saveStatus?: 'idle' | 'saving' | 'saved' | 'error';
   isLoading?: boolean;
@@ -185,194 +188,391 @@ export function MemoryView({
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; memoryId: string } | null>(
     null,
   );
+  const [editingMemory, setEditingMemory] = useState<MemoryRecord | null>(null);
+  const [editContent, setEditContent] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filterType, setFilterType] = useState<'all' | 'indexed' | 'text'>('all');
+  const [sortOrder, setSortOrder] = useState<'newest' | 'oldest'>('newest');
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const filteredMemories = useMemo(() => {
+    let result = [...memories];
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase();
+      result = result.filter((m) => m.content.toLowerCase().includes(query));
+    }
+    if (filterType !== 'all') {
+      result = result.filter((m) => (filterType === 'indexed' ? m.hasEmbedding : !m.hasEmbedding));
+    }
+    result.sort((a, b) =>
+      sortOrder === 'newest' ? b.createdAt - a.createdAt : a.createdAt - b.createdAt,
+    );
+    return result;
+  }, [memories, searchQuery, filterType, sortOrder]);
+
+  const toggleSelect = (id: string): void => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const selectableMemories = filteredMemories.filter(
+    (memory) =>
+      memoryKnowledge(memory).origin !== 'automatic' &&
+      !['superseded', 'disabled'].includes(String(memoryKnowledge(memory).state)),
+  );
+  const allSelected =
+    selectableMemories.length > 0 &&
+    selectableMemories.every((memory) => selectedIds.has(memory.id));
+  const toggleSelectAll = (): void => {
+    setSelectedIds(
+      allSelected ? new Set() : new Set(selectableMemories.map((memory) => memory.id)),
+    );
+  };
+
+  const deleteSelected = (): void => {
+    for (const memory of selectableMemories) {
+      if (selectedIds.has(memory.id)) onDelete?.(memory.id);
+    }
+    setSelectedIds(new Set());
+  };
 
   const closeContextMenu = (): void => setContextMenu(null);
-  const active = memories.filter(
+  const active = filteredMemories.filter(
     (memory) =>
       !['superseded', 'disabled'].includes(String(memoryKnowledge(memory).state ?? 'active')),
   );
-  const retired = memories.filter((memory) =>
+  const retired = filteredMemories.filter((memory) =>
     ['superseded', 'disabled'].includes(String(memoryKnowledge(memory).state)),
   );
 
+  const startEdit = (memory: MemoryRecord): void => {
+    setEditingMemory(memory);
+    setEditContent(memory.content);
+  };
+
+  const cancelEdit = (): void => {
+    setEditingMemory(null);
+    setEditContent('');
+  };
+
+  const saveEdit = (): void => {
+    if (!editingMemory || !editContent.trim()) return;
+    onUpdate?.(editingMemory.id, editContent.trim());
+    setEditingMemory(null);
+    setEditContent('');
+  };
+
   return (
-    <section
-      id="view-memory"
-      className="secondary-view"
-      role="tabpanel"
-      onClick={closeContextMenu}
-      onKeyDown={(e) => {
-        if (e.key === 'Escape') closeContextMenu();
-      }}
-    >
-      <div className="view-heading">
-        <div>
-          <span className="section-label">Durable knowledge</span>
-          <h1>Memory</h1>
-          <p>
-            Saved notes and selectively learned project knowledge, with retained evidence and
-            history.
-          </p>
-        </div>
-        <span className="count-chip">{memories.length} records</span>
-      </div>
-      <div className="learning-controls">
-        <div>
-          <label htmlFor="agent-learning">Agent learning</label>
-          <p>
-            {!learning
-              ? 'Loading the actual setting…'
-              : !learning.available
-                ? 'Automatic learning is unavailable in this runtime.'
-                : learning.mode === 'automatic'
-                  ? 'Selectively reviews meaningful completed work. Verified project knowledge can be saved without a remember command.'
-                  : learning.mode === 'manual'
-                    ? 'No automatic review. The agent saves only when explicitly asked.'
-                    : 'Automatic review and agent saves are off. Existing notes remain available; notes can still be managed here.'}
-          </p>
-        </div>
-        <select
-          id="agent-learning"
-          value={learning?.mode ?? ''}
-          disabled={!learning?.available || changingLearning}
-          onChange={(event) => onLearningMode(event.target.value as LearningStatus['mode'])}
-        >
-          <option value="" disabled>
-            Loading…
-          </option>
-          <option value="automatic">Automatic</option>
-          <option value="manual">Manual</option>
-          <option value="off">Off</option>
-        </select>
-        {changingLearning && <output>Saving and verifying…</output>}
-      </div>
-      <form
-        className="memory-save-form"
-        onSubmit={(e) => {
-          e.preventDefault();
-          const form = e.currentTarget;
-          const input = form.elements.namedItem('memory-content') as HTMLTextAreaElement;
-          if (input?.value?.trim() && saveMemory) {
-            saveMemory(input.value.trim());
-            input.value = '';
+    <>
+      <section
+        id="view-memory"
+        className="secondary-view"
+        role="tabpanel"
+        onClick={closeContextMenu}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') {
+            closeContextMenu();
           }
         }}
       >
-        <textarea
-          name="memory-content"
-          placeholder="Save a note to remember across sessions..."
-          rows={2}
-          disabled={saveStatus === 'saving'}
-        />
-        <button type="submit" disabled={saveStatus === 'saving'}>
-          {saveStatus === 'saving' ? 'Saving...' : 'Save to memory'}
-        </button>
-        {saveStatus === 'saved' && <span className="save-confirm">Saved</span>}
-      </form>
-      <div className="memory-list" aria-label="Memory records">
-        {active.length ? (
-          active.map((memory) => (
-            <div
-              className="memory-row"
-              key={memory.id}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                if (memoryKnowledge(memory).origin !== 'automatic')
-                  setContextMenu({ x: e.clientX, y: e.clientY, memoryId: memory.id });
-              }}
-            >
-              <div className="memory-content">
-                <p>{memory.content}</p>
-                <span className="knowledge-origin">
-                  {memoryKnowledge(memory).origin === 'automatic'
-                    ? 'Learned automatically'
-                    : 'Saved note'}
-                </span>
-                <MemoryEvidence memory={memory} />
-              </div>
-              <div className="memory-meta">
-                <span className={memory.hasEmbedding ? 'indexed' : 'text-only'}>
-                  {memory.hasEmbedding ? 'Indexed' : 'Text'}
-                </span>
-                <time>{relativeTime(memory.createdAt)}</time>
-              </div>
-              {memoryKnowledge(memory).origin === 'automatic' && (
-                <button
-                  type="button"
-                  disabled={revertingId !== null}
-                  onClick={() => onRevert(memory.id)}
-                >
-                  {revertingId === memory.id ? 'Verifying undo…' : 'Undo learning'}
-                </button>
-              )}
-              {onDelete && memoryKnowledge(memory).origin !== 'automatic' && (
-                <button
-                  type="button"
-                  className="memory-delete-btn danger"
-                  title="Delete this memory"
-                  onClick={() => onDelete(memory.id)}
-                >
-                  Delete
-                </button>
-              )}
-            </div>
-          ))
-        ) : isLoading ? (
-          <div className="skeleton-list" aria-label="Loading memories">
-            {[1, 2, 3].map((i) => (
-              <div className="skeleton-card" key={i}>
-                <div className="skeleton-line skeleton-short" />
-                <div className="skeleton-line" />
-                <div className="skeleton-line skeleton-medium" />
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="section-empty">
-            <h2>No saved memory</h2>
+        <div className="view-heading">
+          <div>
+            <span className="section-label">Durable knowledge</span>
+            <h1>Memory</h1>
             <p>
-              Useful project preferences and verified workflows can appear after meaningful work
-              when automatic learning is enabled. A note can also be saved explicitly.
+              Saved notes and selectively learned project knowledge, with retained evidence and
+              history.
             </p>
           </div>
-        )}
-      </div>
-      {retired.length > 0 && (
-        <details className="learning-history">
-          <summary>Learning history</summary>
-          <div aria-label="Retired learning">
-            {retired.map((memory) => (
-              <article key={memory.id}>
-                <p>{memory.content}</p>
-                <small>
-                  {String(memoryKnowledge(memory).state)} · retained for review, not recalled
-                </small>
-                <MemoryEvidence memory={memory} />
-              </article>
-            ))}
+          <span className="count-chip">
+            {filteredMemories.length} of {memories.length} records
+          </span>
+        </div>
+        <div className="learning-controls">
+          <div>
+            <label htmlFor="agent-learning">Agent learning</label>
+            <p>
+              {!learning
+                ? 'Loading the actual setting…'
+                : !learning.available
+                  ? 'Automatic learning is unavailable in this runtime.'
+                  : learning.mode === 'automatic'
+                    ? 'Selectively reviews meaningful completed work. Verified project knowledge can be saved without a remember command.'
+                    : learning.mode === 'manual'
+                      ? 'No automatic review. The agent saves only when explicitly asked.'
+                      : 'Automatic review and agent saves are off. Existing notes remain available; notes can still be managed here.'}
+            </p>
           </div>
-        </details>
-      )}
-      {contextMenu && (
-        <div
-          className="context-menu"
-          style={{ top: contextMenu.y, left: contextMenu.x }}
-          role="menu"
-        >
-          <button
-            type="button"
-            role="menuitem"
-            className="danger"
-            onClick={() => {
-              onDelete?.(contextMenu.memoryId);
-              closeContextMenu();
-            }}
+          <select
+            id="agent-learning"
+            value={learning?.mode ?? ''}
+            disabled={!learning?.available || changingLearning}
+            onChange={(event) => onLearningMode(event.target.value as LearningStatus['mode'])}
           >
-            Delete memory
+            <option value="" disabled>
+              Loading…
+            </option>
+            <option value="automatic">Automatic</option>
+            <option value="manual">Manual</option>
+            <option value="off">Off</option>
+          </select>
+          {changingLearning && <output>Saving and verifying…</output>}
+        </div>
+        <div className="memory-controls">
+          <input
+            type="search"
+            className="memory-search"
+            placeholder="Search memories..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            aria-label="Search memories"
+          />
+          <div className="memory-filter-controls">
+            <select
+              value={filterType}
+              onChange={(e) => setFilterType(e.target.value as 'all' | 'indexed' | 'text')}
+              aria-label="Filter by type"
+            >
+              <option value="all">All types</option>
+              <option value="indexed">Indexed</option>
+              <option value="text">Text only</option>
+            </select>
+            <select
+              value={sortOrder}
+              onChange={(e) => setSortOrder(e.target.value as 'newest' | 'oldest')}
+              aria-label="Sort order"
+            >
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+            </select>
+          </div>
+        </div>
+        {selectedIds.size > 0 && (
+          <div className="bulk-action-bar">
+            <span>{selectedIds.size} selected</span>
+            <button type="button" className="danger-btn" onClick={deleteSelected}>
+              Delete selected
+            </button>
+            <button type="button" onClick={() => setSelectedIds(new Set())}>
+              Cancel
+            </button>
+          </div>
+        )}
+        <form
+          className="memory-save-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const form = e.currentTarget;
+            const input = form.elements.namedItem('memory-content') as HTMLTextAreaElement;
+            if (input?.value?.trim() && saveMemory) {
+              saveMemory(input.value.trim());
+              input.value = '';
+            }
+          }}
+        >
+          <textarea
+            name="memory-content"
+            placeholder="Save a note to remember across sessions..."
+            rows={2}
+            disabled={saveStatus === 'saving'}
+          />
+          <button type="submit" disabled={saveStatus === 'saving'}>
+            {saveStatus === 'saving' ? 'Saving...' : 'Save to memory'}
           </button>
+          {saveStatus === 'saved' && <span className="save-confirm">Saved</span>}
+        </form>
+        <div className="memory-list" aria-label="Memory records">
+          {active.length ? (
+            <>
+              {selectableMemories.length > 0 && (
+                <div className="memory-list-header">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      onChange={toggleSelectAll}
+                      aria-label="Select all"
+                    />
+                    Select all
+                  </label>
+                </div>
+              )}
+              {active.map((memory) => (
+                <div
+                  className={`memory-row ${selectedIds.has(memory.id) ? 'selected' : ''}`}
+                  key={memory.id}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    if (memoryKnowledge(memory).origin !== 'automatic')
+                      setContextMenu({ x: e.clientX, y: e.clientY, memoryId: memory.id });
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    className="memory-checkbox"
+                    disabled={memoryKnowledge(memory).origin === 'automatic'}
+                    checked={selectedIds.has(memory.id)}
+                    onChange={() => toggleSelect(memory.id)}
+                    aria-label={`Select memory: ${memory.content.slice(0, 30)}`}
+                  />
+                  <div className="memory-content">
+                    <p>{memory.content}</p>
+                    <span className="knowledge-origin">
+                      {memoryKnowledge(memory).origin === 'automatic'
+                        ? 'Learned automatically'
+                        : 'Saved note'}
+                    </span>
+                    <MemoryEvidence memory={memory} />
+                  </div>
+                  <div className="memory-meta">
+                    <span className={memory.hasEmbedding ? 'indexed' : 'text-only'}>
+                      {memory.hasEmbedding ? 'Indexed' : 'Text'}
+                    </span>
+                    <time>{relativeTime(memory.createdAt)}</time>
+                  </div>
+                  <div className="memory-actions">
+                    {memoryKnowledge(memory).origin === 'automatic' && (
+                      <button
+                        type="button"
+                        disabled={revertingId !== null}
+                        onClick={() => onRevert(memory.id)}
+                      >
+                        {revertingId === memory.id ? 'Verifying undo…' : 'Undo learning'}
+                      </button>
+                    )}
+                    {onUpdate && memoryKnowledge(memory).origin !== 'automatic' && (
+                      <button
+                        type="button"
+                        className="memory-action-btn"
+                        title="Edit this memory"
+                        onClick={() => startEdit(memory)}
+                      >
+                        Edit
+                      </button>
+                    )}
+                    {onDelete && memoryKnowledge(memory).origin !== 'automatic' && (
+                      <button
+                        type="button"
+                        className="memory-delete-btn danger"
+                        title="Delete this memory"
+                        onClick={() => onDelete(memory.id)}
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </>
+          ) : isLoading ? (
+            <div className="skeleton-list" aria-label="Loading memories">
+              {[1, 2, 3].map((i) => (
+                <div className="skeleton-card" key={i}>
+                  <div className="skeleton-line skeleton-short" />
+                  <div className="skeleton-line" />
+                  <div className="skeleton-line skeleton-medium" />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState
+              title="No saved memory"
+              description="Useful project preferences and verified workflows can appear after meaningful work when automatic learning is enabled. A note can also be saved explicitly."
+              icon="◉"
+            />
+          )}
+        </div>
+        {retired.length > 0 && (
+          <details className="learning-history">
+            <summary>Learning history</summary>
+            <div aria-label="Retired learning">
+              {retired.map((memory) => (
+                <article key={memory.id}>
+                  <p>{memory.content}</p>
+                  <small>
+                    {String(memoryKnowledge(memory).state)} · retained for review, not recalled
+                  </small>
+                  <MemoryEvidence memory={memory} />
+                </article>
+              ))}
+            </div>
+          </details>
+        )}
+        {contextMenu && (
+          <div
+            className="context-menu"
+            style={{ top: contextMenu.y, left: contextMenu.x }}
+            role="menu"
+          >
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const memory = memories.find((m) => m.id === contextMenu.memoryId);
+                if (memory) startEdit(memory);
+                closeContextMenu();
+              }}
+            >
+              Edit memory
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="danger"
+              onClick={() => {
+                onDelete?.(contextMenu.memoryId);
+                closeContextMenu();
+              }}
+            >
+              Delete memory
+            </button>
+          </div>
+        )}
+      </section>
+      {editingMemory && (
+        <div
+          className="dialog-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) cancelEdit();
+          }}
+        >
+          <dialog open className="memory-edit-modal" aria-labelledby="edit-memory-title">
+            <div className="dialog-heading">
+              <div>
+                <span className="section-label">Edit memory</span>
+                <h2 id="edit-memory-title">
+                  {editingMemory.content.substring(0, 50)}
+                  {editingMemory.content.length > 50 ? '...' : ''}
+                </h2>
+              </div>
+              <button type="button" className="icon-button" aria-label="Close" onClick={cancelEdit}>
+                ×
+              </button>
+            </div>
+            <div className="memory-edit-modal-content">
+              <textarea
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                rows={8}
+              />
+            </div>
+            <div className="memory-edit-modal-actions">
+              <button type="button" onClick={saveEdit}>
+                Save changes
+              </button>
+              <button type="button" className="danger" onClick={cancelEdit}>
+                Cancel
+              </button>
+            </div>
+          </dialog>
         </div>
       )}
-    </section>
+    </>
   );
 }
 
@@ -429,8 +629,12 @@ export function AutomationsView({
   schedules,
   scheduleName,
   scheduleInput,
+  scheduleType,
+  scheduleExpression,
   onScheduleName,
   onScheduleInput,
+  onScheduleType,
+  onScheduleExpression,
   onCreate,
   onAction,
   onDelete,
@@ -439,8 +643,12 @@ export function AutomationsView({
   schedules: Schedule[];
   scheduleName: string;
   scheduleInput: string;
+  scheduleType: 'manual' | 'interval' | 'cron';
+  scheduleExpression: string;
   onScheduleName(value: string): void;
   onScheduleInput(value: string): void;
+  onScheduleType(value: 'manual' | 'interval' | 'cron'): void;
+  onScheduleExpression(value: string): void;
   onCreate(): void;
   onAction(id: string, action: 'pause' | 'resume' | 'trigger'): void;
   onDelete?(id: string): void;
@@ -492,6 +700,35 @@ export function AutomationsView({
             placeholder="Daily workspace briefing"
           />
         </label>
+        <div className="automation-form-row">
+          <label className="automation-type-select">
+            <span>Type</span>
+            <select
+              aria-label="Schedule type"
+              value={scheduleType}
+              onChange={(event) =>
+                onScheduleType(event.target.value as 'manual' | 'interval' | 'cron')
+              }
+            >
+              <option value="manual">Manual</option>
+              <option value="interval">Interval</option>
+              <option value="cron">Cron</option>
+            </select>
+          </label>
+          {scheduleType !== 'manual' && (
+            <label className="automation-expression">
+              <span>
+                {scheduleType === 'interval' ? 'Interval (e.g., 1h, 30m)' : 'Cron expression'}
+              </span>
+              <input
+                aria-label="Schedule expression"
+                value={scheduleExpression}
+                onChange={(event) => onScheduleExpression(event.target.value)}
+                placeholder={scheduleType === 'interval' ? '1h' : '0 * * * *'}
+              />
+            </label>
+          )}
+        </div>
         <label>
           <span>Instruction</span>
           <input
@@ -504,7 +741,11 @@ export function AutomationsView({
         <button
           type="submit"
           className="primary-button"
-          disabled={!scheduleName.trim() || !scheduleInput.trim()}
+          disabled={
+            !scheduleName.trim() ||
+            !scheduleInput.trim() ||
+            (scheduleType !== 'manual' && !scheduleExpression.trim())
+          }
         >
           Create automation
         </button>
@@ -701,32 +942,53 @@ export function SystemView({
         <div className="settings-list" aria-label="Skills">
           {skills.length ? (
             skills.map((skill) => (
-              <div className="settings-row" key={skill.name}>
-                <div className="settings-row-info">
-                  <strong>{skill.name}</strong>
-                  <span>{skill.description}</span>
+              <details className="skill-details" key={skill.name}>
+                <summary className="skill-summary">
+                  <div className="settings-row-info">
+                    <strong>{skill.name}</strong>
+                    <span>{skill.description}</span>
+                  </div>
+                  <div className="settings-row-meta">
+                    <span className="skill-source">{skill.source}</span>
+                    <span className="skill-version">v{skill.version}</span>
+                    {(onEnableSkill || onDisableSkill) && (
+                      <button
+                        type="button"
+                        className={`toggle-btn ${skill.enabled === false ? 'disabled' : 'enabled'}`}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          skill.enabled === false
+                            ? onEnableSkill?.(skill.name)
+                            : onDisableSkill?.(skill.name);
+                        }}
+                      >
+                        {skill.enabled === false ? 'Disabled' : 'Enabled'}
+                      </button>
+                    )}
+                  </div>
+                </summary>
+                <div className="skill-detail-content">
+                  {skill.triggers.length > 0 && (
+                    <div className="skill-triggers">
+                      <strong>Trigger words:</strong>
+                      <div className="skill-trigger-tags">
+                        {skill.triggers.map((trigger) => (
+                          <span key={trigger} className="trigger-tag">
+                            {trigger}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
-                <div className="settings-row-meta">
-                  <span className="skill-source">{skill.source}</span>
-                  <span className="skill-version">v{skill.version}</span>
-                </div>
-                {(onEnableSkill || onDisableSkill) && (
-                  <button
-                    type="button"
-                    className={`toggle-btn ${skill.enabled === false ? 'disabled' : 'enabled'}`}
-                    onClick={() =>
-                      skill.enabled === false
-                        ? onEnableSkill?.(skill.name)
-                        : onDisableSkill?.(skill.name)
-                    }
-                  >
-                    {skill.enabled === false ? 'Disabled' : 'Enabled'}
-                  </button>
-                )}
-              </div>
+              </details>
             ))
           ) : (
-            <p className="quiet-copy">No skills registered.</p>
+            <EmptyState
+              title="No skills registered"
+              description="Skills are loaded from the skills/ directory and can trigger automations."
+              icon="◎"
+            />
           )}
         </div>
       </div>
@@ -807,7 +1069,11 @@ export function SystemView({
               );
             })
           ) : (
-            <p className="quiet-copy">No trusted plugins loaded.</p>
+            <EmptyState
+              title="No trusted plugins loaded"
+              description="Plugins extend NUAAI capabilities. Configure trusted plugins to see them here."
+              icon="⊞"
+            />
           )}
         </div>
       </div>
@@ -965,6 +1231,165 @@ export function CommandPalette({
           configuration.
         </p>
       </dialog>
+    </div>
+  );
+}
+
+interface KeyboardShortcutsOverlayProps {
+  onClose(): void;
+}
+
+export function KeyboardShortcutsOverlay({
+  onClose,
+}: KeyboardShortcutsOverlayProps): React.JSX.Element {
+  const shortcutSections = [
+    {
+      title: 'Global',
+      shortcuts: [
+        ['Show keyboard shortcuts', '?'],
+        ['Open command palette', 'Ctrl+K'],
+        ['Close dialog or panel', 'Esc'],
+      ],
+    },
+    {
+      title: 'Navigation',
+      shortcuts: [
+        ['Conversation view', 'Ctrl+1'],
+        ['Memory view', 'Ctrl+2'],
+        ['Automations view', 'Ctrl+3'],
+        ['System view', 'Ctrl+4'],
+      ],
+    },
+    {
+      title: 'Sessions',
+      shortcuts: [
+        ['New session', 'Ctrl+N'],
+        ['New thread', 'Ctrl+T'],
+        ['Collapse sidebar', 'Ctrl+B'],
+        ['Rename session (double-click)', '—'],
+        ['Delete session (right-click)', '—'],
+      ],
+    },
+    {
+      title: 'Conversation',
+      shortcuts: [
+        ['Send message', 'Enter'],
+        ['New line in message', 'Shift+Enter'],
+        ['Cancel running agent', 'Esc'],
+        ['Retry last response', 'Ctrl+Enter'],
+      ],
+    },
+    {
+      title: 'Help',
+      shortcuts: [
+        ['Show this help', '?'],
+        ['Toggle command palette', 'Ctrl+P'],
+      ],
+    },
+  ];
+
+  return (
+    <div
+      className="dialog-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <dialog open className="shortcuts-overlay" aria-labelledby="shortcuts-title">
+        <div className="dialog-heading">
+          <div>
+            <span className="section-label">Keyboard</span>
+            <h2 id="shortcuts-title">Keyboard Shortcuts</h2>
+          </div>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Close shortcuts"
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </div>
+        <div className="shortcuts-grid">
+          {shortcutSections.map((section) => (
+            <div className="shortcuts-section" key={section.title}>
+              <h3>{section.title}</h3>
+              <dl>
+                {section.shortcuts.map(([action, key]) => (
+                  <div key={action}>
+                    <dt>
+                      <kbd>{key}</kbd>
+                      <span>{action}</span>
+                    </dt>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          ))}
+        </div>
+        <p className="dialog-hint">
+          Press <kbd>?</kbd> to toggle this overlay.
+        </p>
+      </dialog>
+    </div>
+  );
+}
+
+interface BottomPanelProps {
+  isOpen: boolean;
+  onToggle(): void;
+  activeRunId: string | null;
+  runProjection?: {
+    status: string;
+  } | null;
+  liveOutput?: string | null;
+}
+
+export function BottomPanel({
+  isOpen,
+  onToggle,
+  activeRunId,
+  runProjection,
+  liveOutput,
+}: BottomPanelProps): React.JSX.Element {
+  return (
+    <div className={`bottom-panel ${isOpen ? 'open' : ''}`}>
+      <div className="bottom-panel-header">
+        <button
+          type="button"
+          className="bottom-panel-toggle"
+          onClick={onToggle}
+          aria-expanded={isOpen}
+          title={isOpen ? 'Collapse panel (Ctrl+J)' : 'Expand panel (Ctrl+J)'}
+        >
+          <span className="bottom-panel-icon">{isOpen ? '⌄' : '⌃'}</span>
+          <span>Activity</span>
+          {activeRunId && <span className="bottom-panel-badge">Active</span>}
+        </button>
+      </div>
+      {isOpen && (
+        <div className="bottom-panel-content">
+          <div className="bottom-panel-section">
+            <h3>Current Run</h3>
+            {activeRunId ? (
+              <div className="run-status">
+                <span className={`run-badge run-${runProjection?.status ?? 'running'}`}>
+                  {runProjection?.status ?? 'running'}
+                </span>
+              </div>
+            ) : (
+              <p className="no-active-run">No active run</p>
+            )}
+          </div>
+          {liveOutput && (
+            <div className="bottom-panel-section">
+              <h3>Live Output</h3>
+              <pre className="live-output">{liveOutput}</pre>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

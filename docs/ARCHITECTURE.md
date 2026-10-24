@@ -4,7 +4,7 @@ NUAAI is a local-first personal agent harness. The daemon owns runtime state and
 
 ```text
 Ink TUI / React web client
-          │ authenticated HTTP + WebSocket
+          │ authenticated HTTP + Server-Sent Events
           ▼
       Node daemon
           ├── AgentRuntime — sessions, runs, provider loop, tools, memory, recovery
@@ -21,9 +21,9 @@ Ink TUI / React web client
 1. `nuaai init` creates `.nuaai/` and an idempotent configuration.
 2. `nuaai daemon` loads configuration, daemon authentication identity, SQLite state, skills, plugins, providers, and tools.
 3. A local daemon lock at `.nuaai/daemon.lock` prevents duplicate ownership. Stale locks are reclaimed only when the recorded PID is no longer alive.
-4. The daemon starts the authenticated loopback HTTP gateway, WebSocket event stream, and scheduler.
+4. The daemon starts the authenticated loopback HTTP gateway, Server-Sent Events stream, and scheduler.
 5. Interactive and scheduled runs use the same `AgentRuntime`, provider contracts, memory retrieval, tools, permissions, cancellation, and durable events.
-6. Shutdown closes the scheduler, WebSocket clients, HTTP server, database, and daemon lock.
+6. Shutdown closes the scheduler, SSE clients, HTTP server, database, and daemon lock.
 
 ## Session instruction identity
 
@@ -47,7 +47,7 @@ Before each provider turn, the runtime applies a provider-neutral token budget u
 
 Background and scheduled tasks persist their execution reference before waiting for the child run. `task.run.linked` records the run/thread/session/correlation IDs for each attempt; terminal task events preserve the original bounded redacted run error instead of replacing it with a status-only message. Task lifecycle events remain global notifications, with execution references in their payload and the child correlation ID in context. Authenticated `GET /api/tasks/:id` and the read-only `task.inspect` tool expose only bounded diagnostic metadata and recorded failure events, not prompts, instructions or arbitrary run output. Old background tasks without references can be diagnosed only when their exact task-scoped source key, input and creation window identify a unique run; multiple candidates are explicitly ambiguous. Intent classification excludes explicit prohibited-action clauses while retaining positive contrast/separate actions, so constraints such as “do not create tasks” do not themselves demand side-effect evidence.
 
-SQLite stores sessions, threads, messages, runs, run-artifact records, events, memories, tasks, schedules, secrets, skills, and plugins. Runtime initialization uses idempotent schema creation and scrubs legacy generic approval previews without replacing valid versioned previews. Events are versioned, redacted before persistence, and replayable by cursor through HTTP or WebSocket subscription.
+SQLite stores sessions, threads, messages, runs, run-artifact records, events, memories, tasks, schedules, secrets, skills, and plugins. Runtime initialization uses idempotent schema creation and scrubs legacy generic approval previews without replacing valid versioned previews. Events are versioned, redacted before persistence, and replayable by cursor through HTTP or Server-Sent Events subscription.
 
 Run artifacts have stable IDs and remain bound to exactly one run and thread. Stored bytes are copied once into owner-only `.nuaai/artifacts/<run-id>/` paths; each runtime, artifact, and run directory is opened and physically resolved before an exclusive no-follow file create, so pre-existing symbolic-link, hard-link-file, non-directory, and reparse-style escapes fail before bytes are written. SQLite records the stored byte length and SHA-256 checksum. Text-like content is redacted before the immutable copy is written, and artifact provenance records that the checksum covers stored sanitized bytes rather than claiming byte-for-byte identity with the workspace source. Citation-only records checksum a canonical HTTPS URL with no userinfo, query, or fragment. The legacy `message_artifacts` table remains internal transcript/tool-loop metadata and is not used as an artifact store.
 
@@ -65,4 +65,4 @@ Ollama uses the local HTTP API for streaming chat and embeddings. Codex turns us
 
 Unconfirmed interactive submissions reuse payload-bound idempotency keys rather than re-admitting a run after a lost acceptance response. The TUI flushes its pending UUID into the private thread draft document before admission; the browser persists a UUID under a SHA-256 payload fingerprint in local storage before admission or interruption. Client restart/browser reload replay is checked against the same daemon run ID and a single durable user message. The browser retains text until acceptance and revision-fences clearing so an older request cannot erase newer typing. Unsent web attachments are owned by thread above the section/component lifecycle; confirmation removes only the submitted files. File handles remain browser-memory state and are not recovered after a browser reload.
 
-The TUI and React dashboard never call providers directly. Both use authenticated daemon routes and WebSocket events. Approval lifecycle changes additionally broadcast a payload-free authenticated inbox invalidation across session subscriptions; reconnect and browser focus refresh the global pending list. Concurrent system loads are abortable and generation-fenced so a late stale response cannot resurrect an actionable card. The daemon remains the only component allowed to mutate runtime state. Artifact list, detail, and byte-range download routes validate run ownership; web download URLs are mount-relative so a `/nuaai` deployment cannot escape to the origin root. The structured thread presentation attaches artifacts and citations only to their owning assistant run.
+The TUI and React dashboard never call providers directly. Both use authenticated daemon routes and SSE events (with an authenticated WebSocket compatibility endpoint for installed clients). Approval lifecycle changes additionally broadcast a payload-free authenticated inbox invalidation across session subscriptions; reconnect and browser focus refresh the global pending list. Concurrent system loads are abortable and generation-fenced so a late stale response cannot resurrect an actionable card. The daemon remains the only component allowed to mutate runtime state. Artifact list, detail, and byte-range download routes validate run ownership; web download URLs are mount-relative so a `/nuaai` deployment cannot escape to the origin root. The structured thread presentation attaches artifacts and citations only to their owning assistant run.

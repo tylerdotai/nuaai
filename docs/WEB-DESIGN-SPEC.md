@@ -125,8 +125,8 @@ The intended emotional result is **controlled, capable, and trustworthy**.
 ### Connection
 
 - `connecting` — initial handshake.
-- `connected` — authenticated HTTP and WebSocket ready.
-- `reconnecting` — WebSocket closed; exponential reconnect pending.
+- `connected` — authenticated HTTP and Server-Sent Events ready.
+- `reconnecting` — SSE connection lost; EventSource reconnects with `Last-Event-ID`.
 - `offline` — HTTP load failed or reconnect window exhausted.
 
 ### Run projection
@@ -173,7 +173,7 @@ The versioned `ThreadPresentation` DTO is authoritative for durable messages, ru
 | Five capability tabs plus duplicate mobile actions | Four task-oriented destinations | Matches user intent instead of implementation nouns |
 | First thread is hardcoded | Real thread selection preserved per session | Makes persisted threads usable |
 | All model deltas concatenated forever | Per-run projection cleared on terminal events | Prevents duplicate assistant output |
-| 50 ms polling for only three seconds | WebSocket lifecycle plus bounded fallback status checks | Supports real long-running work |
+| 50 ms polling for only three seconds | Server-Sent Events lifecycle plus bounded fallback status checks | Supports real long-running work |
 | Provider cards inside session navigation | Provider and capability controls inside System | Removes unrelated sidebar clutter |
 | Tool messages plus a separate global rail | Response-local summary and expandable timeline | Keeps work attached to the answer that owns it |
 | Fixed bottom toolbar overlays mobile content | Bottom navigation reserves layout space | Prevents covered messages and controls |

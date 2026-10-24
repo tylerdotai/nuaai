@@ -40,9 +40,12 @@
     "lint": "biome lint src tests scripts .config",
     "check": "biome check src tests scripts .config && npm run typecheck",
     "test": "vitest run",
+    "test:unit": "vitest run --config vitest.unit.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:e2e": "npm run build:release && node scripts/run-e2e.mjs",
     "test:coverage": "vitest run --coverage",
     "eval:behavior": "tsx scripts/eval-behavior.ts",
+    "test:mutate": "stryker run stryker.config.mjs",
     "audit:dependencies": "npm audit --audit-level=moderate",
     "package:smoke": "node scripts/package-smoke.mjs",
     "test:terminal": "node scripts/terminal-smoke.mjs",
@@ -71,7 +74,7 @@
     "diff": "9.0.0",
     "dotenv": "16.6.1",
     "drizzle-orm": "0.45.2",
-    "esbuild": "0.25.12",
+    "esbuild": "^0.28.2",
     "execa": "10.0.1",
     "hono": "4.13.13",
     "ink": "7.1.1",
@@ -90,10 +93,12 @@
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
     "@playwright/test": "^1.59.1",
+    "@stryker-mutator/core": "^10.0.0",
+    "@stryker-mutator/vitest-runner": "^10.0.0",
     "@types/better-sqlite3": "7.6.12",
     "@types/node": "22.10.0",
     "@types/react": "19.2.18",
-    "@types/react-dom": "^19.2.4",
+    "@types/react-dom": "19.2.4",
     "@types/ws": "8.5.13",
     "@vitejs/plugin-react": "4.3.4",
     "@vitest/coverage-v8": "4.1.12",
@@ -111,5 +116,8 @@
     "esbuild@0.27.7": true,
     "esbuild@0.23.1": true,
     "esbuild@0.28.2": true
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }

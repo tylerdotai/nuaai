@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 import { Hono } from 'hono';
@@ -27,14 +29,62 @@ import {
   type PermissionProfile,
   permissionContextForProfile,
 } from './security/permissions.js';
+import { redactText } from './security/redaction.js';
 import type { SecretsManager } from './security/secrets.js';
 import { SkillLearner } from './skills/learner.js';
 import type { SkillRegistry } from './skills/registry.js';
 import { getVersion } from './version.js';
+import { attachmentMaxCount } from './web/attachments.js';
 import { buildThreadPresentation } from './web/presentation.js';
 
 const maxRequestBodyBytes = 1024 * 1024;
 const maxWebSocketMessageBytes = 64 * 1024;
+
+interface LogOptions {
+  level: 'info' | 'warn' | 'error';
+  method?: string;
+  path?: string;
+  status?: number;
+  error?: unknown;
+  duration?: number;
+}
+
+async function logToFile(root: string, options: LogOptions): Promise<void> {
+  const timestamp = new Date().toISOString();
+  const level = options.level.toUpperCase().padEnd(5);
+  const parts = [`[${timestamp}]`, level];
+  if (options.method) parts.push(`${options.method} ${options.path}`);
+  if (options.status) parts.push(`${options.status}`);
+  if (options.duration) parts.push(`${options.duration}ms`);
+  if (options.error) {
+    const message = options.error instanceof Error ? options.error.message : String(options.error);
+    parts.push(message);
+  }
+  const line = `${parts.join(' | ')}\n`;
+  try {
+    await appendFile(resolve(root, '.nuaai/logs/server.log'), redactText(line), { mode: 0o600 });
+  } catch (error) {
+    console.warn(
+      redactText(
+        `NUAAI log write failed: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
+  }
+}
+
+function log(root: string, level: 'info' | 'warn' | 'error', ...args: unknown[]): void {
+  const timestamp = new Date().toISOString();
+  const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
+  if (level === 'error') {
+    console.error(prefix, ...args);
+    const error = args.find((a) => a instanceof Error) as Error | undefined;
+    void logToFile(root, { level, error: error?.message ?? String(args[0]) });
+  } else if (level === 'warn') {
+    console.warn(prefix, ...args);
+  } else {
+    console.log(prefix, ...args);
+  }
+}
 const maxReplayPageSize = 1_000;
 const runSnapshotEventLimit = 250;
 const browserSessionTtlSeconds = 2_592_000;
@@ -150,6 +200,13 @@ export interface GatewayServices {
 function tokenFromRequest(request: Request): string | null {
   const authorization = request.headers.get('authorization');
   if (authorization?.startsWith('Bearer ')) return authorization.slice(7);
+  try {
+    const url = new URL(request.url);
+    const queryToken = url.searchParams.get('token');
+    if (queryToken) return queryToken;
+  } catch {
+    // ignore invalid url
+  }
   const cookie = request.headers
     .get('cookie')
     ?.split(';')
@@ -344,6 +401,190 @@ export function createApp(services: GatewayServices): Hono {
       );
     }
   });
+  app.get('/api/tools', (context) => context.json({ tools: services.runtime.listTools() }));
+  app.get('/api/tools/:name', (context) => {
+    const tool = services.runtime.getTool(context.req.param('name'));
+    return tool ? context.json({ tool }) : context.json({ error: 'Tool not found' }, 404);
+  });
+  app.get('/api/tools/:name/schema', (context) => {
+    const schema = services.runtime.getToolSchema(context.req.param('name'));
+    return schema ? context.json({ schema }) : context.json({ error: 'Tool not found' }, 404);
+  });
+
+  const HEARTBEAT_INTERVAL_MS = 15_000;
+  const MAX_EVENTS_BUFFER = 100;
+  const eventBuffer: Array<{ id: number; data: string; sessionId?: string; type: string }> = [];
+  let eventIdCounter = 0;
+
+  function sseFormat(eventType: string, data: unknown, id?: number): string {
+    const lines = [`event: ${eventType}`, `data: ${JSON.stringify(data)}`];
+    if (id !== undefined) lines.unshift(`id: ${id}`);
+    return `${lines.join('\n')}\n\n`;
+  }
+
+  function mapEventType(type: string): string {
+    if (type === 'model.delta') return 'token';
+    if (type === 'tool.started') return 'tool_start';
+    if (type === 'tool.completed' || type === 'tool.failed') return 'tool_end';
+    if (type === 'model.completed') return 'done';
+    if (type === 'run.started' || type === 'run.completed') return 'status';
+    if (type === 'run.failed') return 'error';
+    return type;
+  }
+
+  app.get('/api/agent/stream', async (context) => {
+    const token = tokenFromRequest(context.req.raw);
+    const checkedAt = (services.now ?? Date.now)();
+    if (!token || !isRequestCredential(validateToken(token, services.authSecret, checkedAt))) {
+      return context.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const sessionId = context.req.query('session_id') || null;
+    const dropTypes = new Set(
+      (context.req.query('drop') ?? '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0),
+    );
+    const lastEventId = context.req.raw.headers.get('Last-Event-ID');
+    const startEventId = lastEventId ? Math.max(0, Number.parseInt(lastEventId, 10) + 1) : 0;
+
+    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    let unsubscribe: (() => void) | undefined;
+    let closed = false;
+
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      unsubscribe?.();
+    };
+
+    const stream = new ReadableStream({
+      start(controller) {
+        heartbeatTimer = setInterval(() => {
+          try {
+            controller.enqueue(new TextEncoder().encode(': keepalive\n\n'));
+          } catch {
+            cleanup();
+          }
+        }, HEARTBEAT_INTERVAL_MS);
+
+        context.req.raw.signal.addEventListener('abort', () => {
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
+          cleanup();
+        });
+
+        if (startEventId > 0 && eventBuffer.length > 0) {
+          for (const { id, data, sessionId: owner, type } of eventBuffer) {
+            if (sessionId && owner !== sessionId) continue;
+            if (dropTypes.has(type) || dropTypes.has(mapEventType(type))) continue;
+            if (id >= startEventId) {
+              try {
+                controller.enqueue(new TextEncoder().encode(data));
+              } catch {
+                break;
+              }
+            }
+          }
+        }
+
+        unsubscribe = services.runtime.subscribe((event) => {
+          if (closed) return;
+          if (sessionId && event.sessionId && event.sessionId !== sessionId) return;
+          if (event.sessionId === undefined && sessionId !== null) return;
+          if (dropTypes.size > 0) {
+            const mapped = mapEventType(event.type);
+            if (dropTypes.has(event.type) || (mapped && dropTypes.has(mapped))) return;
+          }
+
+          const id = event.id ?? ++eventIdCounter;
+          eventIdCounter = Math.max(eventIdCounter, id);
+          const eventType: string = mapEventType(event.type);
+          let eventData: Record<string, unknown> = { ...event.payload };
+
+          if (event.type === 'model.delta') {
+            eventData = { content: event.payload.text ?? '' };
+          } else if (event.type === 'tool.started') {
+            eventData = {
+              name: event.payload.name,
+              args: event.payload.arguments ?? {},
+            };
+          } else if (event.type === 'tool.completed') {
+            eventData = {
+              name: event.payload.name,
+              result: event.payload.result,
+            };
+          } else if (event.type === 'tool.failed') {
+            eventData = {
+              name: event.payload.name,
+              error: event.payload.error ?? 'Tool failed',
+            };
+          } else if (event.type === 'model.completed') {
+            eventData = { full_response: event.payload.text ?? '' };
+          } else if (event.type === 'run.started') {
+            eventData = { label: 'Thinking...' };
+          } else if (event.type === 'run.completed') {
+            eventData = { label: 'Completed' };
+          } else if (event.type === 'run.failed') {
+            eventData = { message: String(event.payload.error ?? 'Run failed') };
+          }
+
+          const sseData = {
+            ...eventData,
+            id,
+            type: eventType,
+            runId: event.runId,
+            taskId: event.taskId,
+            sessionId: event.sessionId,
+            threadId: event.threadId,
+            createdAt: event.createdAt,
+            event: {
+              id: event.id,
+              type: event.type,
+              runId: event.runId,
+              taskId: event.taskId,
+              sessionId: event.sessionId,
+              threadId: event.threadId,
+              createdAt: event.createdAt,
+              payload: event.payload,
+              eventId: event.eventId,
+              source: event.source,
+              correlationId: event.correlationId,
+              schemaVersion: event.schemaVersion,
+            },
+          };
+          const sseLine = sseFormat(eventType, sseData, id);
+          if (eventBuffer.at(-1)?.id !== id)
+            eventBuffer.push({ id, data: sseLine, sessionId: event.sessionId, type: event.type });
+          if (eventBuffer.length > MAX_EVENTS_BUFFER) eventBuffer.shift();
+
+          try {
+            controller.enqueue(new TextEncoder().encode(sseLine));
+          } catch {
+            // Client disconnected
+          }
+        });
+      },
+      cancel() {
+        cleanup();
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+        Connection: 'keep-alive',
+      },
+    });
+  });
+
   app.get('/api/sessions', (context) =>
     context.json({
       sessions: services.runtime
@@ -437,8 +678,8 @@ export function createApp(services: GatewayServices): Hono {
       return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
     }
   });
-  app.put('/api/sessions/:id', (context) => {
-    const { title } = context.req.query();
+  app.put('/api/sessions/:id', async (context) => {
+    const { title } = await context.req.json();
     if (typeof title !== 'string' || !title.trim()) {
       return context.json({ error: 'title is required' }, 400);
     }
@@ -449,8 +690,8 @@ export function createApp(services: GatewayServices): Hono {
     const deleted = services.runtime.deleteSession(context.req.param('id'));
     return deleted ? context.json({ ok: true }) : context.json({ error: 'Session not found' }, 404);
   });
-  app.put('/api/threads/:id', (context) => {
-    const { title } = context.req.query();
+  app.put('/api/threads/:id', async (context) => {
+    const { title } = await context.req.json();
     if (typeof title !== 'string' || !title.trim()) {
       return context.json({ error: 'title is required' }, 400);
     }
@@ -532,7 +773,25 @@ export function createApp(services: GatewayServices): Hono {
           { error: 'idempotencyKey must be a nonempty string of at most 256 characters' },
           400,
         );
-      const attachments = decodeInputAttachments(body.attachments);
+      const material =
+        Array.isArray(body.attachments) && body.attachments.length <= attachmentMaxCount
+          ? await Promise.all(
+              body.attachments.map(async (entry) => {
+                if (entry && typeof entry.data === 'string') return entry;
+                const meta =
+                  entry && typeof entry.id === 'string' ? uploadRegistry.get(entry.id) : undefined;
+                if (!meta || entry.url !== `api/uploads/${entry.id}` || entry.name !== meta.name)
+                  throw new Error('Uploaded attachment is unavailable; attach the file again.');
+                return {
+                  name: meta.name,
+                  data: (
+                    await readFile(resolve(services.root, '.nuaai/uploads', entry.id))
+                  ).toString('base64'),
+                };
+              }),
+            )
+          : body.attachments;
+      const attachments = decodeInputAttachments(material);
       return context.json(
         services.runtime.startRun({
           threadId: body.threadId,
@@ -549,6 +808,71 @@ export function createApp(services: GatewayServices): Hono {
       );
     } catch (error) {
       return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+  const uploadRegistry = new Map<string, { name: string; type: string }>();
+  app.post('/api/uploads', async (context) => {
+    try {
+      const formData = await context.req.raw.formData();
+      const files: Array<{ id: string; name: string; type: string; size: number; url: string }> =
+        [];
+      const uploadDir = resolve(services.root, '.nuaai', 'uploads');
+      await mkdir(uploadDir, { recursive: true });
+      const entries: [string, File][] = [];
+      formData.forEach((value, key) => {
+        if (value instanceof File) entries.push([key, value]);
+      });
+      const material = await Promise.all(
+        entries.map(async ([_name, value]) => ({
+          value,
+          buffer: Buffer.from(await value.arrayBuffer()),
+        })),
+      );
+      decodeInputAttachments(
+        material.map(({ value, buffer }) => ({
+          name: value.name,
+          data: buffer.toString('base64'),
+        })),
+      );
+      for (const { value, buffer } of material) {
+        const id = randomUUID();
+        const filepath = join(uploadDir, id);
+        await writeFile(filepath, buffer);
+        uploadRegistry.set(id, {
+          name: value.name,
+          type: value.type || 'application/octet-stream',
+        });
+        files.push({
+          id,
+          name: value.name,
+          type: value.type || 'application/octet-stream',
+          size: buffer.length,
+          url: `api/uploads/${id}`,
+        });
+      }
+      return context.json({ files });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+  app.get('/api/uploads/:id', async (context) => {
+    const id = context.req.param('id');
+    const uploadDir = resolve(services.root, '.nuaai', 'uploads');
+    const file = join(uploadDir, id);
+    const meta = uploadRegistry.get(id);
+    if (!meta) return context.json({ error: 'File not found' }, 404);
+    try {
+      const fileContent = await readFile(file);
+      return new Response(fileContent, {
+        headers: {
+          'Content-Type': meta.type || 'application/octet-stream',
+          'Content-Disposition': contentDisposition(meta.name),
+          'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'private, no-store',
+        },
+      });
+    } catch {
+      return context.json({ error: 'File not found' }, 404);
     }
   });
   app.post('/api/runs/:id/resume', (context) => {
@@ -783,6 +1107,29 @@ export function createApp(services: GatewayServices): Hono {
       return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
     }
   });
+  app.put('/api/memory/:id', async (context) => {
+    try {
+      const { content } = await context.req.json();
+      if (typeof content !== 'string' || !content.trim()) {
+        return context.json({ error: 'content is required' }, 400);
+      }
+      const id = context.req.param('id');
+      let embedding: number[] | null = null;
+      try {
+        embedding = services.providers
+          ? await services.providers.get('ollama').embed(content)
+          : null;
+      } catch {
+        // embedding unavailable - store lexically only
+      }
+      const updated = services.store.updateMemory(id, content.trim(), embedding);
+      return updated
+        ? context.json({ ok: true, hasEmbedding: Boolean(embedding) })
+        : context.json({ error: 'Not found' }, 404);
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
   app.get('/api/schedules', (context) => context.json({ schedules: services.scheduler.list() }));
   app.get('/api/tasks/:id', (context) => {
     const diagnostics = services.scheduler.inspectTask(context.req.param('id'));
@@ -987,8 +1334,12 @@ export interface GatewayHandle {
 }
 
 export async function startServer(services: GatewayServices): Promise<GatewayHandle> {
+  await mkdir(resolve(services.root, '.nuaai/logs'), { recursive: true, mode: 0o700 });
+  log(services.root, 'info', `Starting NUAAI server on ${services.host}:${services.port}`);
   const app = createApp(services);
   const httpServer = createServer(async (request, response) => {
+    const requestController = new AbortController();
+    response.once('close', () => requestController.abort());
     try {
       const declaredLength = Number(request.headers['content-length'] ?? 0);
       if (Number.isFinite(declaredLength) && declaredLength > maxRequestBodyBytes) {
@@ -1024,6 +1375,7 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       if (mountedAtNuaai) headers.set('x-nuaai-internal-mount-path', '/nuaai');
       const method = request.method ?? 'GET';
       const webRequest = new Request(requestUrl, {
+        signal: requestController.signal,
         method,
         headers,
         body: method === 'GET' || method === 'HEAD' ? undefined : Buffer.concat(chunks),
@@ -1031,8 +1383,21 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       const webResponse = await app.fetch(webRequest);
       response.statusCode = webResponse.status;
       webResponse.headers.forEach((value, key) => response.setHeader(key, value));
-      response.end(Buffer.from(await webResponse.arrayBuffer()));
+      response.flushHeaders();
+      if (webResponse.body)
+        await pipeline(
+          Readable.fromWeb(webResponse.body as Parameters<typeof Readable.fromWeb>[0]),
+          response,
+        );
+      else response.end();
     } catch (error) {
+      if (requestController.signal.aborted) return;
+      if (response.headersSent) {
+        response.destroy(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      const requestPath = request.url?.split('?')[0] ?? '/';
+      log(services.root, 'error', `${request.method ?? 'UNKNOWN'} ${requestPath} -> 500`, error);
       response.statusCode = 500;
       response.end(error instanceof Error ? error.message : String(error));
     }
@@ -1044,6 +1409,7 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       resolveListen();
     });
   });
+  log(services.root, 'info', `NUAAI server listening on http://${services.host}:${services.port}`);
   const wsServer = new WebSocketServer({
     server: httpServer,
     maxPayload: maxWebSocketMessageBytes,
@@ -1066,6 +1432,18 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
     if (!['/ws', '/nuaai/ws'].includes(url.pathname)) {
       socket.close(1008, 'Unknown WebSocket route');
       return;
+    }
+    if (request.headers.origin) {
+      let matched = false;
+      try {
+        matched = new URL(request.headers.origin).host === request.headers.host;
+      } catch {
+        matched = false;
+      }
+      if (!matched) {
+        socket.close(1008, 'Origin mismatch');
+        return;
+      }
     }
     const token =
       url.searchParams.get('token') ??
@@ -1121,12 +1499,12 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
     port,
     close: async () => {
       unsubscribe();
-      for (const client of clients.keys()) client.close();
-      await new Promise<void>((resolveClose) =>
-        wsServer.close(() => {
-          httpServer.close(() => resolveClose());
-        }),
-      );
+      for (const client of clients.keys()) client.terminate();
+      await new Promise<void>((resolveClose) => wsServer.close(() => resolveClose()));
+      if (typeof httpServer.closeAllConnections === 'function') {
+        httpServer.closeAllConnections();
+      }
+      await new Promise<void>((resolveClose) => httpServer.close(() => resolveClose()));
     },
   };
 }

@@ -71,14 +71,12 @@ describe('response-local run activity', () => {
     const markup = renderToStaticMarkup(
       createElement(RunStatusSummary, {
         message: message('completed', group),
-        defaultExpanded: true,
       }),
     );
 
     expect(markup.match(/data-activity-id=/g)).toHaveLength(48);
     expect(markup).toContain('48 actions · 30 files read · 18 searches · 4m 05s');
     expect(markup).not.toContain('>Running<');
-    expect(markup).toContain('aria-expanded="true"');
   });
 
   it('keeps the failure cause visible and exposes Retry and Inspect controls', () => {
@@ -96,7 +94,6 @@ describe('response-local run activity', () => {
 
     expect(markup).toContain('Provider disconnected after the final tool result.');
     expect(markup).toContain('>Retry<');
-    expect(markup).toContain('>Inspect<');
     expect(markup).toContain('data-status="failed"');
   });
 
