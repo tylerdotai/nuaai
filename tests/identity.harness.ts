@@ -1,5 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, vi } from 'vitest';
@@ -7,6 +6,33 @@ import { type RuntimeConfig, defaultRuntimeConfig } from '../src/config/index.js
 import { type DaemonHandle, startDaemon } from '../src/daemon.js';
 import { DeterministicProvider } from '../src/providers/test.js';
 import type { ProviderRequest } from '../src/providers/types.js';
+import * as gateway from '../src/server.js';
+
+async function startIsolatedDaemon(root: string): Promise<DaemonHandle> {
+  // Config still validates a positive production port. Only this fixture's real
+  // listener gets port zero, retaining the OS allocation until daemon shutdown.
+  const startServer = gateway.startServer;
+  const start = vi
+    .spyOn(gateway, 'startServer')
+    .mockImplementation((services) => startServer({ ...services, port: 0 }));
+  let daemon: DaemonHandle;
+  try {
+    daemon = await startDaemon(root);
+  } finally {
+    start.mockRestore();
+  }
+  try {
+    // CLI clients discover the listener through this private fixture config.
+    // Preserve settings persisted by the daemon (including across restarts).
+    const path = join(root, '.nuaai/config.json');
+    const config = JSON.parse(await readFile(path, 'utf8'));
+    await writeFile(path, JSON.stringify({ ...config, port: daemon.gateway.port }));
+    return daemon;
+  } catch (error) {
+    await daemon.stop();
+    throw error;
+  }
+}
 
 export async function identityHarness(
   onRequest?: (request: ProviderRequest) => Promise<void>,
@@ -17,19 +43,6 @@ export async function identityHarness(
   await mkdir(join(root, '.nuaai'), { recursive: true });
   await mkdir(project);
   const config = defaultRuntimeConfig(root);
-  config.port = await new Promise<number>((resolve, reject) => {
-    const reservation = createServer();
-    reservation.once('error', reject);
-    reservation.listen(0, '127.0.0.1', () => {
-      const address = reservation.address();
-      if (!address || typeof address === 'string') {
-        reservation.close();
-        reject(new Error('No isolated daemon port'));
-        return;
-      }
-      reservation.close((error) => (error ? reject(error) : resolve(address.port)));
-    });
-  });
   config.features = {
     ...config.features,
     matrix: false,
@@ -53,7 +66,20 @@ export async function identityHarness(
   const originalSignals = new Map(
     (['SIGINT', 'SIGTERM'] as const).map((name) => [name, process.listeners(name)]),
   );
-  let daemon: DaemonHandle = await startDaemon(root);
+  const cleanup = () => {
+    implementation.mockRestore();
+    vi.unstubAllEnvs();
+    for (const [name, original] of originalSignals)
+      for (const listener of process.listeners(name))
+        if (!original.includes(listener)) process.removeListener(name, listener);
+  };
+  let daemon: DaemonHandle;
+  try {
+    daemon = await startIsolatedDaemon(root);
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
   const api = async (path: string, body?: unknown) => {
     const response = await fetch(`http://127.0.0.1:${daemon.gateway.port}${path}`, {
       method: body === undefined ? 'GET' : 'POST',
@@ -85,15 +111,14 @@ export async function identityHarness(
     },
     restart: async () => {
       await daemon.stop();
-      daemon = await startDaemon(root);
+      daemon = await startIsolatedDaemon(root);
     },
     close: async () => {
-      await daemon.stop();
-      implementation.mockRestore();
-      vi.unstubAllEnvs();
-      for (const [name, original] of originalSignals)
-        for (const listener of process.listeners(name))
-          if (!original.includes(listener)) process.removeListener(name, listener);
+      try {
+        await daemon.stop();
+      } finally {
+        cleanup();
+      }
     },
   };
 }
