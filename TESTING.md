@@ -15,12 +15,14 @@ failure is the operator's local machine, but several paths can still delete
 data, exfiltrate secrets, or render the harness unusable. Those paths get
 high test density and high mutation pressure. Boilerplate gets less.
 
-### Critical paths (≥80% coverage per file, mutation score ≥80%)
+### Critical paths (per-file coverage; mutation target 80%)
 
 Anything that authenticates a caller, persists data, executes a tool on
 the operator's behalf, or talks to the network falls in this tier. Each
-file under these globs must satisfy the coverage thresholds declared in
-`vitest.config.ts` and the mutation score declared in `stryker.config.mjs`.
+file under these globs must satisfy the combined coverage floors declared in
+`vitest.config.ts`: 80% lines/statements and 75% functions/branches per file.
+`stryker.config.mjs` sets an overall mutation break threshold of 60% and a
+high-score target of 80%; it does not enforce a separate per-file mutation floor.
 
 | Concern | Source | Why |
 |---|---|---|
@@ -37,7 +39,7 @@ file under these globs must satisfy the coverage thresholds declared in
 | Skills / plugins | `src/skills/*.ts`, `src/plugins/*.ts` | A bug here executes arbitrary instructions or imports arbitrary code |
 | Workspace containment | `src/workspace/fs.ts` | A bug here can escape the project root or follow a symlink outside it |
 
-### Standard paths (≥80% coverage per file)
+### Standard paths (80% lines/statements, 75% functions/branches per file)
 
 Everything else inside `src/` that is not excluded from coverage. This
 covers CLI plumbing, daemon lifecycle, runtime orchestration, scheduler,
@@ -110,9 +112,10 @@ journey in the manifest, and a regression in this tier is a release blocker.
 defined in `stryker.config.mjs`. Stryker mutates arithmetic, comparison,
 boolean, and control-flow mutants (excluding string-literal and
 unary-operator mutants, which are usually killed by accident). The test
-suite must kill at least 60% of mutants per file (`thresholds.low` and
-`thresholds.break`); 80% is the bar for the suite overall
-(`thresholds.high`).
+suite must reach an overall mutation score of at least 60%
+(`thresholds.break`); `thresholds.low` is also 60%, and 80% is the
+high-score target (`thresholds.high`). These are overall thresholds, not
+per-file enforcement; per-file reports still guide critical-path review.
 
 The mutation suite is slow and runs on every PR; it is not a gate on
 every commit. A regression in the mutation score is treated as a
@@ -167,19 +170,24 @@ defect and a release blocker.
 
 ## Coverage thresholds
 
-Two thresholds, enforced separately because no single tier can reach
-every critical-path file:
+Coverage is configured separately for each tier because neither tier alone
+can reach every critical-path file:
 
-- **Unit tier (`vitest.unit.config.ts`)** — 60% global floor on lines,
-  functions, branches, statements. Catches the easy bugs fast. Run
-  with `npm run test:unit -- --coverage`.
-- **Integration tier (`vitest.integration.config.ts`)** — 80% per-file
-  floor on every in-scope source file. Catches the bugs that only show
-  up at the SQLite / HTTP / subprocess boundary. Run with
-  `npm run test:integration -- --coverage`.
+- **Unit tier (`vitest.unit.config.ts`)** — 55% global floor on lines,
+  functions, branches and statements. Run with
+  `npm run test:unit -- --coverage`. A passing unit coverage job does not
+  establish combined per-file coverage.
+- **Integration tier (`vitest.integration.config.ts`)** — if coverage is
+  requested, 80% per-file on all four metrics for every in-scope source
+  file. This tier alone need not reach every file; CI runs its tests
+  without coverage, then runs the combined gate below.
+- **Combined gate (`vitest.config.ts`)** — `npm run test:coverage` runs
+  all unit and integration tests together, enforcing **80% lines and
+  statements, 75% functions and branches per file**. An aggregate total
+  above those floors cannot compensate for an individual file below one.
 
-The combined gate (`vitest.config.ts`, used by `npm run test:coverage`)
-runs every test in one shot and enforces the 80% per-file floor.
+The configured floors above describe current enforcement, not a request to
+reduce thresholds when a test fails. The source configuration is authoritative.
 
 Excluded files in all three configs:
 
@@ -191,7 +199,7 @@ Excluded files in all three configs:
 To check coverage locally:
 
 ```sh
-npm run test:coverage              # combined gate (full suite, 80% per-file)
+npm run test:coverage              # combined per-file floors: 80% lines/statements, 75% functions/branches
 npx vitest run --config vitest.unit.config.ts --coverage       # unit tier
 npx vitest run --config vitest.integration.config.ts --coverage # integration tier
 ```
@@ -212,8 +220,11 @@ npm run test:mutate
 Reports are written to `reports/mutation/`. Upload the JSON file to
 `https://dashboard.stryker-mutator.io/` for trend tracking.
 
-The mutation job is gated on every PR and merge to main. A drop of more
-than 5% in the overall killed rate blocks the merge.
+The mutation job runs on every PR and main push after integration succeeds.
+Its configured break threshold is 60% overall. No automatic historical
+5% regression comparison is configured; reviewers must inspect changes in
+mutation results. The quality job does not declare a dependency on mutation,
+so a passing quality job alone is not evidence of a passing mutation job.
 
 ## How to run each tier
 
@@ -235,7 +246,7 @@ npm run gate             # full release gate (version, lint, coverage, e2e, pack
 |---|---|---|
 | `lint` | every push | Biome + TypeScript |
 | `unit` | every push | Unit suite + coverage gate |
-| `integration` | PR + main | Integration suite |
+| `integration` | PR + main | Integration suite, then combined per-file coverage |
 | `e2e` | PR + main | Playwright against the production bundle |
 | `mutation` | PR + main | Stryker against critical paths |
 | `quality` | PR + main | Release gate (version, gate, diff hygiene, npm pack on tags) |
