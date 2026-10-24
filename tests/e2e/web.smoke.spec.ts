@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { createServer, request as proxyRequest } from 'node:http';
 import { join } from 'node:path';
 
 import { expect, test } from '@playwright/test';
@@ -677,6 +678,120 @@ test('a long multi-turn response survives reload without draft concatenation or 
   expect(dimensions.clientHeight).toBe(dimensions.scrollHeight);
   expect(dimensions.overflow).not.toBe('hidden');
   expect(browserErrors).toEqual([]);
+});
+
+test('SSE reconnect recovers missed output with the native cursor and deduplicates replay at the app mount', async ({
+  page,
+  baseURL,
+}) => {
+  const e2eRoot = process.env.NUAAI_E2E_ROOT;
+  if (!e2eRoot) throw new Error('NUAAI_E2E_ROOT is required');
+  const runId = 'reconnect-fixture';
+  const cursor = 1_000_000_003;
+  const reconnectHeaders: Array<string | undefined> = [];
+  let connections = 0;
+  let admissions = 0;
+  let disconnectStream: () => void = () => undefined;
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url ?? '/', baseURL);
+    if (url.pathname === `/nuaai/api/runs/${runId}`) {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ status: 'running' }));
+      return;
+    }
+    if (url.pathname === '/nuaai/api/runs' && request.method === 'POST') admissions += 1;
+    if (url.pathname !== '/nuaai/api/agent/stream' || !request.headers.cookie) {
+      const proxy = proxyRequest(
+        url,
+        { method: request.method, headers: request.headers },
+        (upstream) => {
+          response.writeHead(upstream.statusCode ?? 502, upstream.headers);
+          upstream.pipe(response);
+        },
+      );
+      proxy.on('error', () => response.destroy());
+      request.pipe(proxy);
+      return;
+    }
+    expect(request.headers.cookie).toContain('nuaai_token=');
+    expect(url.searchParams.has('token')).toBe(false);
+    const sessionId = url.searchParams.get('session_id');
+    const detail = await fetch(`${baseURL}/nuaai/api/sessions/${sessionId}`, {
+      headers: { cookie: request.headers.cookie ?? '' },
+    });
+    expect(detail.ok).toBe(true);
+    const { threads } = await detail.json();
+    const threadId = threads[0].id;
+    const event = (id: number, type: string, payload: Record<string, unknown>) =>
+      `id: ${id}\nevent: ${type === 'model.delta' ? 'token' : 'status'}\ndata: ${JSON.stringify({
+        id,
+        event: { id, type, sessionId, threadId, runId, createdAt: 1, payload },
+      })}\n\n`;
+    connections += 1;
+    if (connections === 1) {
+      // A finite SSE response simulates a dropped stream after its last event.
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(
+        [
+          'retry: 100\n\n',
+          event(cursor - 1, 'run.started', {}),
+          event(cursor, 'model.delta', { text: 'Before disconnect. ' }),
+        ].join(''),
+      );
+      return;
+    }
+    const header = request.headers['last-event-id'] as string | undefined;
+    reconnectHeaders.push(header);
+    // Match the daemon contract: only a header cursor requests missed events.
+    // Include an overlapping record to exercise the client's monotonic dedupe.
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    disconnectStream = () => {
+      response.end();
+    };
+    response.write(
+      [
+        'retry: 100\n\n',
+        header === String(cursor)
+          ? [
+              event(cursor, 'model.delta', { text: 'Before disconnect. ' }),
+              event(cursor + 1, 'model.delta', { text: 'Recovered missed output.' }),
+            ].join('')
+          : ': no replay requested\n\n',
+      ].join(''),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected isolated proxy port');
+  try {
+    await page.goto(
+      `http://127.0.0.1:${address.port}/nuaai/#token=${encodeURIComponent(createBrowserPairingToken(e2eRoot))}`,
+    );
+    await expect(page.locator('.connection')).toContainText('Connected');
+    if ((await page.locator('.session-row').count()) === 0)
+      await page.locator('.new-conversation-button').click();
+    const assistant = page.locator('.message-assistant').last();
+    await expect(assistant).toContainText('Before disconnect.');
+    await expect.poll(() => reconnectHeaders).toContain(String(cursor));
+    await expect(assistant).toContainText('Before disconnect. Recovered missed output.');
+    await expect(assistant).not.toContainText('Before disconnect. Before disconnect.');
+    expect(reconnectHeaders[0]).toBe(String(cursor));
+    expect(connections).toBeGreaterThanOrEqual(2);
+    expect(admissions).toBe(0);
+    // Removing the real session cookie makes the daemon reject native reconnect.
+    // A terminal 401 must surface pairing guidance instead of endless retries.
+    await page.context().clearCookies();
+    disconnectStream();
+    await expect(page.getByRole('alert')).toContainText('Pair this device to continue.');
+    await expect(page.locator('.connection')).toContainText('Offline');
+    expect(admissions).toBe(0);
+  } finally {
+    await page.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
 });
 
 test('a stale terminal poll failure cannot surface in a newly selected thread', async ({

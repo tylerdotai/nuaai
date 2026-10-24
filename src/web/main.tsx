@@ -602,7 +602,6 @@ function App(): React.JSX.Element {
     const sessionId = eventSubscription.sessionId;
 
     let stopped = false;
-    let reconnectTimer: number | undefined;
     lastEventId.current = eventSubscription.after;
     let eventSource: EventSource | undefined;
     let eventFrame: number | undefined;
@@ -696,9 +695,6 @@ function App(): React.JSX.Element {
       if (stopped) return;
       const url = new URL(appPath('/api/agent/stream'), location.href);
       url.searchParams.set('session_id', sessionId ?? '');
-      if (lastEventId.current > 0) {
-        url.searchParams.set('Last-Event-ID', String(lastEventId.current));
-      }
       eventSource = new EventSource(url.toString());
       eventSource.onopen = () => setConnection('connected');
       eventSource.onmessage = handleSSEEvent;
@@ -732,16 +728,28 @@ function App(): React.JSX.Element {
         });
       eventSource.onerror = (event) => {
         if (event instanceof MessageEvent || stopped) return;
-        eventSource?.close();
+        if (eventSource?.readyState === EventSource.CLOSED) {
+          setConnection('offline');
+          // EventSource hides HTTP errors; use the authenticated API for re-pair guidance.
+          const failedThreadId = selectedThreadRef.current;
+          void request('/api/status').catch((cause: unknown) => {
+            if (
+              !stopped &&
+              selectedSessionRef.current === sessionId &&
+              selectedThreadRef.current === failedThreadId
+            )
+              reportBackgroundFailure(cause);
+          });
+          return;
+        }
+        // Keep this EventSource: native retries preserve the Last-Event-ID header.
         setConnection('reconnecting');
-        reconnectTimer = window.setTimeout(connect, 2000);
       };
     };
 
     connect();
     return () => {
       stopped = true;
-      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       eventSource?.close();
       if (eventFrame) window.cancelAnimationFrame(eventFrame);
     };
