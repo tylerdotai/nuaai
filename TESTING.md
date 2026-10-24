@@ -227,7 +227,9 @@ nightly at 06:00 UTC on the default branch, or on manual dispatch. Its optional
 `mutate` input explicitly selects files/ranges for a focused manual audit; a
 focused result must never be labeled a full-scope pass. The workflow uses two
 workers and a finite six-hour wall budget. A budget expiry is incomplete evidence,
-not a passing score; available reports and Actions logs retain failures.
+not a passing score. Summary/artifact upload is best-effort: a job-wide timeout or
+cancellation can prevent even `always()` steps from running. Preserve available
+reports and Actions logs rather than claiming guaranteed evidence capture.
 
 The score break threshold remains **60% overall**, with an **80% target**; scope,
 operators and thresholds in `stryker.config.mjs` are unchanged. The audit job
@@ -264,7 +266,8 @@ npm run gate             # full release gate (version, lint, coverage, e2e, pack
 The separate `mutation.yml` workflow runs the full mutation audit nightly/manual
 only; it is not part of PR merge-blocking CI. Manual focused audits use the same
 configuration with an explicitly recorded selector. It preserves real failure
-conclusions and uploads available evidence even on failure.
+conclusions and attempts evidence upload on failure; job-wide timeout/cancellation
+can prevent that best-effort upload.
 
 Ordinary CI jobs are wired with `needs:` so a failure in an earlier stage blocks
 the downstream quality gate. Its `concurrency.cancel-in-progress: true` aborts
