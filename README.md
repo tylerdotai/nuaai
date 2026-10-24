@@ -438,6 +438,8 @@ git diff --check
 
 The gate runs Biome, strict TypeScript, 80% per-file coverage across the instrumented runtime/core library scope, fresh Node/web builds, browser E2E, an installed-tarball daemon smoke, installed-terminal PTY lifecycle/resize/editor/approval checks, version consistency, and a dependency audit that blocks moderate-or-higher advisories. Process entrypoints, React/Ink presentation code, schema declarations, and provider transport shims are verified through integration, build, E2E, and artifact tests rather than included in the percentage claim. Dependency-audit results describe the current lockfile and advisory database, not a permanent guarantee.
 
+Full mutation testing is a separate nightly/manual audit, not a PR merge gate. Critical changes use bounded focused mutation checks with explicit scope; the full audit's configured scope and score thresholds are unchanged. Failed or incomplete audits are reported honestly, not counted as passes. See [`TESTING.md`](TESTING.md).
+
 The repository includes unit, integration, runtime, and browser tests. Live service smoke tests require Docker and are intentionally separate from deterministic unit tests.
 
 The [`v1.0.1` production dogfood report](docs/dogfood/v1.0.1-report.md) records 20/20 final real-provider cases, 20/20 completed actions, cancellation/resume, and PWA reload/reconnect evidence. The protocol preserves the initial blocked report and every replacement run instead of hiding calibration or model-compliance misses.
