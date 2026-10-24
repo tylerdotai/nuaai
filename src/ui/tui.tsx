@@ -344,7 +344,11 @@ export function Tui({
   const policySequence = useRef(0);
   const [identityError, setIdentityError] = useState<string | null>(null);
   const identityReadSequence = useRef(0);
-  const error = composer.recoveryError ?? requestError;
+  const errors = [
+    ...new Set(
+      [composer.recoveryError, requestError].filter((error): error is string => error !== null),
+    ),
+  ];
   const { activate: activateComposer, setDraft: setComposerDraft } = composer;
   const carryDraft = useRef(false);
   const selectedSessionRef = useRef<string | null>(composer.selection.sessionId);
@@ -2161,7 +2165,7 @@ export function Tui({
       footerRows -
       Number(Boolean(tuiState.retry)) -
       Number(approvalBanner) -
-      Number(Boolean(error)) -
+      errors.length -
       Number(Boolean(tuiState.catalogErrors?.length)),
   );
   const minimumRows = conversationVisible
@@ -2578,11 +2582,11 @@ export function Tui({
           {tuiState.approvals.length} action(s) need approval · /approvals focuses the chat card
         </Text>
       )}
-      {error && (
-        <Text color="red" wrap="truncate-end">
+      {errors.map((error) => (
+        <Text key={error} color="red" wrap="truncate-end">
           Error: {terminalText(error).replaceAll('\n', ' ')}
         </Text>
-      )}
+      ))}
       {Boolean(tuiState.catalogErrors?.length) && (
         <Text color="yellow" wrap="truncate-end">
           Catalog unavailable · {tuiState.catalogErrors?.join(' · ')}

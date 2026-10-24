@@ -82,7 +82,7 @@ Shortcuts can switch directly between pickers and preserve the unsent draft and 
 - `/delete`, `/delete-thread`: review the exact target before permanent deletion.
 - Enter sends; Alt-Enter inserts a newline. Large drafts wrap into a cursor-following editor.
 - Left/Right move the cursor. Ctrl-A/E jump to the beginning/end; Ctrl-U/K erase before/after the cursor.
-- Up/Down recall sent inputs for a single-line draft and move between lines for a multiline draft.
+- Alt-Up/Down recall sent inputs for a single-line draft. Plain Up/Down scroll the transcript for single-line drafts and move between lines for multiline drafts.
 - PgUp/PgDn scroll rendered transcript rows, including within a single long reply.
 - `/cancel` or Ctrl-X requests cancellation; `/resume` asks for explicit confirmation before resuming an interrupted run.
 
@@ -90,7 +90,7 @@ Replies render common Markdown headings, emphasis, links, quotes, and fenced cod
 
 ## Draft recovery, search, files, and outputs
 
-Draft text, cursor, sent-input history, pending attachment bytes, and the selected session/thread are stored per thread in an owner-only `.nuaai/tui-drafts-<daemon-key>.json` file. The daemon URL and launch workspace separate recovery files for different runtime/project contexts. Changes are debounced and flushed when the client exits normally. A corrupt recovery file stays untouched and produces a persistent warning rather than being silently replaced. Switching to an existing thread restores its draft; creating a new conversation/thread by shortcut carries the current unsent draft.
+Draft text, cursor, sent-input history, pending attachment bytes, and the selected session/thread are stored per thread in an owner-only `.nuaai/tui-drafts-<daemon-key>.json` file. The daemon URL and launch workspace separate recovery files for different runtime/project contexts. Changes are debounced and flushed when the client exits normally. A corrupt recovery file stays untouched and produces a persistent warning rather than being silently replaced. Additional submission or request errors appear alongside that warning. New runs are blocked when the submission identity cannot be saved; the draft remains visible and no run is submitted. Switching to an existing thread restores its draft; creating a new conversation/thread by shortcut carries the current unsent draft.
 
 | Workflow | Keys / commands |
 | --- | --- |

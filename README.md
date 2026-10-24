@@ -197,7 +197,7 @@ node dist/cli.js service status
 - `/status`: live daemon health; `/refresh` or `Ctrl+R`: reload state.
 - `/cancel` or `Ctrl+X`: cancel the active run; `/resume`: confirm resuming an interrupted run.
 - `Alt+Enter`: newline; arrows and `Ctrl+A/E/U/K`: edit the draft.
-- `Up/Down`: sent-input history in single-line drafts; move between lines in multiline drafts.
+- `Alt+Up/Down`: sent-input history in single-line drafts. Plain `Up/Down` scroll the transcript for single-line drafts and move between lines in multiline drafts.
 - `PgUp/PgDn`: scroll transcript rows, long screens, or picker details.
 - `Esc`: dismiss the current screen, form, or draft; `/quit` or `Ctrl+C`: leave the TUI without stopping the daemon.
 

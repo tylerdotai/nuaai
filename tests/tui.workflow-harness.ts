@@ -16,6 +16,8 @@ export async function workflowHarness(
   await mkdir(join(root, '.nuaai'));
   const requests: Array<{ path: string; method: string; body: Record<string, unknown> }> = [];
   let rejectRuns = false;
+  let rejectSessionRefresh = false;
+  let hydrationGate: Promise<void> | null = null;
   const messages: Record<
     string,
     Array<{ id: string; role: string; markdown: string }>
@@ -30,6 +32,11 @@ export async function workflowHarness(
     const body = text ? JSON.parse(text) : {};
     requests.push({ path: url.pathname + url.search, method: req.method ?? 'GET', body });
     let result: unknown;
+    if (url.pathname === '/api/sessions' && rejectSessionRefresh) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'controlled session refresh failure' }));
+      return;
+    }
     if (url.pathname === '/api/sessions')
       result = { sessions: [{ id: 's', title: 'Workflow session', status: 'active' }] };
     else if (url.pathname === '/api/sessions/s')
@@ -48,8 +55,10 @@ export async function workflowHarness(
         hasMore: !older && all.length > 1,
         nextCursor: older ? 0 : 10,
       };
-    } else if (url.pathname.endsWith('/run-state')) result = { activeRunId: null, lastEventId: 0 };
-    else if (url.pathname === '/api/providers')
+    } else if (url.pathname.endsWith('/run-state')) {
+      await hydrationGate;
+      result = { activeRunId: null, lastEventId: 0 };
+    } else if (url.pathname === '/api/providers')
       result = {
         active: { name: 'fixture', model: 'fixture-model' },
         providers: [{ name: 'fixture', available: true, models: ['fixture-model'] }],
@@ -73,6 +82,7 @@ export async function workflowHarness(
   if (!address || typeof address === 'string') throw new Error('Missing fixture address');
   const baseUrl = `http://127.0.0.1:${address.port}`;
   let stop = () => {};
+  let flushRender = async () => {};
   let input: PassThrough;
   let output = '';
   const frame = () => {
@@ -100,23 +110,27 @@ export async function workflowHarness(
       debug: true,
       exitOnCtrlC: false,
     });
+    flushRender = () => app.waitUntilRenderFlush();
     stop = () => {
       app.unmount();
       app.cleanup();
     };
   };
   launch();
+  const waitForInput = async () => {
+    await flushRender();
+    await expect.poll(() => input.listenerCount('readable'), { timeout: 3000 }).toBeGreaterThan(0);
+  };
   const send = async (bytes: string, expected?: string) => {
     await expect.poll(() => !frame().includes('Applying…'), { timeout: 3000 }).toBe(true);
-    // Let Ink commit passive input effects after a rendered readiness frame.
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await waitForInput();
     const before = output.length;
     input.write(bytes);
     if (expected)
       await expect
         .poll(() => (output.length > before ? frame() : ''), { timeout: 3000 })
         .toContain(expected);
-    else await new Promise((resolve) => setTimeout(resolve, 70));
+    else await flushRender();
   };
   return {
     terminalOutput: () => output,
@@ -126,6 +140,20 @@ export async function workflowHarness(
     messages,
     frame,
     send,
+    waitForInput,
+    pauseHydration: () => {
+      let release = () => {};
+      hydrationGate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return () => {
+        hydrationGate = null;
+        release();
+      };
+    },
+    rejectSessionRefresh: (value: boolean) => {
+      rejectSessionRefresh = value;
+    },
     rejectRuns: (value: boolean) => {
       rejectRuns = value;
     },
@@ -133,6 +161,8 @@ export async function workflowHarness(
       stop();
       launch();
       await expect.poll(frame).toContain('Connected');
+      await expect.poll(() => /Thread [AB] · approvals:/u.test(frame())).toBe(true);
+      await waitForInput();
     },
     close: async () => {
       stop();
