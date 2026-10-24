@@ -1,0 +1,56 @@
+.voice-panel {
+  border: 1px solid var(--border, #697184);
+  border-radius: 12px;
+  padding: 12px;
+  margin-bottom: 12px;
+  font-size: 0.875rem;
+}
+.voice-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.voice-panel summary {
+  min-height: 44px;
+  padding-block: 10px;
+  cursor: pointer;
+}
+.voice-panel output {
+  display: block;
+  line-height: 1.5;
+  margin-block: 10px;
+}
+.voice-controls button {
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  color: inherit;
+  background: transparent;
+}
+.voice-controls button:focus-visible {
+  outline: 3px solid currentColor;
+  outline-offset: 3px;
+}
+.voice-controls button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.voice-controls button[aria-pressed="true"] {
+  border-style: dashed;
+}
+.voice-guidance {
+  line-height: 1.5;
+}
+.voice-error {
+  font-weight: 600;
+}
+.voice-transcripts {
+  max-height: 12rem;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+.voice-panel code {
+  overflow-wrap: anywhere;
+}

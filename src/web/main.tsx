@@ -14,6 +14,7 @@ import { MarkdownContent } from './components/MarkdownContent.js';
 import { RunStatusSummary } from './components/RunStatusSummary.js';
 import { SessionIdentityPanel } from './components/SessionIdentityPanel.js';
 import { ToastContainer } from './components/Toast.js';
+import { VoicePanel } from './components/VoicePanel.js';
 import { type ComposerCommand, draftStorageKey, resolveComposerCommand } from './composer.js';
 import type {
   ActiveProvider,
@@ -2175,6 +2176,24 @@ function App(): React.JSX.Element {
                   </button>
                 )}
 
+                {selectedSessionId && selectedThreadId && (
+                  <VoicePanel
+                    key={`${selectedSessionId}:${selectedThreadId}`}
+                    sessionId={selectedSessionId}
+                    threadId={selectedThreadId}
+                    basePath={APP_BASE_PATH}
+                    disabled={authenticationError}
+                    runStatus={Object.fromEntries([
+                      ...messages.flatMap((message) =>
+                        message.runId ? [[message.runId, message.status]] : [],
+                      ),
+                      ...(activeRunId ? [[activeRunId, 'running']] : []),
+                      ...approvals
+                        .filter((approval) => approval.status === 'pending')
+                        .map((approval) => [approval.runId, 'awaiting approval']),
+                    ])}
+                  />
+                )}
                 <AgentComposer
                   key={selectedThreadId}
                   input={input}
