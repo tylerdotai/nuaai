@@ -42,6 +42,8 @@ import { SkillLearner } from './skills/learner.js';
 import { loadFilesystemSkills } from './skills/loader.js';
 import { SkillRegistry } from './skills/registry.js';
 import { ToolRegistry } from './tools/registry.js';
+import { VoiceBroker, VoiceError } from './voice/broker.js';
+import { unsupportedCodexVoiceProvider } from './voice/codex-transport.js';
 import { initWorkspace } from './workspace/fs.js';
 
 export interface DaemonHandle {
@@ -310,6 +312,40 @@ async function startOwnedDaemon(
       );
     }
   });
+  // Installed Codex has no proven no-execution policy over App Server stdio.
+  // Keep production unavailable; injected transports exercise the complete broker boundary.
+  const voice = new VoiceBroker({
+    provider: unsupportedCodexVoiceProvider,
+    authorize: (_owner, binding) => {
+      const thread = store.getThread(binding.threadId);
+      const snapshot = store.getSessionIdentity(binding.sessionId);
+      if (!thread || thread.sessionId !== binding.sessionId || !snapshot)
+        throw new VoiceError('VOICE_BINDING_CONFLICT', 409);
+      return {
+        identitySnapshotId: snapshot.id,
+        workspaceRoot: snapshot.workspaceRoot,
+        authorityKey: JSON.stringify(effectiveConfig.permissions.web),
+      };
+    },
+    admit: (binding, text, key, authority) => {
+      const run = runtime.startRun({
+        threadId: binding.threadId,
+        input: text,
+        idempotencyKey: key,
+        identitySnapshotId: authority.identitySnapshotId,
+        permissionSource: 'web',
+        permissions: permissionContextForProfile(effectiveConfig.permissions.web),
+      });
+      return {
+        runId: run.id,
+        result: runtime.waitForRun(run.id).then((completed) => {
+          if (completed.status !== 'completed')
+            throw new VoiceError('VOICE_PROVIDER_ERROR', 502, 'delivery');
+          return completed.output;
+        }),
+      };
+    },
+  });
   let gateway: GatewayHandle;
   try {
     scheduler.start();
@@ -332,8 +368,10 @@ async function startOwnedDaemon(
       plugins,
       secrets,
       mcp,
+      voice,
     });
   } catch (error) {
+    await voice.shutdown();
     mcp.stop();
     await scheduler.stop();
     await runtime.shutdown();
@@ -762,6 +800,7 @@ async function startOwnedDaemon(
     unsubscribeMatrixRuntime?.();
     unsubscribeKnowledge();
     continuity?.close();
+    await voice.shutdown();
     await scheduler.stop();
     await runtime.shutdown();
     await scheduler.drain();
