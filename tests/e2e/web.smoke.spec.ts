@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { createServer, request as proxyRequest } from 'node:http';
+import { type IncomingMessage, createServer, request as proxyRequest } from 'node:http';
 import { join } from 'node:path';
 
 import { expect, test } from '@playwright/test';
@@ -686,14 +686,45 @@ test('SSE reconnect recovers missed output with the native cursor and deduplicat
 }) => {
   const e2eRoot = process.env.NUAAI_E2E_ROOT;
   if (!e2eRoot) throw new Error('NUAAI_E2E_ROOT is required');
+  const daemon = new URL(baseURL ?? '');
+  if (daemon.protocol !== 'http:' || daemon.hostname !== '127.0.0.1' || !daemon.port)
+    throw new Error('Expected a trusted loopback test daemon');
+  const destination = { protocol: 'http:', hostname: '127.0.0.1', port: Number(daemon.port) };
+  let proxyHost = '';
   const runId = 'reconnect-fixture';
   const cursor = 1_000_000_003;
   const reconnectHeaders: Array<string | undefined> = [];
   let connections = 0;
   let admissions = 0;
   let disconnectStream: () => void = () => undefined;
+  let foreignRequests = 0;
+  const decoy = createServer((_request, response) => {
+    foreignRequests += 1;
+    response.end('isolated decoy');
+  });
+  await new Promise<void>((resolve) => decoy.listen(0, '127.0.0.1', resolve));
+  const decoyAddress = decoy.address();
+  if (!decoyAddress || typeof decoyAddress === 'string')
+    throw new Error('Expected isolated decoy port');
   const server = createServer(async (request, response) => {
-    const url = new URL(request.url ?? '/', baseURL);
+    const target = request.url ?? '';
+    // Only origin-form mounted paths are accepted. Neither incoming Host nor an
+    // absolute request target can select the proxy's outbound network authority.
+    if (
+      !target.startsWith('/nuaai/') ||
+      target.includes('\\') ||
+      request.headers.host !== proxyHost
+    ) {
+      response.writeHead(400);
+      response.end();
+      return;
+    }
+    const url = new URL(target, 'http://fixture.invalid');
+    if (!url.pathname.startsWith('/nuaai/')) {
+      response.writeHead(400);
+      response.end();
+      return;
+    }
     if (url.pathname === `/nuaai/api/runs/${runId}`) {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ status: 'running' }));
@@ -702,8 +733,12 @@ test('SSE reconnect recovers missed output with the native cursor and deduplicat
     if (url.pathname === '/nuaai/api/runs' && request.method === 'POST') admissions += 1;
     if (url.pathname !== '/nuaai/api/agent/stream' || !request.headers.cookie) {
       const proxy = proxyRequest(
-        url,
-        { method: request.method, headers: request.headers },
+        {
+          ...destination,
+          path: `${url.pathname}${url.search}`,
+          method: request.method,
+          headers: { ...request.headers, host: daemon.host },
+        },
         (upstream) => {
           response.writeHead(upstream.statusCode ?? 502, upstream.headers);
           upstream.pipe(response);
@@ -716,11 +751,27 @@ test('SSE reconnect recovers missed output with the native cursor and deduplicat
     expect(request.headers.cookie).toContain('nuaai_token=');
     expect(url.searchParams.has('token')).toBe(false);
     const sessionId = url.searchParams.get('session_id');
-    const detail = await fetch(`${baseURL}/nuaai/api/sessions/${sessionId}`, {
-      headers: { cookie: request.headers.cookie ?? '' },
+    if (!sessionId || !/^[a-zA-Z0-9_-]{1,128}$/u.test(sessionId)) {
+      response.writeHead(400);
+      response.end();
+      return;
+    }
+    const detail = await new Promise<IncomingMessage>((resolve, reject) => {
+      const lookup = proxyRequest(
+        {
+          ...destination,
+          path: `/nuaai/api/sessions/${encodeURIComponent(sessionId)}`,
+          headers: { cookie: request.headers.cookie ?? '', host: daemon.host },
+        },
+        resolve,
+      );
+      lookup.on('error', reject);
+      lookup.end();
     });
-    expect(detail.ok).toBe(true);
-    const { threads } = await detail.json();
+    expect(detail.statusCode).toBe(200);
+    const chunks: Buffer[] = [];
+    for await (const chunk of detail) chunks.push(Buffer.from(chunk));
+    const { threads } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     const threadId = threads[0].id;
     const event = (id: number, type: string, payload: Record<string, unknown>) =>
       `id: ${id}\nevent: ${type === 'model.delta' ? 'token' : 'status'}\ndata: ${JSON.stringify({
@@ -763,7 +814,51 @@ test('SSE reconnect recovers missed output with the native cursor and deduplicat
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('Expected isolated proxy port');
+  proxyHost = `127.0.0.1:${address.port}`;
   try {
+    for (const target of [
+      `http://127.0.0.1:${decoyAddress.port}/nuaai/health`,
+      `//127.0.0.1:${decoyAddress.port}/nuaai/health`,
+      '/nuaai/../../health',
+      '/nuaai/%2e%2e/%2e%2e/health',
+      '/nuaai/api/agent/stream?session_id=..%2F..%2Fhealth',
+    ]) {
+      const status = await new Promise<number>((resolve, reject) => {
+        const request = proxyRequest(
+          {
+            hostname: '127.0.0.1',
+            port: address.port,
+            path: target,
+            headers: { cookie: 'nuaai_token=synthetic-test-only' },
+          },
+          (response) => {
+            response.resume();
+            response.on('end', () => resolve(response.statusCode ?? 0));
+          },
+        );
+        request.on('error', reject);
+        request.end();
+      });
+      expect(status).toBe(400);
+    }
+    const foreignHostStatus = await new Promise<number>((resolve, reject) => {
+      const request = proxyRequest(
+        {
+          hostname: '127.0.0.1',
+          port: address.port,
+          path: '/nuaai/',
+          headers: { host: 'foreign.invalid' },
+        },
+        (response) => {
+          response.resume();
+          response.on('end', () => resolve(response.statusCode ?? 0));
+        },
+      );
+      request.on('error', reject);
+      request.end();
+    });
+    expect(foreignHostStatus).toBe(400);
+    expect(foreignRequests).toBe(0);
     await page.goto(
       `http://127.0.0.1:${address.port}/nuaai/#token=${encodeURIComponent(createBrowserPairingToken(e2eRoot))}`,
     );
@@ -788,8 +883,14 @@ test('SSE reconnect recovers missed output with the native cursor and deduplicat
   } finally {
     await page.close();
     server.closeAllConnections();
-    await new Promise<void>((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve())),
+    decoy.closeAllConnections();
+    await Promise.all(
+      [server, decoy].map(
+        (listener) =>
+          new Promise<void>((resolve, reject) =>
+            listener.close((error) => (error ? reject(error) : resolve())),
+          ),
+      ),
     );
   }
 });
