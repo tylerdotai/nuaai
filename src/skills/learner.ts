@@ -1,4 +1,4 @@
-import { access, mkdir, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import { workspaceDirectory } from '../config/index.js';
@@ -83,7 +83,33 @@ export class SkillLearner {
   async learnFromRun(input: string): Promise<LearnedSkill | undefined> {
     const request = parseRequest(input);
     if (!request?.body) return undefined;
-    const base = resolve(workspaceDirectory(this.root), 'skills');
+    return this.create(request.name, request.body);
+  }
+
+  async create(name: string, instructions: string): Promise<LearnedSkill> {
+    if (name.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name))
+      throw new Error('Skill name must be a lowercase slug of at most 64 characters.');
+    const body = instructions.trim();
+    if (!body || body.length > 50000)
+      throw new Error('Skill instructions must contain 1–50000 characters.');
+    const request = { name, body };
+    const physicalRoot = await realpath(this.root);
+    const runtimeRoot = workspaceDirectory(physicalRoot);
+    const base = resolve(runtimeRoot, 'skills');
+    for (const directory of [runtimeRoot, base]) {
+      try {
+        await mkdir(directory, { mode: 0o700 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      const entry = await lstat(directory);
+      if (
+        entry.isSymbolicLink() ||
+        !entry.isDirectory() ||
+        (await realpath(directory)) !== directory
+      )
+        throw new Error('Skill storage must be a private real directory.');
+    }
     const selected = await nextDirectory(base, request.name);
     const path = resolve(selected.directory, 'SKILL.md');
     const triggers = triggerWords(selected.name, request.body);
@@ -105,8 +131,8 @@ export class SkillLearner {
       request.body,
       '',
     ].join('\n');
-    await mkdir(selected.directory, { recursive: true, mode: 0o700 });
-    await writeFile(path, document, { encoding: 'utf8', mode: 0o600 });
+    await mkdir(selected.directory, { mode: 0o700 });
+    await writeFile(path, document, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     const manifest = parseSkillDocument(document, selected.name, path);
     this.registry.registerInstruction({
       name: manifest.name,

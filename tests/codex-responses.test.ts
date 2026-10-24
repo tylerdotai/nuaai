@@ -464,7 +464,7 @@ rl.on('line', (line) => {
         })) as typeof fetch,
     });
     await expect(collect(badArguments, [{ role: 'user', content: 'Bad call' }])).rejects.toThrow(
-      'malformed tool arguments',
+      'without a terminal event',
     );
   });
 

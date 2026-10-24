@@ -15,7 +15,7 @@ import {
   workspaceDirectory,
 } from '../src/config/index.js';
 import { createEvent } from '../src/core/events.js';
-import { loadSessionIdentity } from '../src/core/identity.js';
+import { captureSessionIdentity, sessionIdentityPrompt } from '../src/core/identity.js';
 import { AgentRuntime, requestRequiresVerifiedTool } from '../src/core/runtime.js';
 import { Scheduler, nextCronRun } from '../src/core/scheduler.js';
 import { startDaemon } from '../src/daemon.js';
@@ -436,18 +436,26 @@ describe('runtime configuration and security primitives', () => {
     const root = await makeRoot();
     await writeFile(join(root, 'AGENTS.md'), 'workspace rules');
     await writeFile(join(root, 'SOUL.md'), 'agent identity');
-    expect(loadSessionIdentity(root)).toContain('## AGENTS.md\nworkspace rules');
-    expect(loadSessionIdentity(root)).toContain('## SOUL.md\nagent identity');
+    expect(
+      sessionIdentityPrompt(captureSessionIdentity({ root, sessionId: 'identity-fixture' })),
+    ).toContain('## project/AGENTS.md\nworkspace rules');
+    expect(
+      sessionIdentityPrompt(captureSessionIdentity({ root, sessionId: 'identity-fixture' })),
+    ).toContain('## project/SOUL.md\nagent identity');
 
     await writeFile(join(root, 'SOUL.md'), 'x'.repeat(12_001));
-    const bounded = loadSessionIdentity(root);
+    const bounded = sessionIdentityPrompt(
+      captureSessionIdentity({ root, sessionId: 'identity-fixture' }),
+    );
     expect(bounded).toContain('[truncated by NUAAI]');
     expect(Buffer.byteLength(bounded, 'utf8')).toBeGreaterThan(12_000);
   });
 
   it('returns a truthful empty identity when workspace instruction files are absent', async () => {
     const root = await makeRoot();
-    expect(loadSessionIdentity(root)).toBe('No AGENTS.md or SOUL.md was present at session start.');
+    expect(
+      sessionIdentityPrompt(captureSessionIdentity({ root, sessionId: 'identity-fixture' })),
+    ).toBe('You are NUAAI, a persistent local-first personal agent.');
   });
 });
 
@@ -465,7 +473,7 @@ describe('SQLite persistence and vector memory', () => {
           value: string;
         }
       ).value,
-    ).toBe('7');
+    ).toBe('9');
     const legacyRoot = await makeRoot();
     await mkdir(workspaceDirectory(legacyRoot), { recursive: true });
     const legacyDb = new Database(join(workspaceDirectory(legacyRoot), 'memory.db'));
@@ -489,7 +497,7 @@ describe('SQLite persistence and vector memory', () => {
           .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
           .get() as { value: string }
       ).value,
-    ).toBe('7');
+    ).toBe('9');
     expect(
       (upgraded.raw.prepare('PRAGMA table_info(plugins)').all() as Array<{ name: string }>).map(
         (column) => column.name,
@@ -845,7 +853,7 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
   it('executes secure workspace tools and enforces permissions', async () => {
     const root = await makeRoot();
     const tools = new ToolRegistry(root);
-    expect(tools.list()).toHaveLength(8);
+    expect(tools.list()).toHaveLength(15);
     expect(tools.schemas().map((tool) => tool.name)).toContain('workspace.command');
     await tools.execute(
       'workspace.write',
@@ -874,10 +882,16 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
           permissions: permissive,
         },
       ),
-    ).resolves.toEqual([expect.objectContaining({ file: 'notes.txt', line: 1 })]);
+    ).resolves.toMatchObject({
+      matches: [expect.objectContaining({ file: 'notes.txt', line: 1 })],
+      complete: true,
+    });
     await expect(
       tools.execute('workspace.list', {}, { root, permissions: permissive }),
-    ).resolves.toContain('notes.txt');
+    ).resolves.toMatchObject({
+      entries: expect.arrayContaining([{ name: 'notes.txt', path: 'notes.txt', type: 'file' }]),
+      truncated: false,
+    });
     await expect(
       tools.execute(
         'workspace.command',
@@ -993,7 +1007,7 @@ describe('secrets manager, workspace tools, skills, and plugins', () => {
     );
     expect(await listWorkspaceFiles(root)).toContain('notes.txt');
     expect(await readWorkspaceFile(root, 'notes.txt')).toBe('hello world');
-    expect(await searchWorkspace(root, 'WORLD')).toEqual([
+    expect((await searchWorkspace(root, 'WORLD')).matches).toEqual([
       expect.objectContaining({ file: 'notes.txt' }),
     ]);
     expect(textDiff('a\n', 'b\n').map((change) => change.value)).toEqual(['a\n', 'b\n']);
@@ -2244,7 +2258,7 @@ else {
       store.listTasks().find((task) => task.scheduleId === falseSuccessSchedule.id),
     ).toMatchObject({
       status: 'failed',
-      payload: { error: 'Agent run ended with status: failed' },
+      payload: { error: 'provider failed' },
     });
   });
 
@@ -2854,7 +2868,11 @@ describe('agent runtime orchestration', () => {
           parameters: { type: 'object' },
         },
       ],
-      status: () => ({ servers: ['remote'], failures: {}, tools: [] }),
+      status: () => ({
+        servers: ['remote'],
+        failures: {},
+        tools: [{ name: 'mcp.remote.expensive', server: 'remote' }],
+      }),
       discover: async () => [{ name: 'mcp.remote.expensive' }],
       executeComputer: async () => ({ ok: true }),
       execute: async () => ({ ok: true }),
@@ -3090,11 +3108,19 @@ describe('agent runtime orchestration', () => {
     expect(requests[0]?.tools?.map((tool) => tool.name)).toEqual([
       'github.auth',
       'github.repo.list',
+      'host.command',
+      'runtime.inspect',
       'workspace.command',
+      'workspace.copy',
+      'workspace.edit',
       'workspace.inspect',
       'workspace.list',
+      'workspace.mkdir',
+      'workspace.move',
       'workspace.read',
       'workspace.search',
+      'workspace.stat',
+      'workspace.trash',
       'workspace.write',
     ]);
   });
@@ -3102,7 +3128,6 @@ describe('agent runtime orchestration', () => {
   it('rejects repeated model calls to tools outside the permission-filtered catalog', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
-    const execute = vi.fn(async () => ({ ok: true }));
     let requests = 0;
     const provider = makeAgentProvider('tool-boundary', async function* () {
       requests += 1;
@@ -3113,21 +3138,8 @@ describe('agent runtime orchestration', () => {
         arguments: { provider: 'codex', model: 'gpt-test' },
       };
     });
-    const tools = {
-      schemas: () => [
-        {
-          name: 'memory.forget',
-          description: 'Forget persisted memory',
-          parameters: { type: 'object' },
-        },
-        {
-          name: 'github.repo.list',
-          description: 'List GitHub repositories',
-          parameters: { type: 'object' },
-        },
-      ],
-      execute,
-    } as unknown as ToolRegistry;
+    const tools = new ToolRegistry(root, undefined, {}, { store });
+    const execute = vi.spyOn(tools, 'execute');
     const runtime = new AgentRuntime({
       root,
       config: defaultRuntimeConfig(root),
@@ -3166,30 +3178,34 @@ describe('agent runtime orchestration', () => {
         yield {
           type: 'tool_call',
           id: 'rows-call',
-          name: 'github.repo.list',
+          name: 'fixture.numeric',
           arguments: { mode: 'rows', limit: '50' },
         };
       } else yield { type: 'done', text: 'Rows checked.' };
     });
-    const tools = {
-      schemas: () => [
-        {
-          name: 'github.repo.list',
-          description: 'List GitHub repositories',
-          parameters: {
-            type: 'object',
-            properties: {
-              mode: { type: 'string' },
-              limit: { type: 'number' },
-            },
-          },
-        },
-      ],
-      execute: async (_name: string, input: Record<string, unknown>) => {
-        calls.push(input);
-        return { exitCode: 0, count: 50, repositories: [] };
+    const tools = new ToolRegistry(root);
+    tools.register({
+      name: 'fixture.numeric',
+      description: 'Echo a schema-declared numeric input',
+      permission: 'read',
+      governance: {
+        owner: 'fixture',
+        costClass: 'low',
+        authMode: 'none',
+        sideEffects: 'none',
+        approval: 'none',
+        maxCallsPerRun: 8,
       },
-    } as unknown as ToolRegistry;
+      parameters: {
+        type: 'object',
+        properties: { mode: { type: 'string' }, limit: { type: 'number' } },
+      },
+      input: z.object({ mode: z.string(), limit: z.number() }),
+      execute: async (input) => {
+        calls.push(input as Record<string, unknown>);
+        return input;
+      },
+    });
     const runtime = new AgentRuntime({
       root,
       config: defaultRuntimeConfig(root),
@@ -3200,7 +3216,7 @@ describe('agent runtime orchestration', () => {
     const created = runtime.createSession('Numeric tool arguments');
     const run = runtime.startRun({
       threadId: created.thread.id,
-      input: 'List my GitHub repositories.',
+      input: 'Use fixture.numeric to echo 50 rows.',
       provider: 'numeric-tool-arguments',
       permissions: permissive,
     });
@@ -3300,19 +3316,15 @@ describe('agent runtime orchestration', () => {
         };
       } else yield { type: 'done', text: '34' };
     });
-    const tools = {
-      schemas: () => [
-        {
-          name: 'github.repo.list',
-          description: 'List GitHub repositories',
-          parameters: { type: 'object' },
-        },
-      ],
-      execute: async (_name: string, input: { mode: string; limit: number }) =>
-        input.mode === 'count'
-          ? { exitCode: 0, count: 152, limit: input.limit }
-          : { exitCode: 0, count: 50, repositories: [] },
-    } as unknown as ToolRegistry;
+    const tools = new ToolRegistry(root);
+    const github = tools.list().find((tool) => tool.name === 'github.repo.list');
+    if (!github) throw new Error('Missing native GitHub adapter');
+    vi.spyOn(github, 'execute').mockImplementation(async (input) => {
+      const value = input as { mode: string; limit: number };
+      return value.mode === 'count'
+        ? { exitCode: 0, count: 152, limit: value.limit }
+        : { exitCode: 0, count: 50, repositories: [] };
+    });
     const runtime = new AgentRuntime({
       root,
       config: defaultRuntimeConfig(root),
@@ -3321,6 +3333,7 @@ describe('agent runtime orchestration', () => {
       tools,
     });
     const created = runtime.createSession('Repository count invariant');
+    runtime.setSessionApprovalPolicy(created.session.id, 'unguarded');
     const run = runtime.startRun({
       threadId: created.thread.id,
       input: 'List my GitHub repositories and report the exact verified count.',
@@ -3480,6 +3493,15 @@ describe('agent runtime orchestration', () => {
           id: 'tool-1',
           name: 'workspace.write',
           arguments: { path: 'tool.txt', content: 'tool output' },
+        };
+        return;
+      }
+      if (turn === 2) {
+        yield {
+          type: 'tool_call',
+          id: 'tool-readback',
+          name: 'workspace.read',
+          arguments: { path: 'tool.txt' },
         };
         return;
       }
@@ -4438,9 +4460,9 @@ describe('agent runtime orchestration', () => {
       store,
       providers: providerMap({ refusal: refusalProvider, ollama: refusalProvider }),
       tools: new ToolRegistry(root),
-      identityContext: 'bounded identity',
     });
     const created = runtime.createSession('Bounded context');
+    store.updateSessionContext(created.session.id, 'bounded identity');
     store.addMessage(created.thread.id, 'user', 'old message '.repeat(20));
     const run = runtime.startRun({
       threadId: created.thread.id,
@@ -4454,7 +4476,7 @@ describe('agent runtime orchestration', () => {
     expect(store.searchMemoryRows()).toHaveLength(0);
   });
 
-  it('bounds memory injection and isolates memory mutations from prior context', async () => {
+  it('bounds memory injection and retains relevant context for memory mutations', async () => {
     const root = await makeRoot();
     const store = makeStore(root);
     const requests: ProviderRequest[] = [];
@@ -4488,9 +4510,9 @@ describe('agent runtime orchestration', () => {
       store,
       providers: providerMap({ 'bounded-memory': provider, ollama: provider }),
       tools: new ToolRegistry(root),
-      identityContext: 'session instructions',
     });
     const created = runtime.createSession('Bounded memory');
+    store.updateSessionContext(created.session.id, 'session instructions');
     store.addMessage(created.thread.id, 'assistant', 'old conversation that must be bounded');
 
     const contextualRun = runtime.startRun({
@@ -4501,7 +4523,7 @@ describe('agent runtime orchestration', () => {
     await expect(runtime.waitForRun(contextualRun.id)).resolves.toMatchObject({
       status: 'completed',
     });
-    const contextualSystem = requests[0]?.messages[0]?.content ?? '';
+    const contextualSystem = requests[0]?.systemPrompt ?? '';
     const memorySection = contextualSystem.split('Relevant persisted memory:\n')[1] ?? '';
     expect(Buffer.byteLength(memorySection, 'utf8')).toBeLessThanOrEqual(100);
     expect(
@@ -4518,13 +4540,17 @@ describe('agent runtime orchestration', () => {
     await expect(runtime.waitForRun(mutationRun.id)).resolves.toMatchObject({
       status: 'failed',
     });
-    const mutationSystem = requests[1]?.messages[0]?.content ?? '';
-    expect(mutationSystem).not.toContain('Relevant persisted memory:');
+    expect(memorySection).toContain('A');
+    const mutationSystem = requests[1]?.systemPrompt ?? '';
+    expect(mutationSystem).toContain('Relevant persisted memory:');
+    expect(
+      Buffer.byteLength(mutationSystem.split('Relevant persisted memory:\n')[1] ?? '', 'utf8'),
+    ).toBeLessThanOrEqual(100);
     expect(
       requests[1]?.messages.some((message) =>
         message.content.includes('old conversation that must be bounded'),
       ),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       store
         .listEvents()
@@ -4532,7 +4558,7 @@ describe('agent runtime orchestration', () => {
           (event) =>
             event.type === 'memory.retrieved' && event.payload.skipped === 'memory_mutation',
         ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it('reports run timeouts as failures without calling them user cancellations', async () => {
@@ -4817,6 +4843,13 @@ describe('agent runtime orchestration', () => {
       'resume-correlation',
     );
     store.updateRun(failed.id, { status: 'failed' });
+    expect(() => runtime.resumeRun(failed.id)).toThrow(
+      'Run recovery requires retained execution context',
+    );
+    store.saveRunExecutionContext(failed.id, {
+      permissionSource: 'direct',
+      permissions: { approved: ['read'], capabilities: { filesystem: true } },
+    });
     const resumed = runtime.resumeRun(failed.id);
     await expect(runtime.waitForRun(resumed.id)).resolves.toMatchObject({ status: 'completed' });
     const unrecoverable = store.createRun(

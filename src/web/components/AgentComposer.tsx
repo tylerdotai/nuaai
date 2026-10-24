@@ -1,4 +1,5 @@
 import { type RefObject, useEffect, useMemo, useRef, useState } from 'react';
+import { attachmentAccept } from '../attachments.js';
 
 import {
   type ComposerCommand,
@@ -12,15 +13,8 @@ import type {
   PermissionProfile,
   ProviderHealth,
 } from '../contracts.js';
-import { appPath } from '../utils.js';
 
-interface UploadedFile {
-  id: string;
-  name: string;
-  type: string;
-  size: number;
-  url: string;
-}
+export type ComposerAttachment = File & { id: string };
 
 const slashCommands: Array<{ command: string; id: ComposerCommand; label: string }> = [
   { command: '/new', id: 'new-session', label: 'New conversation' },
@@ -42,6 +36,8 @@ export function AgentComposer({
   expanded,
   textareaRef,
   onInput,
+  attachments,
+  onAttachmentsChange: setAttachments,
   onExpanded,
   onSubmit,
   onStop,
@@ -58,47 +54,36 @@ export function AgentComposer({
   queuedItems: Array<{ id: string; prompt: string }>;
   expanded: boolean;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
+  attachments: ComposerAttachment[];
+  onAttachmentsChange: (
+    value: ComposerAttachment[] | ((current: ComposerAttachment[]) => ComposerAttachment[]),
+  ) => void;
   onInput: (value: string) => void;
   onExpanded: (expanded: boolean) => void;
-  onSubmit: (mode: 'next' | 'interrupt', attachments?: UploadedFile[]) => void;
+  onSubmit: (mode: 'next' | 'interrupt', files: File[]) => Promise<boolean> | undefined;
   onStop: () => void;
   onSwitchProvider: (provider: string, model: string) => void;
   onCommand: (command: ComposerCommand) => void;
 }): React.JSX.Element {
   const [focused, setFocused] = useState(false);
   const [followupMode, setFollowupMode] = useState<'next' | 'interrupt'>('next');
-  const [attachments, setAttachments] = useState<Array<File & { id: string }>>([]);
-  const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const action = composerAction({ input, activeRunId });
+  const [submitting, setSubmitting] = useState(false);
+  const action = composerAction({
+    input: input || (attachments.length ? 'Attached files' : ''),
+    activeRunId,
+  });
+  const [isDragOver, setIsDragOver] = useState(false);
   const commandSuggestions = input.trim().startsWith('/')
     ? slashCommands.filter(({ command }) => command.startsWith(input.trim().toLowerCase()))
     : [];
 
-  const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
-  const ALLOWED_TYPES = ['image/', 'text/', 'application/pdf', 'application/json'];
-
-  const validateFile = (file: File): string | null => {
-    if (file.size > MAX_FILE_SIZE) return `${file.name} exceeds 50MB limit`;
-    const allowed = ALLOWED_TYPES.some((type) => file.type.startsWith(type) || file.type === type);
-    if (!allowed) return `${file.name} has unsupported type: ${file.type}`;
-    return null;
-  };
-
-  const addFiles = (files: FileList | File[]) => {
-    const fileArray = Array.from(files);
-    const validFiles: Array<File & { id: string }> = [];
-    for (const file of fileArray) {
-      const error = validateFile(file);
-      if (error) {
-        console.warn(error);
-        continue;
-      }
-      validFiles.push(Object.assign(file, { id: crypto.randomUUID() }));
-    }
-    if (validFiles.length) {
-      setAttachments((current) => [...current, ...validFiles]);
-    }
+  const addFiles = (files: FileList | File[]): void => {
+    if (submitting || !selectedThread || connection !== 'connected') return;
+    setAttachments((current) => [
+      ...current,
+      ...Array.from(files, (file) => Object.assign(file, { id: crypto.randomUUID() })),
+    ]);
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -130,7 +115,10 @@ export function AgentComposer({
     );
     if (imageItems.length) {
       e.preventDefault();
-      const files = imageItems.map((item) => item.getAsFile()).filter(Boolean) as File[];
+      const files = imageItems.flatMap((item) => {
+        const file = item.getAsFile();
+        return file ? [file] : [];
+      });
       addFiles(files);
     }
   };
@@ -161,13 +149,6 @@ export function AgentComposer({
     return options;
   }, [activeProvider, providers]);
 
-  const _getHealthDot = (detail: string, available: boolean): string => {
-    if (!available) return '●';
-    if (detail === 'ready') return '●';
-    if (detail.startsWith('error') || detail.startsWith('failed')) return '○';
-    return '○';
-  };
-
   const getHealthTitle = (detail: string, available: boolean): string => {
     if (!available) return `Unavailable: ${detail}`;
     if (detail === 'ready') return 'Ready';
@@ -187,34 +168,22 @@ export function AgentComposer({
   }, [activeRunId]);
 
   const submit = async (): Promise<void> => {
+    if (submitting) return;
     if (action === 'stop') {
       onStop();
       return;
     }
-    let uploadedFiles: UploadedFile[] | undefined;
-    const hasAttachments = attachments.length > 0;
-    if (hasAttachments) {
-      const formData = new FormData();
-      for (const file of attachments) {
-        formData.append('files', file);
-      }
-      try {
-        const response = await fetch(appPath('/api/uploads'), {
-          method: 'POST',
-          body: formData,
-        });
-        if (response.ok) {
-          const result = (await response.json()) as { files: UploadedFile[] };
-          uploadedFiles = result.files;
-        }
-      } catch {
-        // Upload failed, continue without attachments
-      }
+    if (action !== 'send' && action !== 'queue') return;
+    setSubmitting(true);
+    try {
+      const submitted = attachments;
+      if (await onSubmit(action === 'send' ? 'next' : followupMode, submitted))
+        setAttachments((current) =>
+          current.filter((file) => !submitted.some((sent) => sent.id === file.id)),
+        );
+    } finally {
+      setSubmitting(false);
     }
-    if (action === 'send') {
-      onSubmit('next', uploadedFiles);
-      if (hasAttachments) setAttachments([]);
-    } else if (action === 'queue') onSubmit(followupMode, uploadedFiles);
   };
 
   return (
@@ -247,6 +216,7 @@ export function AgentComposer({
               <button
                 type="button"
                 aria-label={`Remove ${file.name}`}
+                disabled={submitting}
                 onClick={() => setAttachments((current) => current.filter((f) => f.id !== file.id))}
               >
                 ×
@@ -259,6 +229,8 @@ export function AgentComposer({
       <input
         ref={fileInputRef}
         type="file"
+        accept={attachmentAccept}
+        disabled={submitting}
         multiple
         className="sr-only"
         tabIndex={-1}
@@ -307,7 +279,7 @@ export function AgentComposer({
             onKeyDown={(event) => {
               if (event.nativeEvent.isComposing || event.key !== 'Enter' || event.shiftKey) return;
               event.preventDefault();
-              if (input.trim()) submit();
+              if (input.trim() || attachments.length) void submit();
             }}
             onPaste={handlePaste}
           />
@@ -325,14 +297,16 @@ export function AgentComposer({
                   : 'Send next'
                 : 'Send message'
           }
-          disabled={action === 'disabled' || !selectedThread || connection !== 'connected'}
+          disabled={
+            submitting || action === 'disabled' || !selectedThread || connection !== 'connected'
+          }
           onClick={submit}
         >
           <span aria-hidden="true">{action === 'stop' ? '■' : '↑'}</span>
         </button>
       </div>
 
-      {activeRunId && input.trim() && (
+      {activeRunId && (input.trim() || attachments.length > 0) && (
         <div className="composer-followup-modes" aria-label="Follow-up behavior">
           <button
             type="button"
@@ -409,7 +383,8 @@ export function AgentComposer({
             type="button"
             className="composer-attach"
             aria-label="Attach files"
-            title="Attach files"
+            title="UTF-8 text/source files, PNG, JPEG, WebP · 4 files · 512 KiB total"
+            disabled={submitting || connection !== 'connected' || !selectedThread}
             onClick={() => fileInputRef.current?.click()}
           >
             📎

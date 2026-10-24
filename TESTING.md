@@ -15,12 +15,14 @@ failure is the operator's local machine, but several paths can still delete
 data, exfiltrate secrets, or render the harness unusable. Those paths get
 high test density and high mutation pressure. Boilerplate gets less.
 
-### Critical paths (≥80% coverage per file, mutation score ≥80%)
+### Critical paths (per-file coverage; mutation target 80%)
 
 Anything that authenticates a caller, persists data, executes a tool on
 the operator's behalf, or talks to the network falls in this tier. Each
-file under these globs must satisfy the coverage thresholds declared in
-`vitest.config.ts` and the mutation score declared in `stryker.config.mjs`.
+file under these globs must satisfy the combined coverage floors declared in
+`vitest.config.ts`: 80% lines/statements and 75% functions/branches per file.
+`stryker.config.mjs` sets an overall mutation break threshold of 60% and a
+high-score target of 80%; it does not enforce a separate per-file mutation floor.
 
 | Concern | Source | Why |
 |---|---|---|
@@ -37,7 +39,7 @@ file under these globs must satisfy the coverage thresholds declared in
 | Skills / plugins | `src/skills/*.ts`, `src/plugins/*.ts` | A bug here executes arbitrary instructions or imports arbitrary code |
 | Workspace containment | `src/workspace/fs.ts` | A bug here can escape the project root or follow a symlink outside it |
 
-### Standard paths (≥80% coverage per file)
+### Standard paths (80% lines/statements, 75% functions/branches per file)
 
 Everything else inside `src/` that is not excluded from coverage. This
 covers CLI plumbing, daemon lifecycle, runtime orchestration, scheduler,
@@ -66,7 +68,7 @@ E2E suites:
 | Unit | vitest | `tests/**/*.test.ts` excluding `*.integration.test.ts` | Every push |
 | Integration | vitest | `tests/**/*.integration.test.ts` | Every PR |
 | End-to-end | Playwright | `tests/e2e/*.spec.ts` | Every PR and merge to main |
-| Mutation | Stryker (vitest runner) | critical paths only | Every PR and merge to main |
+| Mutation | Stryker (vitest runner) | critical paths only | Full nightly/manual audit; focused checks for critical changes |
 
 ### Unit tier
 
@@ -110,13 +112,17 @@ journey in the manifest, and a regression in this tier is a release blocker.
 defined in `stryker.config.mjs`. Stryker mutates arithmetic, comparison,
 boolean, and control-flow mutants (excluding string-literal and
 unary-operator mutants, which are usually killed by accident). The test
-suite must kill at least 60% of mutants per file (`thresholds.low` and
-`thresholds.break`); 80% is the bar for the suite overall
-(`thresholds.high`).
+suite must reach an overall mutation score of at least 60%
+(`thresholds.break`); `thresholds.low` is also 60%, and 80% is the
+high-score target (`thresholds.high`). These are overall thresholds, not
+per-file enforcement; per-file reports still guide critical-path review.
 
-The mutation suite is slow and runs on every PR; it is not a gate on
-every commit. A regression in the mutation score is treated as a
-critical-path defect, not a flake.
+The full mutation suite is a nightly/manual test-quality audit, not a PR
+merge gate. Ordinary tests, coverage, security scans, builds and browser/package/
+terminal checks remain blocking. For critical changes, reviewers use bounded,
+focused mutation checks on the affected modules or ranges and record their scope.
+A demonstrated surviving security/authority defect still requires a fix; moving
+the broad audit off PR CI does not make such defects acceptable.
 
 ## What a test must look like
 
@@ -167,19 +173,24 @@ defect and a release blocker.
 
 ## Coverage thresholds
 
-Two thresholds, enforced separately because no single tier can reach
-every critical-path file:
+Coverage is configured separately for each tier because neither tier alone
+can reach every critical-path file:
 
-- **Unit tier (`vitest.unit.config.ts`)** — 60% global floor on lines,
-  functions, branches, statements. Catches the easy bugs fast. Run
-  with `npm run test:unit -- --coverage`.
-- **Integration tier (`vitest.integration.config.ts`)** — 80% per-file
-  floor on every in-scope source file. Catches the bugs that only show
-  up at the SQLite / HTTP / subprocess boundary. Run with
-  `npm run test:integration -- --coverage`.
+- **Unit tier (`vitest.unit.config.ts`)** — 55% global floor on lines,
+  functions, branches and statements. Run with
+  `npm run test:unit -- --coverage`. A passing unit coverage job does not
+  establish combined per-file coverage.
+- **Integration tier (`vitest.integration.config.ts`)** — if coverage is
+  requested, 80% per-file on all four metrics for every in-scope source
+  file. This tier alone need not reach every file; CI runs its tests
+  without coverage, then runs the combined gate below.
+- **Combined gate (`vitest.config.ts`)** — `npm run test:coverage` runs
+  all unit and integration tests together, enforcing **80% lines and
+  statements, 75% functions and branches per file**. An aggregate total
+  above those floors cannot compensate for an individual file below one.
 
-The combined gate (`vitest.config.ts`, used by `npm run test:coverage`)
-runs every test in one shot and enforces the 80% per-file floor.
+The configured floors above describe current enforcement, not a request to
+reduce thresholds when a test fails. The source configuration is authoritative.
 
 Excluded files in all three configs:
 
@@ -191,7 +202,7 @@ Excluded files in all three configs:
 To check coverage locally:
 
 ```sh
-npm run test:coverage              # combined gate (full suite, 80% per-file)
+npm run test:coverage              # combined per-file floors: 80% lines/statements, 75% functions/branches
 npx vitest run --config vitest.unit.config.ts --coverage       # unit tier
 npx vitest run --config vitest.integration.config.ts --coverage # integration tier
 ```
@@ -206,14 +217,27 @@ mutant means the test suite did not detect the injected fault.
 To run mutation testing locally:
 
 ```sh
-npm run test:mutate
+npm run test:mutate                                      # full configured audit
+npm run test:mutate -- --mutate src/core/approvals.ts --concurrency 2 # focused module
 ```
 
-Reports are written to `reports/mutation/`. Upload the JSON file to
-`https://dashboard.stryker-mutator.io/` for trend tracking.
+Reports are written to `reports/mutation/`. The separate
+`.github/workflows/mutation.yml` runs the unchanged full critical-path scope
+nightly at 06:00 UTC on the default branch, or on manual dispatch. Its optional
+`mutate` input explicitly selects files/ranges for a focused manual audit; a
+focused result must never be labeled a full-scope pass. The workflow uses two
+workers and a finite six-hour wall budget. A budget expiry is incomplete evidence,
+not a passing score. Summary/artifact upload is best-effort: a job-wide timeout or
+cancellation can prevent even `always()` steps from running. Preserve available
+reports and Actions logs rather than claiming guaranteed evidence capture.
 
-The mutation job is gated on every PR and merge to main. A drop of more
-than 5% in the overall killed rate blocks the merge.
+The score break threshold remains **60% overall**, with an **80% target**; scope,
+operators and thresholds in `stryker.config.mjs` are unchanged. The audit job
+fails normally on errors or a low score (no `continue-on-error`), but is not a
+PR-triggered check and does not block the ordinary quality pipeline. No historical
+5% regression comparison is configured. Review audit failures as test-quality
+findings, retaining exact revision, scope, resource profile and incomplete work.
+Do not hand-edit reports or reuse stale source/test/helper results as acceptance.
 
 ## How to run each tier
 
@@ -223,7 +247,7 @@ npm run test:unit       # unit only — runs in seconds, run on every commit
 npm run test:integration # integration only — runs in under a minute
 npm run test:e2e         # Playwright against a real daemon
 npm run test:coverage   # unit + integration with v8 coverage gate
-npm run test:mutate      # Stryker against critical paths
+npm run test:mutate      # full nightly/manual audit; use --mutate for focused checks
 npm run gate             # full release gate (version, lint, coverage, e2e, package smoke, audit)
 ```
 
@@ -235,14 +259,20 @@ npm run gate             # full release gate (version, lint, coverage, e2e, pack
 |---|---|---|
 | `lint` | every push | Biome + TypeScript |
 | `unit` | every push | Unit suite + coverage gate |
-| `integration` | PR + main | Integration suite |
+| `integration` | PR + main | Integration suite, then combined per-file coverage |
 | `e2e` | PR + main | Playwright against the production bundle |
-| `mutation` | PR + main | Stryker against critical paths |
 | `quality` | PR + main | Release gate (version, gate, diff hygiene, npm pack on tags) |
 
-Jobs are wired with `needs:` so a failure in any earlier stage blocks
-the downstream gate. `concurrency.cancel-in-progress: true` aborts
-in-flight runs when a new commit lands.
+The separate `mutation.yml` workflow runs the full mutation audit nightly/manual
+only; it is not part of PR merge-blocking CI. Manual focused audits use the same
+configuration with an explicitly recorded selector. It preserves real failure
+conclusions and attempts evidence upload on failure; job-wide timeout/cancellation
+can prevent that best-effort upload.
+
+Ordinary CI jobs are wired with `needs:` so a failure in an earlier stage blocks
+the downstream quality gate. Its `concurrency.cancel-in-progress: true` aborts
+obsolete PR runs when a new commit lands. Mutation audit concurrency is separate
+and does not cancel an active audit for each PR update.
 
 ## Policy on flaky tests
 
@@ -273,8 +303,10 @@ without any code change. Flakiness is a defect, not a fact of life:
 4. Write the failing assertion first. If the test passes on the
    first run, you have not tested anything.
 5. Run `npm run test:unit` and confirm the suite still passes.
-6. If the new test is on a critical path, run `npm run test:mutate`
-   locally and confirm the mutation score holds.
+6. If the new test is on a critical path, run a bounded focused check such as
+   `npm run test:mutate -- --mutate src/core/approvals.ts --concurrency 2`.
+   Record the exact module/range, score and any incomplete work. Leave full-scope
+   auditing to the nightly/manual workflow; do not claim a focused pass covers it.
 
 ## Policy on new source files
 

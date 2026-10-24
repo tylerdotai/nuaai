@@ -55,6 +55,7 @@ function services() {
   };
   const media = { inspect: async (path: string) => ({ path, kind: 'text' }) };
   const agents = {
+    available: () => true,
     list: () => ['local-agent'],
     dispatch: async (agent: string, prompt: string) => ({ agent, prompt, ok: true }),
   };
@@ -255,7 +256,8 @@ describe('model-facing tool registry contracts', () => {
     };
 
     expect(
-      ((await registry.execute('workspace.list', {}, context)) as unknown[]).length,
+      ((await registry.execute('workspace.list', {}, context)) as { entries: unknown[] }).entries
+        .length,
     ).toBeGreaterThan(0);
     expect(await registry.execute('workspace.read', { path: 'note.txt' }, context)).toBe(
       'vision and schedule',
@@ -274,10 +276,9 @@ describe('model-facing tool registry contracts', () => {
     ).toEqual({
       written: 'out.txt',
     });
-    expect(
-      ((await registry.execute('workspace.search', { query: 'vision' }, context)) as unknown[])
-        .length,
-    ).toBe(1);
+    expect(await registry.execute('workspace.search', { query: 'vision' }, context)).toMatchObject({
+      matches: [{ file: 'note.txt', line: 1, text: 'vision and schedule' }],
+    });
     expect(
       await registry.execute('workspace.command', { command: 'printf', args: ['ok'] }, context),
     ).toMatchObject({
@@ -397,7 +398,10 @@ describe('model-facing tool registry contracts', () => {
     expect(await registry.execute('media.inspect', { path: 'note.txt' }, context)).toMatchObject({
       kind: 'text',
     });
-    expect(await registry.execute('agent.list', {}, context)).toEqual({ agents: ['local-agent'] });
+    expect(await registry.execute('agent.list', {}, context)).toEqual({
+      agents: ['local-agent'],
+      available: true,
+    });
     expect(
       await registry.execute('agent.dispatch', { agent: 'local-agent', prompt: 'hello' }, context),
     ).toMatchObject({ ok: true });

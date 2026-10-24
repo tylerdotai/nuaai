@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { type IncomingMessage, createServer, request as proxyRequest } from 'node:http';
 import { join } from 'node:path';
 
 import { expect, test } from '@playwright/test';
@@ -36,7 +37,9 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await expect(commandPalette.getByRole('button', { name: /Cancel active run/ })).toBeDisabled();
   await commandPalette.getByRole('button', { name: 'Close commands' }).click();
 
-  const initialSessionCount = await page.locator('.session-row').count();
+  const initialSessions = await page.request.get('/api/sessions');
+  const initialSessionCount = (await initialSessions.json()).sessions.length;
+  await expect(page.locator('.session-row')).toHaveCount(initialSessionCount);
   await page.locator('.new-conversation-button').click();
   await expect(page.locator('.session-row')).toHaveCount(initialSessionCount + 1);
   const selectedSession = page.locator('.session-row-wrap.selected');
@@ -374,7 +377,8 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
     .locator('.primary-nav')
     .getByRole('tab', { name: /Memory/ })
     .click();
-  await expect(page.getByRole('tabpanel')).toContainText('Only information intentionally saved');
+  await expect(page.getByRole('tabpanel')).toContainText('selectively learned project knowledge');
+  await expect(page.getByRole('combobox', { name: 'Agent learning' })).toBeEnabled();
   await expect(page.locator('[aria-label="Memory records"]')).toBeVisible();
 
   await page
@@ -394,10 +398,39 @@ test('v1 conversation UI completes durable, structured, queued, failed, and resp
   await page.getByLabel('Schedule name').fill(scheduleName);
   await page.getByLabel('Schedule agent input').fill('Say hello.');
   await page.getByRole('button', { name: 'Create automation' }).click();
-  const scheduleRow = page.locator('.schedule-row').filter({ hasText: scheduleName });
-  await expect(scheduleRow).toBeVisible();
-  await scheduleRow.getByRole('button', { name: 'Run' }).click();
-  await expect(scheduleRow).toBeVisible();
+  const automationCard = page
+    .getByLabel('Schedules', { exact: true })
+    .locator('.schedule-row')
+    .filter({ has: page.getByRole('heading', { name: scheduleName, exact: true }) });
+  await expect(automationCard).toBeVisible();
+  const scheduleResponse = await page.request.get('/api/schedules');
+  expect(scheduleResponse.ok()).toBe(true);
+  const { schedules } = (await scheduleResponse.json()) as {
+    schedules: Array<{ id: string; name: string; agentInput: string }>;
+  };
+  const createdSchedule = schedules.find((schedule) => schedule.name === scheduleName);
+  expect(createdSchedule?.agentInput).toBe('Say hello.');
+  await automationCard.getByRole('button', { name: 'Run', exact: true }).click();
+  await expect
+    .poll(
+      async () => {
+        const response = await page.request.get('/api/tasks');
+        expect(response.ok()).toBe(true);
+        const { tasks } = (await response.json()) as {
+          tasks: Array<{
+            scheduleId: string | null;
+            status: string;
+            payload: { agentInput?: string };
+          }>;
+        };
+        const completed = tasks.find(
+          (task) => task.scheduleId === createdSchedule?.id && task.status === 'completed',
+        );
+        return completed && { status: completed.status, input: completed.payload.agentInput };
+      },
+      { timeout: 30_000 },
+    )
+    .toEqual({ status: 'completed', input: 'Say hello.' });
 
   await page.setViewportSize({ width: 390, height: 844 });
   const mobileTabs = page.locator('.mobile-nav').getByRole('tab');
@@ -532,15 +565,17 @@ test('a failed optional provider switch keeps the active runtime healthy', async
     .getByRole('tab', { name: /System/ })
     .click();
 
-  const codex = page.locator('.provider-row').filter({ hasText: 'Codex' });
+  const codex = page.locator('.provider-row').filter({ hasText: /codex/i });
   await codex.getByRole('button', { name: 'gpt-test' }).click();
 
   await expect(page.locator('.connection')).toContainText('Codex unavailable', {
     timeout: 10_000,
   });
-  await expect(codex.locator('.provider-info .provider-status')).toContainText('Offline');
+  await expect(codex.locator('.provider-status')).toContainText('Offline');
   await expect(page.getByRole('alert')).toHaveCount(0);
-  await expect(page.locator('.current-model')).toContainText(/deterministic/i);
+  await expect(page.locator('.current-model').first()).toContainText(
+    /deterministic · deterministic/i,
+  );
 });
 
 test('mobile safe-area space keeps chat and system UI outside device insets', async ({ page }) => {
@@ -645,6 +680,221 @@ test('a long multi-turn response survives reload without draft concatenation or 
   expect(browserErrors).toEqual([]);
 });
 
+test('SSE reconnect recovers missed output with the native cursor and deduplicates replay at the app mount', async ({
+  page,
+  baseURL,
+}) => {
+  const e2eRoot = process.env.NUAAI_E2E_ROOT;
+  if (!e2eRoot) throw new Error('NUAAI_E2E_ROOT is required');
+  const daemon = new URL(baseURL ?? '');
+  if (daemon.protocol !== 'http:' || daemon.hostname !== '127.0.0.1' || !daemon.port)
+    throw new Error('Expected a trusted loopback test daemon');
+  const destination = { protocol: 'http:', hostname: '127.0.0.1', port: Number(daemon.port) };
+  let proxyHost = '';
+  const runId = 'reconnect-fixture';
+  const cursor = 1_000_000_003;
+  const reconnectHeaders: Array<string | undefined> = [];
+  let connections = 0;
+  let admissions = 0;
+  let disconnectStream: () => void = () => undefined;
+  let foreignRequests = 0;
+  const decoy = createServer((_request, response) => {
+    foreignRequests += 1;
+    response.end('isolated decoy');
+  });
+  await new Promise<void>((resolve) => decoy.listen(0, '127.0.0.1', resolve));
+  const decoyAddress = decoy.address();
+  if (!decoyAddress || typeof decoyAddress === 'string')
+    throw new Error('Expected isolated decoy port');
+  const server = createServer(async (request, response) => {
+    const target = request.url ?? '';
+    // Only origin-form mounted paths are accepted. Neither incoming Host nor an
+    // absolute request target can select the proxy's outbound network authority.
+    if (
+      !target.startsWith('/nuaai/') ||
+      target.includes('\\') ||
+      request.headers.host !== proxyHost
+    ) {
+      response.writeHead(400);
+      response.end();
+      return;
+    }
+    const url = new URL(target, 'http://fixture.invalid');
+    if (!url.pathname.startsWith('/nuaai/')) {
+      response.writeHead(400);
+      response.end();
+      return;
+    }
+    if (url.pathname === `/nuaai/api/runs/${runId}`) {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ status: 'running' }));
+      return;
+    }
+    if (url.pathname === '/nuaai/api/runs' && request.method === 'POST') admissions += 1;
+    if (url.pathname !== '/nuaai/api/agent/stream' || !request.headers.cookie) {
+      const proxy = proxyRequest(
+        {
+          ...destination,
+          path: `${url.pathname}${url.search}`,
+          method: request.method,
+          headers: { ...request.headers, host: daemon.host },
+        },
+        (upstream) => {
+          response.writeHead(upstream.statusCode ?? 502, upstream.headers);
+          upstream.pipe(response);
+        },
+      );
+      proxy.on('error', () => response.destroy());
+      request.pipe(proxy);
+      return;
+    }
+    expect(request.headers.cookie).toContain('nuaai_token=');
+    expect(url.searchParams.has('token')).toBe(false);
+    const sessionId = url.searchParams.get('session_id');
+    if (!sessionId || !/^[a-zA-Z0-9_-]{1,128}$/u.test(sessionId)) {
+      response.writeHead(400);
+      response.end();
+      return;
+    }
+    const detail = await new Promise<IncomingMessage>((resolve, reject) => {
+      const lookup = proxyRequest(
+        {
+          ...destination,
+          path: `/nuaai/api/sessions/${encodeURIComponent(sessionId)}`,
+          headers: { cookie: request.headers.cookie ?? '', host: daemon.host },
+        },
+        resolve,
+      );
+      lookup.on('error', reject);
+      lookup.end();
+    });
+    expect(detail.statusCode).toBe(200);
+    const chunks: Buffer[] = [];
+    for await (const chunk of detail) chunks.push(Buffer.from(chunk));
+    const { threads } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const threadId = threads[0].id;
+    const event = (id: number, type: string, payload: Record<string, unknown>) =>
+      `id: ${id}\nevent: ${type === 'model.delta' ? 'token' : 'status'}\ndata: ${JSON.stringify({
+        id,
+        event: { id, type, sessionId, threadId, runId, createdAt: 1, payload },
+      })}\n\n`;
+    connections += 1;
+    if (connections === 1) {
+      // A finite SSE response simulates a dropped stream after its last event.
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end(
+        [
+          'retry: 100\n\n',
+          event(cursor - 1, 'run.started', {}),
+          event(cursor, 'model.delta', { text: 'Before disconnect. ' }),
+        ].join(''),
+      );
+      return;
+    }
+    const header = request.headers['last-event-id'] as string | undefined;
+    reconnectHeaders.push(header);
+    // Match the daemon contract: only a header cursor requests missed events.
+    // Include an overlapping record to exercise the client's monotonic dedupe.
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    disconnectStream = () => {
+      response.end();
+    };
+    response.write(
+      [
+        'retry: 100\n\n',
+        header === String(cursor)
+          ? [
+              event(cursor, 'model.delta', { text: 'Before disconnect. ' }),
+              event(cursor + 1, 'model.delta', { text: 'Recovered missed output.' }),
+            ].join('')
+          : ': no replay requested\n\n',
+      ].join(''),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Expected isolated proxy port');
+  proxyHost = `127.0.0.1:${address.port}`;
+  try {
+    for (const target of [
+      `http://127.0.0.1:${decoyAddress.port}/nuaai/health`,
+      `//127.0.0.1:${decoyAddress.port}/nuaai/health`,
+      '/nuaai/../../health',
+      '/nuaai/%2e%2e/%2e%2e/health',
+      '/nuaai/api/agent/stream?session_id=..%2F..%2Fhealth',
+    ]) {
+      const status = await new Promise<number>((resolve, reject) => {
+        const request = proxyRequest(
+          {
+            hostname: '127.0.0.1',
+            port: address.port,
+            path: target,
+            headers: { cookie: 'nuaai_token=synthetic-test-only' },
+          },
+          (response) => {
+            response.resume();
+            response.on('end', () => resolve(response.statusCode ?? 0));
+          },
+        );
+        request.on('error', reject);
+        request.end();
+      });
+      expect(status).toBe(400);
+    }
+    const foreignHostStatus = await new Promise<number>((resolve, reject) => {
+      const request = proxyRequest(
+        {
+          hostname: '127.0.0.1',
+          port: address.port,
+          path: '/nuaai/',
+          headers: { host: 'foreign.invalid' },
+        },
+        (response) => {
+          response.resume();
+          response.on('end', () => resolve(response.statusCode ?? 0));
+        },
+      );
+      request.on('error', reject);
+      request.end();
+    });
+    expect(foreignHostStatus).toBe(400);
+    expect(foreignRequests).toBe(0);
+    await page.goto(
+      `http://127.0.0.1:${address.port}/nuaai/#token=${encodeURIComponent(createBrowserPairingToken(e2eRoot))}`,
+    );
+    await expect(page.locator('.connection')).toContainText('Connected');
+    if ((await page.locator('.session-row').count()) === 0)
+      await page.locator('.new-conversation-button').click();
+    const assistant = page.locator('.message-assistant').last();
+    await expect(assistant).toContainText('Before disconnect.');
+    await expect.poll(() => reconnectHeaders).toContain(String(cursor));
+    await expect(assistant).toContainText('Before disconnect. Recovered missed output.');
+    await expect(assistant).not.toContainText('Before disconnect. Before disconnect.');
+    expect(reconnectHeaders[0]).toBe(String(cursor));
+    expect(connections).toBeGreaterThanOrEqual(2);
+    expect(admissions).toBe(0);
+    // Removing the real session cookie makes the daemon reject native reconnect.
+    // A terminal 401 must surface pairing guidance instead of endless retries.
+    await page.context().clearCookies();
+    disconnectStream();
+    await expect(page.getByRole('alert')).toContainText('Pair this device to continue.');
+    await expect(page.locator('.connection')).toContainText('Offline');
+    expect(admissions).toBe(0);
+  } finally {
+    await page.close();
+    server.closeAllConnections();
+    decoy.closeAllConnections();
+    await Promise.all(
+      [server, decoy].map(
+        (listener) =>
+          new Promise<void>((resolve, reject) =>
+            listener.close((error) => (error ? reject(error) : resolve())),
+          ),
+      ),
+    );
+  }
+});
+
 test('a stale terminal poll failure cannot surface in a newly selected thread', async ({
   page,
 }) => {
@@ -742,7 +992,7 @@ test('an accepted run is not restored to the composer when its refresh fails', a
   await page.getByRole('button', { name: 'Send message', exact: true }).click();
 
   await expect(page.getByRole('alert')).toContainText(
-    'Run accepted, but conversation refresh failed',
+    'Run accepted, but client reconciliation failed',
   );
   await expect(composer).toHaveValue('');
 });

@@ -147,6 +147,7 @@ export function approvalTarget(toolName: string, argumentsValue: Record<string, 
   };
   const targetKeys: Record<string, string[]> = {
     'workspace.write': ['path'],
+    'host.command': ['command'],
     'github.repo.list': ['owner'],
     'memory.forget': ['id'],
     'schedule.create': ['name'],
@@ -157,6 +158,7 @@ export function approvalTarget(toolName: string, argumentsValue: Record<string, 
     'task.cancel': ['id'],
     'provider.switch': ['provider', 'model'],
     'mcp.execute': ['name'],
+    'plugin.execute': ['name'],
     'agent.dispatch': ['agent'],
   };
   if (toolName === 'computer.use') {
@@ -187,6 +189,12 @@ export function boundedApprovalPreview(value: unknown, maximum = 500): string {
 type PreviewFieldMode = 'code' | 'opaque';
 
 const previewFieldSpecs: Record<string, Array<[string, string, PreviewFieldMode?]>> = {
+  'host.command': [
+    ['command', 'Command', 'opaque'],
+    ['args', 'Arguments', 'opaque'],
+    ['stdin', 'Standard input', 'opaque'],
+    ['timeoutMs', 'Timeout ms'],
+  ],
   'workspace.command': [
     ['command', 'Command', 'opaque'],
     ['args', 'Arguments', 'opaque'],
@@ -226,6 +234,7 @@ const previewFieldSpecs: Record<string, Array<[string, string, PreviewFieldMode?
     ['model', 'Model'],
   ],
   'mcp.execute': [['name', 'MCP tool']],
+  'plugin.execute': [['name', 'Plugin']],
   'agent.dispatch': [
     ['agent', 'Agent'],
     ['prompt', 'Prompt', 'opaque'],
@@ -295,6 +304,7 @@ const previewLabels = new Set([
   'Content size',
   'Content SHA-256',
   'Action',
+  'Execution boundary',
   ...[...Object.values(previewFieldSpecs), ...Object.values(computerFieldSpecs)].flatMap((fields) =>
     fields.flatMap(([, label, mode]) =>
       mode === 'opaque' ? [`${label} size`, `${label} SHA-256`] : [label],
@@ -415,10 +425,112 @@ export function buildApprovalPreview(
   return {
     version: 1,
     kind: toolName,
-    summary: `Run ${toolName}`,
-    fields: fieldsFromSpecs(argumentsValue, previewFieldSpecs[toolName] ?? []),
+    summary:
+      toolName === 'host.command' ? 'Host-account CLI (not workspace-confined)' : `Run ${toolName}`,
+    fields: [
+      ...(toolName === 'host.command'
+        ? [
+            {
+              label: 'Execution boundary',
+              value: 'Host OS account access; not a workspace filesystem sandbox',
+            },
+          ]
+        : []),
+      ...fieldsFromSpecs(argumentsValue, previewFieldSpecs[toolName] ?? []),
+    ],
     context: previewContext(context.permissionSource, context.sessionId),
   };
+}
+
+// Live review only. Never persist this preview or include it in durable events.
+// Unknown sensitive values cannot be inferred: known credential files are opaque.
+export function buildTransientApprovalPreview(
+  toolName: string,
+  argumentsValue: Record<string, unknown>,
+  context: { permissionSource: string; sessionId?: string | null },
+): ApprovalPreviewV1 {
+  const preview = buildApprovalPreview(toolName, argumentsValue, context);
+  const reviewText = (value: unknown): string => {
+    let text = typeof value === 'string' ? value : (JSON.stringify(redactValue(value)) ?? '');
+    text = text
+      .replace(
+        /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g,
+        '[REDACTED PRIVATE KEY]',
+      )
+      .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[REDACTED]@')
+      .replace(
+        /(--?(?:token|password|passwd|secret|api[-_]?key|authorization|cookie))([=\s]+)(?:"[^"]*"|'[^']*'|[^\s]+)/gi,
+        '$1$2[REDACTED]',
+      );
+    text = [...redactText(text)]
+      .filter(
+        (character) =>
+          character === '\n' ||
+          character === '\t' ||
+          ((character.codePointAt(0) ?? 0) >= 32 && character !== String.fromCharCode(127)),
+      )
+      .join('');
+    return text.length <= 1_600 ? text : `${text.slice(0, 1_580)}\n[truncated]`;
+  };
+  const fields: ApprovalPreviewField[] = [];
+  if (toolName === 'workspace.write') {
+    const path = typeof argumentsValue.path === 'string' ? argumentsValue.path : '';
+    const protectedPath =
+      /(?:^|[/\\])(?:\.env(?:\..*)?|[^/\\]*(?:credential|secret|private[-_]?key)[^/\\]*|id_(?:rsa|ed25519)|[^/\\]*\.(?:pem|key))$/i.test(
+        path,
+      );
+    fields.push({
+      label: 'Proposed text (transient)',
+      value: protectedPath ? '[REDACTED credential file]' : reviewText(argumentsValue.content),
+      format: 'code',
+    });
+  } else if (toolName === 'workspace.command' || toolName === 'host.command') {
+    fields.push({
+      label: 'Command (transient)',
+      value: reviewText(argumentsValue.command),
+      format: 'code',
+    });
+    if (toolName === 'host.command' && argumentsValue.stdin !== undefined)
+      fields.push({
+        label: 'Standard input (transient)',
+        value: reviewText(argumentsValue.stdin),
+        format: 'code',
+      });
+    // Preserve argument boundaries: a credential flag protects the entire next value.
+    let hideNext = false;
+    const args = Array.isArray(argumentsValue.args)
+      ? argumentsValue.args.map((argument) => {
+          if (hideNext) {
+            hideNext = false;
+            return '[REDACTED]';
+          }
+          const text = String(argument);
+          const flag = text.match(
+            /^(--?(?:token|password|passwd|secret|api[-_]?key|authorization|cookie))(=|$)/i,
+          );
+          if (flag) {
+            hideNext = flag[2] !== '=';
+            return flag[2] === '=' ? `${flag[1]}=[REDACTED]` : text;
+          }
+          return reviewText(text);
+        })
+      : argumentsValue.args;
+    fields.push({
+      label: 'Arguments (transient)',
+      value: reviewText(args),
+      format: 'code',
+    });
+  } else {
+    for (const [key, label, mode] of previewFieldSpecs[toolName] ?? []) {
+      if (mode === 'opaque' && argumentsValue[key] !== undefined)
+        fields.push({
+          label: `${label} (transient)`,
+          value: reviewText(argumentsValue[key]),
+          format: 'code',
+        });
+    }
+  }
+  return { ...preview, fields: [...preview.fields, ...fields].slice(0, 12) };
 }
 
 function storedApprovalPreview(row: ApprovalRequestRow): ApprovalPreviewV1 {

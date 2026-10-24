@@ -74,6 +74,15 @@ function runtimeProvider(name = 'test'): ProviderAdapter {
         yield { type: 'done', text: '' };
         return;
       }
+      if (!request.messages.some((message) => message.toolName === 'workspace.read')) {
+        yield {
+          type: 'tool_call',
+          id: 'readback-call',
+          name: 'workspace.read',
+          arguments: { path: 'approved.txt' },
+        };
+        return;
+      }
       yield { type: 'done', text: 'Approved write completed.' };
     },
     async embed() {
@@ -266,7 +275,7 @@ describe('runtime approval boundary', () => {
       root,
       config: {
         ...config,
-        limits: { ...config.limits, maxToolCalls: 1, maxToolCostUnits: 2 },
+        limits: { ...config.limits, maxToolCalls: 2, maxToolCostUnits: 3 },
       },
       store,
       providers: providerMap(provider),
@@ -312,7 +321,9 @@ describe('runtime approval boundary', () => {
     expect(
       store
         .listEventsForThread(created.thread.id, 0, 100)
-        .events.filter((event) => event.type === 'tool.started'),
+        .events.filter(
+          (event) => event.type === 'tool.started' && event.payload.name === 'workspace.write',
+        ),
     ).toHaveLength(1);
     expect(
       store
@@ -408,7 +419,7 @@ describe('runtime approval boundary', () => {
       root,
       config: {
         ...config,
-        limits: { ...config.limits, maxToolCalls: 1, maxToolCostUnits: 2 },
+        limits: { ...config.limits, maxToolCalls: 2, maxToolCostUnits: 3 },
       },
       store,
       providers: providerMap(provider),
@@ -445,7 +456,7 @@ describe('runtime approval boundary', () => {
       root,
       config: {
         ...config,
-        limits: { ...config.limits, maxToolCalls: 1, maxToolCostUnits: 2 },
+        limits: { ...config.limits, maxToolCalls: 2, maxToolCostUnits: 3 },
       },
       store: reopened,
       providers: providerMap(provider),
@@ -465,7 +476,11 @@ describe('runtime approval boundary', () => {
     const runEvents = reopened
       .listEventsForThread(created.thread.id, 0, 200)
       .events.filter((event) => event.runId === run.id);
-    expect(runEvents.filter((event) => event.type === 'tool.started')).toHaveLength(1);
+    expect(
+      runEvents.filter(
+        (event) => event.type === 'tool.started' && event.payload.name === 'workspace.write',
+      ),
+    ).toHaveLength(1);
     expect(runEvents.filter((event) => event.type === 'artifact.created')).toHaveLength(1);
     expect(runEvents.filter((event) => event.type === 'run.failed')).toHaveLength(0);
   });
@@ -1052,7 +1067,7 @@ describe('authenticated API and operator clients', () => {
       body: JSON.stringify({ payloadHash: pending.payloadHash }),
     });
     expect(approved.status).toBe(200);
-    expect(approveApproval).toHaveBeenLastCalledWith(pending.id, pending.payloadHash);
+    expect(approveApproval).toHaveBeenLastCalledWith(pending.id, pending.payloadHash, 'once');
     const denied = await fetch(`${baseUrl}/api/approvals/${pending.id}/deny`, {
       method: 'POST',
       headers,

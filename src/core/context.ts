@@ -1,4 +1,4 @@
-import type { ProviderMessage } from '../providers/types.js';
+import type { ProviderMessage, ProviderRequest } from '../providers/types.js';
 
 const tokensPerUtf8Byte = 3;
 const messageEnvelopeTokens = 6;
@@ -59,6 +59,76 @@ export function estimateToolSchemaTokens(tools: unknown[]): number {
   return tools.length ? 12 + estimateTokens(JSON.stringify(tools)) : 0;
 }
 
+export class ContextBudgetError extends Error {
+  readonly code = 'CONTEXT_BUDGET_EXCEEDED';
+  constructor(
+    readonly estimatedTokens: number,
+    readonly maxTokens: number,
+  ) {
+    super(
+      `Context budget exceeded before model transport (${estimatedTokens} > ${maxTokens}). Reduce the input or tool observations and retry.`,
+    );
+    this.name = 'ContextBudgetError';
+  }
+}
+
+/** Check the actual canonical envelope, including attachments and finalization instructions.
+ * Stop rather than silently discard observations that a later answer may rely on.
+ */
+export function estimateRequestContextTokens(
+  request: Pick<ProviderRequest, 'systemPrompt' | 'messages' | 'tools' | 'dynamicTools'>,
+  responseReserveTokens: number,
+): number {
+  const estimatedTokens =
+    estimateMessageTokens({ role: 'system', content: request.systemPrompt ?? '' }) +
+    estimateToolSchemaTokens([
+      ...(request.tools ?? []),
+      ...(request.dynamicTools ?? []).map(({ namespace, name, description, parameters }) => ({
+        namespace,
+        name,
+        description,
+        parameters,
+      })),
+    ]) +
+    request.messages.reduce((total, message) => total + estimateMessageTokens(message), 0) +
+    responseReserveTokens;
+  return estimatedTokens;
+}
+
+export function assertRequestContextBudget(
+  request: Pick<ProviderRequest, 'systemPrompt' | 'messages' | 'tools' | 'dynamicTools'>,
+  maxTokens: number,
+  responseReserveTokens: number,
+): number {
+  const estimatedTokens = estimateRequestContextTokens(request, responseReserveTokens);
+  if (estimatedTokens > maxTokens) throw new ContextBudgetError(estimatedTokens, maxTokens);
+  return estimatedTokens;
+}
+
+export function toolUnitBoundary(
+  messages: ProviderMessage[],
+  index: number,
+): { end: number; complete: boolean } {
+  const message = messages[index];
+  if (message?.role !== 'assistant' || !message.toolCalls?.length)
+    return { end: index + 1, complete: false };
+  let end = index + 1;
+  while (end < messages.length && messages[end].role === 'tool') end += 1;
+  const rows = messages.slice(index + 1, end);
+  const expected = new Set(message.toolCalls.map((call) => call.id));
+  const actual = new Set(
+    rows.map((row) => row.toolCallId).filter((id): id is string => typeof id === 'string'),
+  );
+  return {
+    end,
+    complete:
+      expected.size === message.toolCalls.length &&
+      rows.length === expected.size &&
+      actual.size === expected.size &&
+      [...expected].every((id) => actual.has(id)),
+  };
+}
+
 function atomicUnits(messages: ContextMessage[]): {
   units: ContextMessage[][];
   invalidIds: string[];
@@ -76,26 +146,11 @@ function atomicUnits(messages: ContextMessage[]): {
       continue;
     }
 
-    const toolRows: ContextMessage[] = [];
-    let cursor = index + 1;
-    while (cursor < messages.length && messages[cursor].role === 'tool') {
-      toolRows.push(messages[cursor]);
-      cursor += 1;
-    }
-    const expected = new Set(message.toolCalls.map((call) => call.id));
-    const actual = new Set(
-      toolRows
-        .map((row) => row.toolCallId)
-        .filter((callId): callId is string => typeof callId === 'string'),
-    );
-    const complete =
-      expected.size === message.toolCalls.length &&
-      toolRows.length === expected.size &&
-      actual.size === expected.size &&
-      [...expected].every((callId) => actual.has(callId));
-    if (complete) units.push([message, ...toolRows]);
-    else invalidIds.push(message.id, ...toolRows.map((row) => row.id));
-    index = cursor - 1;
+    const boundary = toolUnitBoundary(messages, index);
+    const unit = messages.slice(index, boundary.end);
+    if (boundary.complete) units.push(unit);
+    else invalidIds.push(...unit.map((row) => row.id));
+    index = boundary.end - 1;
   }
   return { units, invalidIds };
 }

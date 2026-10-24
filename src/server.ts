@@ -2,16 +2,24 @@ import { randomUUID } from 'node:crypto';
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 import { Hono } from 'hono';
+import { type WebSocket, WebSocketServer } from 'ws';
 
+import { z } from 'zod';
 import { RunArtifactRegistry } from './artifacts/registry.js';
-import { harnessConfig } from './config/index.js';
+import { harnessConfig, learningModeSchema } from './config/index.js';
+import type { KnowledgeLearner } from './memory/learning.js';
+
 import { ApprovalStateError, approvalStatuses } from './core/approvals.js';
+import { executionRequestSchema } from './core/execution-policy.js';
 import type { AgentRuntime } from './core/runtime.js';
 import type { Scheduler } from './core/scheduler.js';
 import { createToken, inspectToken, validateToken } from './gateway/token.js';
+import { decodeInputAttachments } from './integrations/input-attachments.js';
 import type { McpManager } from './integrations/mcp.js';
 import type { DatabaseStore, EventPage, RunArtifactRow, RunRow } from './memory/db.js';
 import type { PluginRegistry } from './plugins/registry.js';
@@ -21,12 +29,16 @@ import {
   type PermissionProfile,
   permissionContextForProfile,
 } from './security/permissions.js';
+import { redactText } from './security/redaction.js';
 import type { SecretsManager } from './security/secrets.js';
+import { SkillLearner } from './skills/learner.js';
 import type { SkillRegistry } from './skills/registry.js';
 import { getVersion } from './version.js';
+import { attachmentMaxCount } from './web/attachments.js';
 import { buildThreadPresentation } from './web/presentation.js';
 
 const maxRequestBodyBytes = 1024 * 1024;
+const maxWebSocketMessageBytes = 64 * 1024;
 
 interface LogOptions {
   level: 'info' | 'warn' | 'error';
@@ -37,7 +49,7 @@ interface LogOptions {
   duration?: number;
 }
 
-async function logToFile(options: LogOptions): Promise<void> {
+async function logToFile(root: string, options: LogOptions): Promise<void> {
   const timestamp = new Date().toISOString();
   const level = options.level.toUpperCase().padEnd(5);
   const parts = [`[${timestamp}]`, level];
@@ -50,19 +62,23 @@ async function logToFile(options: LogOptions): Promise<void> {
   }
   const line = `${parts.join(' | ')}\n`;
   try {
-    await appendFile('/home/tyler/.nuaai/logs/server.log', line).catch(() => {});
-  } catch {
-    // ignore
+    await appendFile(resolve(root, '.nuaai/logs/server.log'), redactText(line), { mode: 0o600 });
+  } catch (error) {
+    console.warn(
+      redactText(
+        `NUAAI log write failed: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
   }
 }
 
-function log(level: 'info' | 'warn' | 'error', ...args: unknown[]): void {
+function log(root: string, level: 'info' | 'warn' | 'error', ...args: unknown[]): void {
   const timestamp = new Date().toISOString();
   const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
   if (level === 'error') {
     console.error(prefix, ...args);
     const error = args.find((a) => a instanceof Error) as Error | undefined;
-    void logToFile({ level, error: error?.message ?? String(args[0]) });
+    void logToFile(root, { level, error: error?.message ?? String(args[0]) });
   } else if (level === 'warn') {
     console.warn(prefix, ...args);
   } else {
@@ -154,6 +170,11 @@ function artifactDownloadHeaders(artifact: RunArtifactRow): Record<string, strin
   };
 }
 
+function publicSession<T extends { context: string }>(value: T): Omit<T, 'context'> {
+  const { context: _context, ...session } = value;
+  return session;
+}
+
 export interface GatewayServices {
   root: string;
   port: number;
@@ -173,6 +194,7 @@ export interface GatewayServices {
   plugins: PluginRegistry;
   secrets: SecretsManager;
   mcp?: McpManager;
+  knowledge?: KnowledgeLearner;
 }
 
 function tokenFromRequest(request: Request): string | null {
@@ -292,6 +314,37 @@ export function createApp(services: GatewayServices): Hono {
       webPermissionProfile: runPermissionProfile,
     }),
   );
+  app.get('/api/sessions/:id/permissions', (context) => {
+    if (!services.store.getSession(context.req.param('id')))
+      return context.json({ error: 'Session not found' }, 404);
+    return context.json(services.runtime.sessionApprovalPolicy(context.req.param('id')));
+  });
+  app.post('/api/sessions/:id/permissions', async (context) => {
+    if (!services.store.getSession(context.req.param('id')))
+      return context.json({ error: 'Session not found' }, 404);
+    const parsed = z
+      .object({
+        mode: z.enum(['manual', 'smart', 'unguarded']),
+        revokeGrants: z.boolean().default(false),
+        confirmUnguarded: z.boolean().default(false),
+      })
+      .safeParse(await context.req.json().catch(() => ({})));
+    if (!parsed.success || (parsed.data.mode === 'unguarded' && !parsed.data.confirmUnguarded))
+      return context.json(
+        { error: 'Valid mode and explicit Unguarded confirmation required' },
+        400,
+      );
+    return context.json(
+      services.runtime.setSessionApprovalPolicy(
+        context.req.param('id'),
+        parsed.data.mode,
+        parsed.data.revokeGrants,
+      ),
+    );
+  });
+  app.get('/api/goals', (context) =>
+    context.json({ goals: services.store.listGoals(context.req.query('threadId')) }),
+  );
   app.get('/api/approvals', (context) => {
     const requestedStatus = context.req.query('status');
     if (requestedStatus && !approvalStatuses.includes(requestedStatus as never))
@@ -305,12 +358,21 @@ export function createApp(services: GatewayServices): Hono {
     return approval ? context.json(approval) : context.json({ error: 'Approval not found' }, 404);
   });
   app.post('/api/approvals/:id/approve', async (context) => {
-    const body = (await context.req.json().catch(() => ({}))) as { payloadHash?: string };
+    const body = (await context.req.json().catch(() => ({}))) as {
+      payloadHash?: string;
+      scope?: string;
+    };
     if (!body.payloadHash?.match(/^[a-f0-9]{64}$/u))
       return context.json({ error: 'payloadHash is required' }, 400);
+    if (body.scope !== undefined && !['once', 'session'].includes(body.scope))
+      return context.json({ error: 'Invalid approval scope' }, 400);
     try {
       return context.json(
-        services.runtime.approveApproval(context.req.param('id'), body.payloadHash),
+        services.runtime.approveApproval(
+          context.req.param('id'),
+          body.payloadHash,
+          (body.scope ?? 'once') as 'once' | 'session',
+        ),
       );
     } catch (error) {
       const status =
@@ -322,7 +384,10 @@ export function createApp(services: GatewayServices): Hono {
     }
   });
   app.post('/api/approvals/:id/deny', async (context) => {
-    const body = (await context.req.json().catch(() => ({}))) as { payloadHash?: string };
+    const body = (await context.req.json().catch(() => ({}))) as {
+      payloadHash?: string;
+      scope?: string;
+    };
     if (!body.payloadHash?.match(/^[a-f0-9]{64}$/u))
       return context.json({ error: 'payloadHash is required' }, 400);
     try {
@@ -348,9 +413,8 @@ export function createApp(services: GatewayServices): Hono {
 
   const HEARTBEAT_INTERVAL_MS = 15_000;
   const MAX_EVENTS_BUFFER = 100;
-  const eventBuffer: Array<{ id: number; data: string }> = [];
+  const eventBuffer: Array<{ id: number; data: string; sessionId?: string; type: string }> = [];
   let eventIdCounter = 0;
-  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
   function sseFormat(eventType: string, data: unknown, id?: number): string {
     const lines = [`event: ${eventType}`, `data: ${JSON.stringify(data)}`];
@@ -368,31 +432,8 @@ export function createApp(services: GatewayServices): Hono {
     return type;
   }
 
-  function getAuthToken(request: Request): string | null {
-    const url = new URL(request.url);
-    const token = url.searchParams.get('token');
-    if (token) return token;
-    const cookie = request.headers.get('cookie');
-    if (cookie) {
-      const match = cookie.split(';').find((c) => c.trim().startsWith('nuaai_token='));
-      if (match) return match.trim().slice('nuaai_token='.length);
-    }
-    return null;
-  }
-
-  function startHeartbeat(controller: ReadableStreamDefaultController): void {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-    heartbeatTimer = setInterval(() => {
-      try {
-        controller.enqueue(new TextEncoder().encode(': keepalive\n\n'));
-      } catch {
-        if (heartbeatTimer) clearInterval(heartbeatTimer);
-      }
-    }, HEARTBEAT_INTERVAL_MS);
-  }
-
   app.get('/api/agent/stream', async (context) => {
-    const token = getAuthToken(context.req.raw);
+    const token = tokenFromRequest(context.req.raw);
     const checkedAt = (services.now ?? Date.now)();
     if (!token || !isRequestCredential(validateToken(token, services.authSecret, checkedAt))) {
       return context.json({ error: 'Unauthorized' }, 401);
@@ -408,6 +449,7 @@ export function createApp(services: GatewayServices): Hono {
     const lastEventId = context.req.raw.headers.get('Last-Event-ID');
     const startEventId = lastEventId ? Math.max(0, Number.parseInt(lastEventId, 10) + 1) : 0;
 
+    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
     let unsubscribe: (() => void) | undefined;
     let closed = false;
 
@@ -420,7 +462,13 @@ export function createApp(services: GatewayServices): Hono {
 
     const stream = new ReadableStream({
       start(controller) {
-        startHeartbeat(controller);
+        heartbeatTimer = setInterval(() => {
+          try {
+            controller.enqueue(new TextEncoder().encode(': keepalive\n\n'));
+          } catch {
+            cleanup();
+          }
+        }, HEARTBEAT_INTERVAL_MS);
 
         context.req.raw.signal.addEventListener('abort', () => {
           try {
@@ -432,7 +480,9 @@ export function createApp(services: GatewayServices): Hono {
         });
 
         if (startEventId > 0 && eventBuffer.length > 0) {
-          for (const { id, data } of eventBuffer) {
+          for (const { id, data, sessionId: owner, type } of eventBuffer) {
+            if (sessionId && owner !== sessionId) continue;
+            if (dropTypes.has(type) || dropTypes.has(mapEventType(type))) continue;
             if (id >= startEventId) {
               try {
                 controller.enqueue(new TextEncoder().encode(data));
@@ -452,7 +502,8 @@ export function createApp(services: GatewayServices): Hono {
             if (dropTypes.has(event.type) || (mapped && dropTypes.has(mapped))) return;
           }
 
-          const id = ++eventIdCounter;
+          const id = event.id ?? ++eventIdCounter;
+          eventIdCounter = Math.max(eventIdCounter, id);
           const eventType: string = mapEventType(event.type);
           let eventData: Record<string, unknown> = { ...event.payload };
 
@@ -484,6 +535,7 @@ export function createApp(services: GatewayServices): Hono {
           }
 
           const sseData = {
+            ...eventData,
             id,
             type: eventType,
             runId: event.runId,
@@ -492,6 +544,7 @@ export function createApp(services: GatewayServices): Hono {
             threadId: event.threadId,
             createdAt: event.createdAt,
             event: {
+              id: event.id,
               type: event.type,
               runId: event.runId,
               taskId: event.taskId,
@@ -504,10 +557,10 @@ export function createApp(services: GatewayServices): Hono {
               correlationId: event.correlationId,
               schemaVersion: event.schemaVersion,
             },
-            ...eventData,
           };
           const sseLine = sseFormat(eventType, sseData, id);
-          eventBuffer.push({ id, data: sseLine });
+          if (eventBuffer.at(-1)?.id !== id)
+            eventBuffer.push({ id, data: sseLine, sessionId: event.sessionId, type: event.type });
           if (eventBuffer.length > MAX_EVENTS_BUFFER) eventBuffer.shift();
 
           try {
@@ -534,23 +587,43 @@ export function createApp(services: GatewayServices): Hono {
 
   app.get('/api/sessions', (context) =>
     context.json({
-      sessions: services.runtime.listSessions(context.req.query('includeOrphans') === 'true'),
+      sessions: services.runtime
+        .listSessions(context.req.query('includeOrphans') === 'true')
+        .map(publicSession),
     }),
   );
   app.post('/api/sessions', async (context) => {
     const body = (await context.req.json().catch(() => ({}))) as {
       title?: string;
       sourceKey?: string;
+      workspaceRoot?: string;
+      parentSessionId?: string;
     };
-    return context.json(services.runtime.createSession(body.title, body.sourceKey));
+    try {
+      const created = services.runtime.createSession(body.title, body.sourceKey, undefined, {
+        workspaceRoot: body.workspaceRoot,
+        parentSessionId: body.parentSessionId,
+      });
+      return context.json({ ...created, session: publicSession(created.session) });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
   });
   app.post('/api/sessions/resolve', async (context) => {
     const body = (await context.req.json().catch(() => ({}))) as {
       title?: string;
       sourceKey?: string;
+      workspaceRoot?: string;
     };
     if (!body.sourceKey?.trim()) return context.json({ error: 'sourceKey is required' }, 400);
-    return context.json(services.runtime.getOrCreateSession(body.sourceKey, body.title));
+    try {
+      const created = services.runtime.getOrCreateSession(body.sourceKey, body.title, {
+        workspaceRoot: body.workspaceRoot,
+      });
+      return context.json({ ...created, session: publicSession(created.session) });
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
   });
   app.post('/api/sessions/:id/threads', async (context) => {
     try {
@@ -570,14 +643,40 @@ export function createApp(services: GatewayServices): Hono {
   app.get('/api/sessions/:id', (context) => {
     const session = services.runtime.getSession(context.req.param('id'));
     return session
-      ? context.json({ session, threads: services.runtime.listThreads(session.id) })
+      ? context.json({
+          session: publicSession(session),
+          threads: services.runtime.listThreads(session.id),
+          identity: services.runtime.sessionIdentityStatus(session.id),
+        })
       : context.json({ error: 'Session not found' }, 404);
   });
   app.post('/api/sessions/:id/switch', (context) => {
     const session = services.runtime.getSession(context.req.param('id'));
     return session
-      ? context.json({ session, threads: services.runtime.listThreads(session.id), active: true })
+      ? context.json({
+          session: publicSession(session),
+          threads: services.runtime.listThreads(session.id),
+          active: true,
+        })
       : context.json({ error: 'Session not found' }, 404);
+  });
+  app.get('/api/sessions/:id/identity', (context) => {
+    if (!services.runtime.getSession(context.req.param('id')))
+      return context.json({ error: 'Session not found' }, 404);
+    try {
+      return context.json(services.runtime.sessionIdentityStatus(context.req.param('id')));
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
+  app.post('/api/sessions/:id/identity/refresh', (context) => {
+    if (!services.runtime.getSession(context.req.param('id')))
+      return context.json({ error: 'Session not found' }, 404);
+    try {
+      return context.json(services.runtime.refreshSessionIdentity(context.req.param('id')));
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
   });
   app.put('/api/sessions/:id', async (context) => {
     const { title } = await context.req.json();
@@ -653,28 +752,58 @@ export function createApp(services: GatewayServices): Hono {
   });
   app.post('/api/runs', async (context) => {
     const body = (await context.req.json()) as {
+      attachments?: unknown;
+      execution?: unknown;
+      idempotencyKey?: unknown;
       threadId?: string;
       input?: string;
       provider?: string;
       model?: string;
-      attachments?: Array<{ id: string; name: string; type: string; size: number; url: string }>;
     };
     if (!body.threadId || !body.input)
       return context.json({ error: 'threadId and input are required' }, 400);
-    let input = body.input;
-    if (body.attachments && body.attachments.length > 0) {
-      const fileList = body.attachments.map((a) => `[${a.name}]`).join(', ');
-      input = `${input}\n\nAttachments: ${fileList}`;
-    }
     try {
+      if (
+        body.idempotencyKey !== undefined &&
+        (typeof body.idempotencyKey !== 'string' ||
+          !body.idempotencyKey.trim() ||
+          body.idempotencyKey.length > 256)
+      )
+        return context.json(
+          { error: 'idempotencyKey must be a nonempty string of at most 256 characters' },
+          400,
+        );
+      const material =
+        Array.isArray(body.attachments) && body.attachments.length <= attachmentMaxCount
+          ? await Promise.all(
+              body.attachments.map(async (entry) => {
+                if (entry && typeof entry.data === 'string') return entry;
+                const meta =
+                  entry && typeof entry.id === 'string' ? uploadRegistry.get(entry.id) : undefined;
+                if (!meta || entry.url !== `api/uploads/${entry.id}` || entry.name !== meta.name)
+                  throw new Error('Uploaded attachment is unavailable; attach the file again.');
+                return {
+                  name: meta.name,
+                  data: (
+                    await readFile(resolve(services.root, '.nuaai/uploads', entry.id))
+                  ).toString('base64'),
+                };
+              }),
+            )
+          : body.attachments;
+      const attachments = decodeInputAttachments(material);
       return context.json(
         services.runtime.startRun({
           threadId: body.threadId,
-          input,
+          input: [body.input, attachments.text].filter(Boolean).join('\n\n'),
+          verificationInput: body.input,
+          execution: executionRequestSchema.parse(body.execution ?? { mode: 'standard' }),
+          images: attachments.images,
           provider: body.provider,
           model: body.model,
           permissions: runPermissions,
           permissionSource: 'web',
+          idempotencyKey: body.idempotencyKey,
         }),
       );
     } catch (error) {
@@ -693,10 +822,21 @@ export function createApp(services: GatewayServices): Hono {
       formData.forEach((value, key) => {
         if (value instanceof File) entries.push([key, value]);
       });
-      for (const [_name, value] of entries) {
+      const material = await Promise.all(
+        entries.map(async ([_name, value]) => ({
+          value,
+          buffer: Buffer.from(await value.arrayBuffer()),
+        })),
+      );
+      decodeInputAttachments(
+        material.map(({ value, buffer }) => ({
+          name: value.name,
+          data: buffer.toString('base64'),
+        })),
+      );
+      for (const { value, buffer } of material) {
         const id = randomUUID();
         const filepath = join(uploadDir, id);
-        const buffer = Buffer.from(await value.arrayBuffer());
         await writeFile(filepath, buffer);
         uploadRegistry.set(id, {
           name: value.name,
@@ -720,15 +860,15 @@ export function createApp(services: GatewayServices): Hono {
     const uploadDir = resolve(services.root, '.nuaai', 'uploads');
     const file = join(uploadDir, id);
     const meta = uploadRegistry.get(id);
-    if (meta) {
-      context.header('Content-Type', meta.type);
-      context.header('Content-Disposition', `inline; filename="${meta.name}"`);
-    }
+    if (!meta) return context.json({ error: 'File not found' }, 404);
     try {
       const fileContent = await readFile(file);
       return new Response(fileContent, {
         headers: {
-          'Content-Type': meta?.type || 'application/octet-stream',
+          'Content-Type': meta.type || 'application/octet-stream',
+          'Content-Disposition': contentDisposition(meta.name),
+          'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'private, no-store',
         },
       });
     } catch {
@@ -864,6 +1004,68 @@ export function createApp(services: GatewayServices): Hono {
   app.get('/api/mcp', (context) =>
     context.json(services.mcp?.status() ?? { servers: [], failures: {} }),
   );
+  app.get('/api/memory/learning', (context) =>
+    context.json(services.knowledge?.status() ?? { available: false, enabled: false, mode: 'off' }),
+  );
+  app.post('/api/memory/learning', async (context) => {
+    if (!services.knowledge)
+      return context.json({ error: 'Learning controls are unavailable' }, 503);
+    const parsed = z
+      .object({ mode: learningModeSchema })
+      .strict()
+      .safeParse(await context.req.json());
+    if (!parsed.success)
+      return context.json(
+        { error: 'A valid exact learning mode is required: automatic, manual, or off' },
+        400,
+      );
+    try {
+      return context.json(await services.knowledge.setMode(parsed.data.mode));
+    } catch (error) {
+      const correlationId = randomUUID();
+      const code =
+        error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+          ? error.code
+          : error instanceof SyntaxError
+            ? 'CONFIG_PARSE_FAILED'
+            : 'CONFIG_UPDATE_FAILED';
+      services.runtime.publishEvent(
+        'knowledge.mode.failed',
+        {
+          requestedMode: parsed.data.mode,
+          failureCode: code,
+          failureClass: error instanceof Error ? error.name : 'unknown',
+        },
+        { correlationId },
+      );
+      return context.json(
+        {
+          error:
+            'Learning mode update could not be persisted and verified; reload the actual setting before retrying',
+          failureCode: code,
+          correlationId,
+        },
+        500,
+      );
+    }
+  });
+  app.post('/api/memory/:id/revert', (context) => {
+    if (!services.knowledge)
+      return context.json({ error: 'Learning history controls are unavailable' }, 503);
+    try {
+      return context.json(services.knowledge.revert(context.req.param('id')));
+    } catch (error) {
+      return context.json(
+        {
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Learning history could not be safely reverted',
+        },
+        409,
+      );
+    }
+  });
   app.get('/api/memory', (context) =>
     context.json({
       memories: services.store
@@ -874,6 +1076,11 @@ export function createApp(services: GatewayServices): Hono {
   app.post('/api/memory', async (context) => {
     try {
       const { content, metadata } = await context.req.json();
+      if (metadata && typeof metadata === 'object' && Object.hasOwn(metadata, 'knowledge'))
+        return context.json(
+          { error: 'Knowledge provenance is reserved for daemon-owned memory operations' },
+          400,
+        );
       if (typeof content !== 'string' || !content.trim()) {
         return context.json({ error: 'content is required' }, 400);
       }
@@ -924,6 +1131,10 @@ export function createApp(services: GatewayServices): Hono {
     }
   });
   app.get('/api/schedules', (context) => context.json({ schedules: services.scheduler.list() }));
+  app.get('/api/tasks/:id', (context) => {
+    const diagnostics = services.scheduler.inspectTask(context.req.param('id'));
+    return diagnostics ? context.json(diagnostics) : context.json({ error: 'Task not found' }, 404);
+  });
   app.get('/api/tasks', (context) => context.json({ tasks: services.scheduler.listTasks() }));
   app.post('/api/tasks/:id/cancel', (context) => {
     try {
@@ -994,6 +1205,25 @@ export function createApp(services: GatewayServices): Hono {
     }
   });
   app.get('/api/skills', (context) => context.json({ skills: services.skills.list() }));
+  app.get('/api/skills/:name', (context) => {
+    try {
+      return context.json(services.skills.load(context.req.param('name')));
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 404);
+    }
+  });
+  app.post('/api/skills', async (context) => {
+    try {
+      const body = (await context.req.json()) as { name?: unknown; instructions?: unknown };
+      if (typeof body.name !== 'string' || typeof body.instructions !== 'string')
+        return context.json({ error: 'Skill name and instructions are required.' }, 400);
+      return context.json(
+        await new SkillLearner(services.root, services.skills).create(body.name, body.instructions),
+      );
+    } catch (error) {
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+    }
+  });
   app.post('/api/skills/:name/enable', (context) => {
     try {
       services.skills.enable(context.req.param('name'));
@@ -1104,10 +1334,12 @@ export interface GatewayHandle {
 }
 
 export async function startServer(services: GatewayServices): Promise<GatewayHandle> {
-  await mkdir('/home/tyler/.nuaai/logs', { recursive: true }).catch(() => {});
-  log('info', `Starting NUAAI server on ${services.host}:${services.port}`);
+  await mkdir(resolve(services.root, '.nuaai/logs'), { recursive: true, mode: 0o700 });
+  log(services.root, 'info', `Starting NUAAI server on ${services.host}:${services.port}`);
   const app = createApp(services);
   const httpServer = createServer(async (request, response) => {
+    const requestController = new AbortController();
+    response.once('close', () => requestController.abort());
     try {
       const declaredLength = Number(request.headers['content-length'] ?? 0);
       if (Number.isFinite(declaredLength) && declaredLength > maxRequestBodyBytes) {
@@ -1143,6 +1375,7 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       if (mountedAtNuaai) headers.set('x-nuaai-internal-mount-path', '/nuaai');
       const method = request.method ?? 'GET';
       const webRequest = new Request(requestUrl, {
+        signal: requestController.signal,
         method,
         headers,
         body: method === 'GET' || method === 'HEAD' ? undefined : Buffer.concat(chunks),
@@ -1150,10 +1383,21 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       const webResponse = await app.fetch(webRequest);
       response.statusCode = webResponse.status;
       webResponse.headers.forEach((value, key) => response.setHeader(key, value));
-      response.end(Buffer.from(await webResponse.arrayBuffer()));
+      response.flushHeaders();
+      if (webResponse.body)
+        await pipeline(
+          Readable.fromWeb(webResponse.body as Parameters<typeof Readable.fromWeb>[0]),
+          response,
+        );
+      else response.end();
     } catch (error) {
-      const requestPath = request.url ?? '/';
-      log('error', `${request.method ?? 'UNKNOWN'} ${requestPath} -> 500`, error);
+      if (requestController.signal.aborted) return;
+      if (response.headersSent) {
+        response.destroy(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      const requestPath = request.url?.split('?')[0] ?? '/';
+      log(services.root, 'error', `${request.method ?? 'UNKNOWN'} ${requestPath} -> 500`, error);
       response.statusCode = 500;
       response.end(error instanceof Error ? error.message : String(error));
     }
@@ -1165,12 +1409,98 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
       resolveListen();
     });
   });
-  log('info', `NUAAI server listening on http://${services.host}:${services.port}`);
+  log(services.root, 'info', `NUAAI server listening on http://${services.host}:${services.port}`);
+  const wsServer = new WebSocketServer({
+    server: httpServer,
+    maxPayload: maxWebSocketMessageBytes,
+  });
+  const clients = new Map<WebSocket, string | undefined | null>();
+  const unsubscribe = services.runtime.subscribe((event) => {
+    const payload = JSON.stringify({ type: 'event', event });
+    const approvalInvalidation = event.type.startsWith('approval.')
+      ? JSON.stringify({ type: 'approvals.invalidated' })
+      : undefined;
+    for (const [client, sessionId] of clients) {
+      if (client.readyState !== client.OPEN) continue;
+      if (approvalInvalidation) client.send(approvalInvalidation);
+      if (sessionId === null) continue;
+      if (!sessionId || !event.sessionId || sessionId === event.sessionId) client.send(payload);
+    }
+  });
+  wsServer.on('connection', (socket, request) => {
+    const url = new URL(request.url ?? '/ws', `http://${request.headers.host ?? 'localhost'}`);
+    if (!['/ws', '/nuaai/ws'].includes(url.pathname)) {
+      socket.close(1008, 'Unknown WebSocket route');
+      return;
+    }
+    if (request.headers.origin) {
+      let matched = false;
+      try {
+        matched = new URL(request.headers.origin).host === request.headers.host;
+      } catch {
+        matched = false;
+      }
+      if (!matched) {
+        socket.close(1008, 'Origin mismatch');
+        return;
+      }
+    }
+    const token =
+      url.searchParams.get('token') ??
+      request.headers.cookie
+        ?.split(';')
+        .map((part) => part.trim())
+        .find((part) => part.startsWith('nuaai_token='))
+        ?.slice('nuaai_token='.length);
+    const checkedAt = (services.now ?? Date.now)();
+    if (!token || !isRequestCredential(validateToken(token, services.authSecret, checkedAt))) {
+      socket.close(1008, authenticationFailure(token ?? null, services.authSecret, checkedAt).code);
+      return;
+    }
+    clients.set(socket, null);
+    socket.send(JSON.stringify({ type: 'ready', version: getVersion() }));
+    socket.on('message', (raw) => {
+      try {
+        const message = JSON.parse(raw.toString()) as {
+          type?: string;
+          sessionId?: string;
+          after?: number;
+          limit?: number;
+        };
+        if (message.type === 'subscribe') {
+          clients.set(socket, message.sessionId);
+          const after = Number.isFinite(message.after)
+            ? Math.max(0, Math.trunc(message.after ?? 0))
+            : 0;
+          const limit = Number.isFinite(message.limit)
+            ? Math.min(maxReplayPageSize, Math.max(1, Math.trunc(message.limit ?? 250)))
+            : 250;
+          const page = message.sessionId
+            ? services.store.listEventsForSession(message.sessionId, after, limit)
+            : globalEventPage(services.store, after, limit);
+          for (const event of page.events) socket.send(JSON.stringify({ type: 'event', event }));
+          socket.send(
+            JSON.stringify({
+              type: 'replay.complete',
+              nextCursor: page.nextCursor,
+              hasMore: page.hasMore,
+            }),
+          );
+        }
+      } catch {
+        socket.send(JSON.stringify({ type: 'error', error: 'Invalid WebSocket message' }));
+      }
+    });
+    socket.on('close', () => clients.delete(socket));
+  });
   const address = httpServer.address();
   const port = typeof address === 'object' && address ? address.port : services.port;
   return {
     port,
     close: async () => {
+      unsubscribe();
+      for (const client of clients.keys()) client.terminate();
+      await new Promise<void>((resolveClose) => wsServer.close(() => resolveClose()));
       if (typeof httpServer.closeAllConnections === 'function') {
         httpServer.closeAllConnections();
       }

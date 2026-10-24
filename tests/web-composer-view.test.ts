@@ -23,6 +23,8 @@ function render(input: string, activeRunId: string | null, queuedPrompts: string
       expanded: false,
       textareaRef: createRef<HTMLTextAreaElement>(),
       onInput: vi.fn(),
+      attachments: [],
+      onAttachmentsChange: vi.fn(),
       onExpanded: vi.fn(),
       onSubmit: vi.fn(),
       onStop: vi.fn(),
@@ -43,7 +45,7 @@ describe('AgentComposer', () => {
     expect(markup).toContain('aria-label="Send next"');
   });
 
-  it('shows real model, capability, and separate context controls with attachment support', () => {
+  it('shows real model, capability, and separate context controls with supported attachment controls', () => {
     const markup = render('', null);
 
     expect(markup).toContain('gpt-test');
@@ -52,7 +54,8 @@ describe('AgentComposer', () => {
     expect(markup).toContain('Run approved commands');
     expect(markup).toContain('Thread history');
     expect(markup).toContain('Automatic memory');
-    expect(markup).toContain('Attach');
+    expect(markup).toContain('Attach files');
+    expect(markup).toContain('512 KiB total');
   });
 
   it('keeps the authoritative active model selectable when health omits a model catalog', () => {
@@ -69,6 +72,8 @@ describe('AgentComposer', () => {
         expanded: false,
         textareaRef: createRef<HTMLTextAreaElement>(),
         onInput: vi.fn(),
+        attachments: [],
+        onAttachmentsChange: vi.fn(),
         onExpanded: vi.fn(),
         onSubmit: vi.fn(),
         onStop: vi.fn(),

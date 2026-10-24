@@ -95,6 +95,7 @@ export function matrixHelpText(): string {
     '**NUAAI Matrix commands**',
     '`/help` — show this help',
     '`/status` — show the active session',
+    '`/identity [refresh]` — inspect frozen instruction-source metadata or explicitly reload it',
     '`/sessions` — list sessions available in this room',
     '`/new [title]` — start a fresh session',
     '`/switch <session-id>` — switch the active session',

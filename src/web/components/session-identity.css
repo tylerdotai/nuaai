@@ -1,0 +1,24 @@
+.command-palette.identity-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  padding: 1.25rem;
+  width: min(42rem, calc(100vw - 2rem));
+  max-height: 80dvh;
+  overflow: auto;
+}
+.identity-dialog .dialog-heading {
+  padding: 0 0 1rem;
+  margin-bottom: 1rem;
+}
+.identity-dialog::backdrop {
+  background: rgb(0 0 0 / 65%);
+}
+.identity-dialog p,
+.identity-dialog li,
+.identity-dialog code {
+  overflow-wrap: anywhere;
+}
+.identity-dialog li {
+  margin-block: 0.5rem;
+}

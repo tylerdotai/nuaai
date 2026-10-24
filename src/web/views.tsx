@@ -7,6 +7,7 @@ import type {
   ApprovalRequest,
   CommandId,
   ConnectionState,
+  LearningStatus,
   MemoryRecord,
   PluginHealth,
   PluginRecord,
@@ -161,6 +162,11 @@ export function ApprovalInbox({
 
 export function MemoryView({
   memories,
+  learning,
+  changingLearning,
+  onLearningMode,
+  onRevert,
+  revertingId,
   onDelete,
   onUpdate,
   saveMemory,
@@ -168,6 +174,11 @@ export function MemoryView({
   isLoading,
 }: {
   memories: MemoryRecord[];
+  learning: LearningStatus | null;
+  changingLearning: boolean;
+  onLearningMode(mode: LearningStatus['mode']): void;
+  onRevert(id: string): void;
+  revertingId: string | null;
   onDelete?(id: string): void;
   onUpdate?(id: string, content: string): void;
   saveMemory?(content: string): void;
@@ -208,22 +219,35 @@ export function MemoryView({
     });
   };
 
+  const selectableMemories = filteredMemories.filter(
+    (memory) =>
+      memoryKnowledge(memory).origin !== 'automatic' &&
+      !['superseded', 'disabled'].includes(String(memoryKnowledge(memory).state)),
+  );
+  const allSelected =
+    selectableMemories.length > 0 &&
+    selectableMemories.every((memory) => selectedIds.has(memory.id));
   const toggleSelectAll = (): void => {
-    if (selectedIds.size === filteredMemories.length) {
-      setSelectedIds(new Set());
-    } else {
-      setSelectedIds(new Set(filteredMemories.map((m) => m.id)));
-    }
+    setSelectedIds(
+      allSelected ? new Set() : new Set(selectableMemories.map((memory) => memory.id)),
+    );
   };
 
   const deleteSelected = (): void => {
-    for (const id of selectedIds) {
-      onDelete?.(id);
+    for (const memory of selectableMemories) {
+      if (selectedIds.has(memory.id)) onDelete?.(memory.id);
     }
     setSelectedIds(new Set());
   };
 
   const closeContextMenu = (): void => setContextMenu(null);
+  const active = filteredMemories.filter(
+    (memory) =>
+      !['superseded', 'disabled'].includes(String(memoryKnowledge(memory).state ?? 'active')),
+  );
+  const retired = filteredMemories.filter((memory) =>
+    ['superseded', 'disabled'].includes(String(memoryKnowledge(memory).state)),
+  );
 
   const startEdit = (memory: MemoryRecord): void => {
     setEditingMemory(memory);
@@ -257,13 +281,46 @@ export function MemoryView({
       >
         <div className="view-heading">
           <div>
-            <span className="section-label">Explicit recall</span>
+            <span className="section-label">Durable knowledge</span>
             <h1>Memory</h1>
-            <p>Only information intentionally saved for future sessions appears here.</p>
+            <p>
+              Saved notes and selectively learned project knowledge, with retained evidence and
+              history.
+            </p>
           </div>
           <span className="count-chip">
             {filteredMemories.length} of {memories.length} records
           </span>
+        </div>
+        <div className="learning-controls">
+          <div>
+            <label htmlFor="agent-learning">Agent learning</label>
+            <p>
+              {!learning
+                ? 'Loading the actual setting…'
+                : !learning.available
+                  ? 'Automatic learning is unavailable in this runtime.'
+                  : learning.mode === 'automatic'
+                    ? 'Selectively reviews meaningful completed work. Verified project knowledge can be saved without a remember command.'
+                    : learning.mode === 'manual'
+                      ? 'No automatic review. The agent saves only when explicitly asked.'
+                      : 'Automatic review and agent saves are off. Existing notes remain available; notes can still be managed here.'}
+            </p>
+          </div>
+          <select
+            id="agent-learning"
+            value={learning?.mode ?? ''}
+            disabled={!learning?.available || changingLearning}
+            onChange={(event) => onLearningMode(event.target.value as LearningStatus['mode'])}
+          >
+            <option value="" disabled>
+              Loading…
+            </option>
+            <option value="automatic">Automatic</option>
+            <option value="manual">Manual</option>
+            <option value="off">Off</option>
+          </select>
+          {changingLearning && <output>Saving and verifying…</output>}
         </div>
         <div className="memory-controls">
           <input
@@ -329,14 +386,14 @@ export function MemoryView({
           {saveStatus === 'saved' && <span className="save-confirm">Saved</span>}
         </form>
         <div className="memory-list" aria-label="Memory records">
-          {filteredMemories.length ? (
+          {active.length ? (
             <>
-              {selectedIds.size > 0 && selectedIds.size < filteredMemories.length && (
+              {selectableMemories.length > 0 && (
                 <div className="memory-list-header">
                   <label>
                     <input
                       type="checkbox"
-                      checked={false}
+                      checked={allSelected}
                       onChange={toggleSelectAll}
                       aria-label="Select all"
                     />
@@ -344,24 +401,32 @@ export function MemoryView({
                   </label>
                 </div>
               )}
-              {filteredMemories.map((memory) => (
+              {active.map((memory) => (
                 <div
                   className={`memory-row ${selectedIds.has(memory.id) ? 'selected' : ''}`}
                   key={memory.id}
                   onContextMenu={(e) => {
                     e.preventDefault();
-                    setContextMenu({ x: e.clientX, y: e.clientY, memoryId: memory.id });
+                    if (memoryKnowledge(memory).origin !== 'automatic')
+                      setContextMenu({ x: e.clientX, y: e.clientY, memoryId: memory.id });
                   }}
                 >
                   <input
                     type="checkbox"
                     className="memory-checkbox"
+                    disabled={memoryKnowledge(memory).origin === 'automatic'}
                     checked={selectedIds.has(memory.id)}
                     onChange={() => toggleSelect(memory.id)}
                     aria-label={`Select memory: ${memory.content.slice(0, 30)}`}
                   />
                   <div className="memory-content">
                     <p>{memory.content}</p>
+                    <span className="knowledge-origin">
+                      {memoryKnowledge(memory).origin === 'automatic'
+                        ? 'Learned automatically'
+                        : 'Saved note'}
+                    </span>
+                    <MemoryEvidence memory={memory} />
                   </div>
                   <div className="memory-meta">
                     <span className={memory.hasEmbedding ? 'indexed' : 'text-only'}>
@@ -370,7 +435,16 @@ export function MemoryView({
                     <time>{relativeTime(memory.createdAt)}</time>
                   </div>
                   <div className="memory-actions">
-                    {onUpdate && (
+                    {memoryKnowledge(memory).origin === 'automatic' && (
+                      <button
+                        type="button"
+                        disabled={revertingId !== null}
+                        onClick={() => onRevert(memory.id)}
+                      >
+                        {revertingId === memory.id ? 'Verifying undo…' : 'Undo learning'}
+                      </button>
+                    )}
+                    {onUpdate && memoryKnowledge(memory).origin !== 'automatic' && (
                       <button
                         type="button"
                         className="memory-action-btn"
@@ -380,7 +454,7 @@ export function MemoryView({
                         Edit
                       </button>
                     )}
-                    {onDelete && (
+                    {onDelete && memoryKnowledge(memory).origin !== 'automatic' && (
                       <button
                         type="button"
                         className="memory-delete-btn danger"
@@ -407,11 +481,27 @@ export function MemoryView({
           ) : (
             <EmptyState
               title="No saved memory"
-              description="Ask NUAAI to remember something when persistence is useful."
+              description="Useful project preferences and verified workflows can appear after meaningful work when automatic learning is enabled. A note can also be saved explicitly."
               icon="◉"
             />
           )}
         </div>
+        {retired.length > 0 && (
+          <details className="learning-history">
+            <summary>Learning history</summary>
+            <div aria-label="Retired learning">
+              {retired.map((memory) => (
+                <article key={memory.id}>
+                  <p>{memory.content}</p>
+                  <small>
+                    {String(memoryKnowledge(memory).state)} · retained for review, not recalled
+                  </small>
+                  <MemoryEvidence memory={memory} />
+                </article>
+              ))}
+            </div>
+          </details>
+        )}
         {contextMenu && (
           <div
             className="context-menu"
@@ -483,6 +573,55 @@ export function MemoryView({
         </div>
       )}
     </>
+  );
+}
+
+function memoryKnowledge(memory: MemoryRecord): Record<string, unknown> {
+  const value = memory.metadata?.knowledge;
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function MemoryEvidence({ memory }: { memory: MemoryRecord }): React.JSX.Element | null {
+  const knowledge = memoryKnowledge(memory);
+  if (!Object.keys(knowledge).length) return null;
+  return (
+    <details className="memory-evidence">
+      <summary>Evidence and scope</summary>
+      <dl>
+        <dt>Applies to</dt>
+        <dd>
+          {knowledge.scope === 'workspace'
+            ? String(knowledge.workspaceRoot ?? 'Unknown workspace')
+            : 'Profile'}
+        </dd>
+        <dt>Origin</dt>
+        <dd>{String(knowledge.origin ?? 'Unspecified')}</dd>
+        {typeof knowledge.sourceRunId === 'string' && (
+          <>
+            <dt>Source run</dt>
+            <dd>
+              <code>{String(knowledge.sourceRunId)}</code>
+            </dd>
+          </>
+        )}
+        {typeof knowledge.topic === 'string' && (
+          <>
+            <dt>Topic</dt>
+            <dd>{String(knowledge.topic)}</dd>
+          </>
+        )}
+      </dl>
+      {typeof knowledge.sourceQuote === 'string' && knowledge.sourceQuote && (
+        <blockquote>{knowledge.sourceQuote}</blockquote>
+      )}
+      {Array.isArray(knowledge.evidenceCallIds) && knowledge.evidenceCallIds.length > 0 && (
+        <p>
+          Recorded successful calls: {knowledge.evidenceCallIds.slice(0, 8).map(String).join(', ')}
+        </p>
+      )}
+    </details>
   );
 }
 
@@ -1040,6 +1179,7 @@ export function CommandPalette({
     ['new-thread', 'New thread', 'Continue this session in a clean thread', 'T'],
     ['focus-composer', 'Focus composer', 'Jump back to the conversation', 'A'],
     ['refresh', 'Refresh runtime', 'Reload daemon and system state', 'R'],
+    ['identity', 'Instruction sources', 'Inspect the retained SOUL.md and AGENTS.md snapshot', ''],
     ['cancel-run', 'Cancel active run', 'Stop the current agent task', 'Esc'],
   ];
   return (
@@ -1071,7 +1211,8 @@ export function CommandPalette({
               type="button"
               className="command-row"
               disabled={
-                (id === 'cancel-run' && !activeRunId) || (id === 'new-thread' && !selectedSessionId)
+                (id === 'cancel-run' && !activeRunId) ||
+                ((id === 'new-thread' || id === 'identity') && !selectedSessionId)
               }
               key={id}
               ref={index === 0 ? firstActionRef : undefined}
@@ -1081,7 +1222,7 @@ export function CommandPalette({
                 <strong>{label}</strong>
                 <small>{description}</small>
               </span>
-              <kbd>{shortcut}</kbd>
+              {shortcut && <kbd>{shortcut}</kbd>}
             </button>
           ))}
         </div>

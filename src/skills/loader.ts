@@ -1,8 +1,8 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import fg from 'fast-glob';
 import { z } from 'zod';
+import { discoverFiles } from '../workspace/discovery.js';
 
 import { workspaceDirectory } from '../config/index.js';
 import { createEvent } from '../core/events.js';
@@ -132,7 +132,11 @@ async function loadLegacyPrivateSkills(
   manifests: SkillManifest[],
 ): Promise<void> {
   const directory = resolve(workspaceDirectory(root), 'skills');
-  const paths = await fg('*/manifest.json', { cwd: directory, onlyFiles: true });
+  const paths = await discoverFiles(directory, {
+    maxDepth: 1,
+    skipDirectory: (path) => path.startsWith('.'),
+    includeFile: (path) => path.split('/').length === 2 && path.endsWith('/manifest.json'),
+  });
   for (const relativePath of paths.sort()) {
     const manifestPath = resolve(directory, relativePath);
     const name = relativePath.split('/')[0];
@@ -193,13 +197,18 @@ export async function loadFilesystemSkills(
   store?: DatabaseStore,
   builtInSkillsDirectory = resolve(root, 'skills'),
 ): Promise<SkillManifest[]> {
+  if (store) registry.attachStore(store);
   const manifests: SkillManifest[] = [];
   const directories = [
     ...new Set([builtInSkillsDirectory, resolve(workspaceDirectory(root), 'skills')]),
   ];
   await loadLegacyPrivateSkills(root, registry, store, manifests);
   for (const directory of directories) {
-    const paths = await fg('*/SKILL.md', { cwd: directory, onlyFiles: true });
+    const paths = await discoverFiles(directory, {
+      maxDepth: 1,
+      skipDirectory: (path) => path.startsWith('.'),
+      includeFile: (path) => path.split('/').length === 2 && path.endsWith('/SKILL.md'),
+    });
     for (const relativePath of paths.sort()) {
       const path = resolve(directory, relativePath);
       const name = relativePath.split('/')[0];

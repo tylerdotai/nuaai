@@ -12,6 +12,84 @@ import {
 } from '../src/ui/tui-state.js';
 
 describe('TUI event state', () => {
+  it('preserves per-run tool activities even when an approval-paused turn has no answer yet', () => {
+    const messages = tuiMessagesFromPresentation([
+      {
+        role: 'assistant',
+        runId: 'paused-run',
+        markdown: '',
+        activities: [
+          {
+            items: [
+              { id: 'call-1', name: 'workspace.write', status: 'running', target: 'notes.txt' },
+            ],
+          },
+        ],
+      },
+    ]);
+    expect(messages).toMatchObject([
+      {
+        runId: 'paused-run',
+        tools: [{ id: 'call-1', name: 'workspace.write', status: 'running', target: 'notes.txt' }],
+      },
+    ]);
+  });
+
+  it('reconciles deleted selections to existing records instead of retaining stale IDs', () => {
+    const previous = {
+      ...initialTuiState,
+      selectedSessionId: 'deleted-session',
+      selectedThreadId: 'deleted-thread',
+      activeRunId: 'old-run',
+      stream: 'old answer',
+    };
+    const next = reduceTuiEvent(previous, {
+      type: 'sessions.loaded',
+      sessions: [{ id: 'remaining', title: 'Keep', status: 'active' }],
+      threads: [{ id: 'remaining-thread', sessionId: 'remaining', title: 'Keep thread' }],
+    });
+    expect(next.selectedSessionId).toBe('remaining');
+    expect(next.selectedThreadId).toBe('remaining-thread');
+    expect(next.activeRunId).toBeNull();
+    expect(next.stream).toBe('');
+  });
+
+  it('clears stream and tool activity immediately when switching threads, but not on same-thread refresh', () => {
+    const state = {
+      ...initialTuiState,
+      selectedThreadId: 'old',
+      activeRunId: 'old-run',
+      stream: 'private old answer',
+      tools: [{ name: 'read_file', status: 'running' as const }],
+    };
+    expect(reduceTuiEvent(state, { type: 'thread.selected', threadId: 'old' })).toEqual(state);
+    const next = reduceTuiEvent(state, { type: 'thread.selected', threadId: 'new' });
+    expect(next.stream).toBe('');
+    expect(next.activeRunId).toBeNull();
+    expect(next.tools).toEqual([]);
+    expect(
+      reduceTuiEvent(next, { type: 'model.delta', runId: 'old-run', text: 'late output' }).stream,
+    ).toBe('');
+  });
+
+  it('reconciles the selected thread run without retaining another thread stream', () => {
+    const running = reduceTuiEvent(initialTuiState, {
+      type: 'run.started',
+      runId: 'old-run',
+      provider: 'codex',
+      model: 'test',
+    });
+    const streamed = reduceTuiEvent(running, {
+      type: 'model.delta',
+      runId: 'old-run',
+      text: 'old output',
+    });
+    const selected = reduceTuiEvent(streamed, { type: 'run.snapshot', activeRunId: null });
+    expect(selected.activeRunId).toBeNull();
+    expect(selected.stream).toBe('');
+    const resumed = reduceTuiEvent(selected, { type: 'run.snapshot', activeRunId: 'new-run' });
+    expect(resumed.activeRunId).toBe('new-run');
+  });
   it('bounds reconnect backoff and keeps a low-frequency approval fallback', () => {
     expect([1, 2, 3, 4, 9].map(tuiReconnectDelayMs)).toEqual([1_000, 2_000, 4_000, 8_000, 10_000]);
     expect(tuiApprovalFallbackIntervalMs).toBe(15_000);

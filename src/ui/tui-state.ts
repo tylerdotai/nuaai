@@ -33,6 +33,9 @@ export type TuiConversationArtifact =
   | { type: 'unsupported'; title: string };
 
 export interface TuiConversationMessage {
+  id?: string;
+  runId?: string;
+  tools?: TuiToolActivity[];
   role: string;
   content: string;
   artifacts?: TuiConversationArtifact[];
@@ -52,6 +55,9 @@ export function tuiArtifactLines(message: TuiConversationMessage): string[] {
 
 export function tuiMessagesFromPresentation(
   messages: Array<{
+    id?: string;
+    runId?: string;
+    activities?: Array<{ items: TuiToolActivity[] }>;
     role: string;
     markdown: string;
     artifacts?: Array<{
@@ -69,7 +75,8 @@ export function tuiMessagesFromPresentation(
   return messages
     .filter(
       (message) =>
-        (message.role === 'user' || message.role === 'assistant') && message.markdown.trim(),
+        (message.role === 'user' || message.role === 'assistant') &&
+        (message.markdown.trim() || message.activities?.some((group) => group.items.length)),
     )
     .map((message) => {
       const artifacts: TuiConversationArtifact[] = (message.artifacts ?? []).flatMap(
@@ -92,6 +99,11 @@ export function tuiMessagesFromPresentation(
       return {
         role: message.role,
         content: message.markdown,
+        ...(message.id ? { id: message.id } : {}),
+        ...(message.runId ? { runId: message.runId } : {}),
+        ...(message.activities?.some((group) => group.items.length)
+          ? { tools: message.activities.flatMap((group) => group.items) }
+          : {}),
         ...(artifacts.length ? { artifacts } : {}),
         ...(citations.length ? { citations } : {}),
       };
@@ -99,6 +111,9 @@ export function tuiMessagesFromPresentation(
 }
 
 export interface TuiToolActivity {
+  id?: string;
+  detail?: string;
+  target?: string;
   name: string;
   status: 'running' | 'completed' | 'failed';
 }
@@ -121,6 +136,7 @@ export interface TuiSchedule {
 }
 
 export interface TuiMemory {
+  metadata?: Record<string, unknown>;
   id: string;
   content: string;
   hasEmbedding: boolean;
@@ -128,6 +144,7 @@ export interface TuiMemory {
 
 export interface TuiSkill {
   name: string;
+  enabled?: boolean;
   description: string;
   source: string;
 }
@@ -195,13 +212,15 @@ export interface TuiState {
   lastRunStatus: 'completed' | 'failed' | 'cancelled' | null;
   retry: TuiRetryState | null;
   approvals: TuiApproval[];
+  catalogErrors?: string[];
 }
 
 export type TuiEvent =
   | { type: 'sessions.loaded'; sessions: TuiSession[]; threads: TuiThread[] }
   | {
       type: 'catalog.loaded';
-      active: { name: string; model: string };
+      active: { name: string; model: string } | null;
+      errors?: string[];
       tasks: TuiTask[];
       schedules: TuiSchedule[];
       memories: TuiMemory[];
@@ -211,6 +230,8 @@ export type TuiEvent =
       secretNames: string[];
       approvals?: TuiApproval[];
     }
+  | { type: 'run.snapshot'; activeRunId: string | null }
+  | { type: 'run.hydrated'; activeRunId: string | null; events: TuiEvent[] }
   | { type: 'view.changed'; view: TuiView }
   | { type: 'session.selected'; sessionId: string }
   | { type: 'thread.selected'; threadId: string }
@@ -218,9 +239,9 @@ export type TuiEvent =
   | { type: 'run.started'; runId: string; provider: string; model: string }
   | { type: 'model.started'; runId: string }
   | { type: 'model.delta'; runId: string; text: string }
-  | { type: 'tool.started'; runId: string; name: string }
-  | { type: 'tool.completed'; runId: string; name: string }
-  | { type: 'tool.failed'; runId: string; name: string }
+  | { type: 'tool.started'; runId: string; name: string; id?: string; detail?: string }
+  | { type: 'tool.completed'; runId: string; name: string; id?: string; detail?: string }
+  | { type: 'tool.failed'; runId: string; name: string; id?: string; detail?: string }
   | { type: 'run.completed'; runId: string }
   | { type: 'run.failed'; runId: string; error?: string }
   | { type: 'run.cancelled'; runId: string }
@@ -270,15 +291,26 @@ export const initialTuiState: TuiState = {
 export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
   switch (event.type) {
     case 'sessions.loaded': {
-      const selectedSessionId = state.selectedSessionId ?? event.sessions[0]?.id ?? null;
-      const selectedThreadId =
-        state.selectedThreadId ??
-        event.threads.find((thread) => thread.sessionId === selectedSessionId)?.id ??
-        null;
+      const selectedSessionId = event.sessions.some(
+        (session) => session.id === state.selectedSessionId,
+      )
+        ? state.selectedSessionId
+        : (event.sessions[0]?.id ?? null);
+      const availableThreads = event.threads.filter(
+        (thread) => thread.sessionId === selectedSessionId,
+      );
+      const selectedThreadId = availableThreads.some(
+        (thread) => thread.id === state.selectedThreadId,
+      )
+        ? state.selectedThreadId
+        : (availableThreads[0]?.id ?? null);
       return {
         ...state,
         sessions: event.sessions,
         threads: event.threads,
+        ...(selectedThreadId !== state.selectedThreadId
+          ? { activeRunId: null, stream: '', tools: [], lastRunStatus: null, retry: null }
+          : {}),
         selectedSessionId,
         selectedThreadId,
         connection: 'connected',
@@ -289,6 +321,7 @@ export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
       return {
         ...state,
         provider: event.active,
+        catalogErrors: event.errors ?? [],
         tasks: event.tasks,
         schedules: event.schedules,
         memories: event.memories,
@@ -298,15 +331,44 @@ export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
         secretNames: event.secretNames,
         approvals: event.approvals ?? state.approvals,
       };
+    case 'run.hydrated': {
+      let hydrated: TuiState = {
+        ...state,
+        activeRunId: event.activeRunId,
+        stream: '',
+        tools: [],
+        lastRunStatus: null,
+        retry: null,
+      };
+      for (const entry of event.events) hydrated = reduceTuiEvent(hydrated, entry);
+      return hydrated;
+    }
+    case 'run.snapshot':
+      return state.activeRunId === event.activeRunId
+        ? state
+        : { ...state, activeRunId: event.activeRunId, stream: '', tools: [] };
     case 'view.changed':
       return { ...state, view: event.view };
     case 'session.selected': {
       const selectedThreadId =
         state.threads.find((thread) => thread.sessionId === event.sessionId)?.id ?? null;
-      return { ...state, selectedSessionId: event.sessionId, selectedThreadId };
+      const next = { ...state, selectedSessionId: event.sessionId, selectedThreadId };
+      return selectedThreadId === state.selectedThreadId
+        ? next
+        : { ...next, activeRunId: null, stream: '', tools: [], lastRunStatus: null, retry: null };
     }
     case 'thread.selected':
-      return { ...state, selectedThreadId: event.threadId };
+      return state.selectedThreadId === event.threadId
+        ? state
+        : {
+            ...state,
+            selectedThreadId: event.threadId,
+            activeRunId: null,
+            stream: '',
+            tools: [],
+            lastRunStatus: null,
+            retry: null,
+          };
     case 'connection.changed':
       return { ...state, connection: event.status, error: event.error ?? null };
     case 'run.started':
@@ -327,18 +389,31 @@ export function reduceTuiEvent(state: TuiState, event: TuiEvent): TuiState {
         : state;
     case 'tool.started':
       return event.runId === state.activeRunId
-        ? { ...state, tools: [...state.tools, { name: event.name, status: 'running' }] }
+        ? {
+            ...state,
+            tools: [
+              ...state.tools,
+              { name: event.name, status: 'running', ...(event.id ? { id: event.id } : {}) },
+            ],
+          }
         : state;
     case 'tool.completed':
     case 'tool.failed': {
       if (event.runId !== state.activeRunId) return state;
       const status = event.type === 'tool.completed' ? 'completed' : 'failed';
       const index = state.tools.findIndex(
-        (tool) => tool.name === event.name && tool.status === 'running',
+        (tool) =>
+          (event.id ? tool.id === event.id : tool.name === event.name) && tool.status === 'running',
       );
-      if (index === -1) return { ...state, tools: [...state.tools, { name: event.name, status }] };
+      const completed: TuiToolActivity = {
+        name: event.name,
+        status,
+        ...(event.id ? { id: event.id } : {}),
+        ...(event.detail ? { detail: event.detail } : {}),
+      };
+      if (index === -1) return { ...state, tools: [...state.tools, completed] };
       const tools = [...state.tools];
-      tools[index] = { name: event.name, status };
+      tools[index] = { ...tools[index], ...completed };
       return { ...state, tools };
     }
     case 'run.completed':

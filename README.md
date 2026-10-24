@@ -46,11 +46,12 @@ The default path is a local model endpoint: native Ollama or an OpenAI-compatibl
 ## What ships
 
 - Durable SQLite runtime with sessions, threads, messages, runs, events, memories, tasks, schedules, skills, plugins, and vector rows.
+- Per-session global/project `SOUL.md` and `AGENTS.md` snapshots, explicit refresh, metadata-only source diagnostics, and durable run-level identity pinning.
 - Observe → plan → act runtime loop with streaming, cancellation, timeouts, bounded output, explicit manual resume after an interrupted model run, and durable per-action approvals for profile-governed tools.
 - Dual local-provider adapter: native Ollama chat/embedding APIs or OpenAI-compatible `/v1` chat, tools, embeddings, and model discovery.
 - Optional Codex Responses provider using the installed Codex CLI's ChatGPT OAuth state. Turns stream from the fixed Codex backend; tool calls execute through NUAAI's permission-filtered runtime and return as verified observations.
 - Matrix bridge with invite auto-join, outbound replies, and a required static user or room allowlist.
-- Matrix source-bound sessions with `/help`, `/status`, `/sessions`, `/new [title]`, `/switch <session-id>`, `/voice on|off|status`, and `/tts on|off|status` commands.
+- Matrix source-bound sessions with `/help`, `/status`, `/sessions`, `/new [title]`, `/switch <session-id>`, `/identity [refresh]`, `/voice on|off|status`, and `/tts on|off|status` commands.
 - Matrix file, image, audio, video, and sticker ingestion with bounded private staging and `MEDIA:` file delivery.
 - Optional local voice input/output: Matrix audio and video attachments can use Faster-Whisper transcription, and completed responses can return Kokoro WAV audio. Text remains primary; voice input and TTS are independently disabled by default and require explicit runtime commands.
 - Local web search through SearXNG with DuckDuckGo fallback.
@@ -172,6 +173,8 @@ node dist/cli.js status
 node dist/cli.js doctor
 node dist/cli.js pair [base-url]
 node dist/cli.js run "Summarize the current workspace"
+node dist/cli.js identity [session-id]
+node dist/cli.js identity <session-id> --refresh
 node dist/cli.js onboard
 node dist/cli.js service install
 node dist/cli.js service status
@@ -179,17 +182,32 @@ node dist/cli.js service status
 
 ### TUI controls
 
-- `Ctrl+1` through `Ctrl+8`: switch surfaces.
-- `Ctrl+0`: open the command palette.
-- `Ctrl+Up` / `Ctrl+Down`: select sessions.
-- `Ctrl+Left` / `Ctrl+Right`: select threads.
-- `Ctrl+N` on Schedules: create a schedule.
-- `Ctrl+G`: trigger the first listed schedule.
-- `Ctrl+E`: pause or resume the first listed schedule.
-- `Ctrl+P` / `Ctrl+M`: cycle provider/model.
-- `Ctrl+X`: cancel the active run or task.
-- `Ctrl+R`: refresh daemon state.
-- `Esc`: exit.
+`nuaai tui` connects to the home runtime (`~/.nuaai/`) from any working directory. Set `NUAAI_ROOT=/absolute/runtime/root` to use another runtime explicitly; the caller's directory does not silently select a different database or provider. It does select the new session's project workspace, which must be contained in the selected runtime root.
+
+- `/`: searchable command menu; `Tab` completes a command.
+- `/model` or `Ctrl+P`: searchable model picker across configured providers.
+- `/provider codex` or `Ctrl+O`: choose a provider, then a model. The daemon saves the selection.
+- `/settings`: provider/model, transcript spacing, tool details, skills, and trusted plugins.
+- `/sessions`, `/threads`, `/new [title]`, `/thread [title]`: manage conversations.
+- `/rename`, `/rename-thread`, `/delete`, `/delete-thread`: rename or explicitly confirm deletion of the current selection.
+- `/memory`, `/remember <text>`: inspect, search, save, and explicitly confirm deletion of memories.
+- `/schedules`: inspect and manage automations. `/schedule` opens a guided form with a final review before saving.
+- `/tasks`: inspect background tasks and confirm cancellation.
+- Approvals appear inline in chat: `Ctrl+Y` approves once, `Ctrl+N` denies; `/approvals` focuses the card without opening a menu.
+- `/status`: live daemon health; `/refresh` or `Ctrl+R`: reload state.
+- `/cancel` or `Ctrl+X`: cancel the active run; `/resume`: confirm resuming an interrupted run.
+- `Alt+Enter`: newline; arrows and `Ctrl+A/E/U/K`: edit the draft.
+- `Alt+Up/Down`: sent-input history in single-line drafts. Plain `Up/Down` scroll the transcript for single-line drafts and move between lines in multiline drafts.
+- `PgUp/PgDn`: scroll transcript rows, long screens, or picker details.
+- `Esc`: dismiss the current screen, form, or draft; `/quit` or `Ctrl+C`: leave the TUI without stopping the daemon.
+
+See [the TUI guide](docs/TUI.md) for model switching, runtime roots, and automation workflows.
+
+### Session instructions
+
+New sessions capture the exact `SOUL.md` and `AGENTS.md` files from the daemon root and the selected project workspace. Project rules refine global defaults; within each scope `AGENTS.md` outranks `SOUL.md`. Runtime permissions and filesystem boundaries remain authoritative. Existing sessions and admitted runs retain their private snapshots across turns/reconnects/restarts; file edits apply to new sessions without restarting the daemon.
+
+Inspect with TUI `/identity`, CLI `nuaai identity [session-id]`, Web/PWA **Instruction sources**, or Matrix `/identity`. Refresh is explicit, affects future run admissions only, and reports missing, empty, unreadable, truncated, and loaded sources without exposing instruction text. See [session instruction identity](docs/SESSION_IDENTITY.md) for roots, limits, native inheritance, legacy compatibility, and API details.
 
 ### Agent tools
 
@@ -396,6 +414,19 @@ The boundaries are concrete:
 
 Review [`docs/SECURITY.md`](docs/SECURITY.md) before exposing any service beyond loopback.
 
+## Behavioral evaluations
+
+From a source checkout, validate or inspect the initiative/restraint case bank without making model calls:
+
+```sh
+npm run eval:behavior -- --validate
+npm run eval:behavior -- --list --case competitor-sloc-1
+```
+
+The [case bank and scoring rubric](evals/behavioral/README.md) cover grounded research, harmless lookups, focused clarification, tool-failure recovery, and authorization boundaries. Controlled facts are synthetic test inputs, not real competitor measurements. Protocol fixtures verify plumbing, not model quality; live execution requires explicit provider/model selection and `--live`. Structural checks never assign an overall behavioral pass without evidence review. The controlled runner rejects the separate live-web scenarios rather than pretending to execute them.
+
+This is checkout-only evaluation tooling using the existing development dependencies, not an installed `nuaai` command. It is excluded from the release tarball.
+
 ## Verification
 
 Run the complete local gate:
@@ -405,7 +436,9 @@ npm run gate
 git diff --check
 ```
 
-The gate runs Biome, strict TypeScript, 80% per-file coverage across the instrumented runtime/core library scope, fresh Node/web builds, browser E2E, an installed-tarball daemon smoke, version consistency, and a dependency audit that blocks moderate-or-higher advisories. Process entrypoints, React/Ink presentation code, schema declarations, and provider transport shims are verified through integration, build, E2E, and artifact tests rather than included in the percentage claim. The current remaining low advisory is confined to tsup's Windows-only development-server esbuild dependency; NUAAI does not ship or run that server.
+The gate runs Biome, strict TypeScript, 80% per-file coverage across the instrumented runtime/core library scope, fresh Node/web builds, browser E2E, an installed-tarball daemon smoke, installed-terminal PTY lifecycle/resize/editor/approval checks, version consistency, and a dependency audit that blocks moderate-or-higher advisories. Process entrypoints, React/Ink presentation code, schema declarations, and provider transport shims are verified through integration, build, E2E, and artifact tests rather than included in the percentage claim. Dependency-audit results describe the current lockfile and advisory database, not a permanent guarantee.
+
+Full mutation testing is a separate nightly/manual audit, not a PR merge gate. Critical changes use bounded focused mutation checks with explicit scope; the full audit's configured scope and score thresholds are unchanged. Failed or incomplete audits are reported honestly, not counted as passes. See [`TESTING.md`](TESTING.md).
 
 The repository includes unit, integration, runtime, and browser tests. Live service smoke tests require Docker and are intentionally separate from deterministic unit tests.
 
