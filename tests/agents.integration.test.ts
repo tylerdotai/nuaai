@@ -67,7 +67,7 @@ describe('bounded external-agent dispatch', () => {
     }
   });
 
-  it('rejects disabled, unknown, empty, failing, and timed-out adapters truthfully', async () => {
+  it('rejects disabled, unknown, and empty adapter requests before execution', async () => {
     const disabled = new ExternalAgentDispatcher('/tmp', {
       enabled: false,
       timeoutMs: 50,
@@ -78,21 +78,50 @@ describe('bounded external-agent dispatch', () => {
 
     const dispatcher = new ExternalAgentDispatcher('/tmp', {
       enabled: true,
-      timeoutMs: 50,
+      timeoutMs: 5_000,
+      maxOutputBytes: 2_000,
+      commands: {},
+    });
+    await expect(dispatcher.dispatch('missing', 'prompt')).rejects.toThrow('not allowlisted');
+    await expect(dispatcher.dispatch('missing', '   ')).rejects.toThrow('prompt is required');
+  });
+
+  it('reports stderr from a real nonzero exit rather than racing subprocess startup', async () => {
+    const dispatcher = new ExternalAgentDispatcher('/tmp', {
+      enabled: true,
+      timeoutMs: 5_000,
       maxOutputBytes: 2_000,
       commands: {
         fail: adapter(process.execPath, [
           '-e',
-          "process.stderr.write('adapter failed');process.exit(2)",
+          "process.stderr.write('adapter failed', () => process.exit(2))",
         ]),
-        hang: adapter(process.execPath, ['-e', 'setTimeout(() => {}, 10_000)']),
+        silent: adapter(process.execPath, ['-e', 'process.exit(2)']),
       },
     });
-    await expect(dispatcher.dispatch('missing', 'prompt')).rejects.toThrow('not allowlisted');
-    await expect(dispatcher.dispatch('fail', 'prompt')).rejects.toThrow('adapter failed');
-    await expect(dispatcher.dispatch('hang', 'prompt')).rejects.toThrow('failed');
-    await expect(dispatcher.dispatch('fail', '   ')).rejects.toThrow('prompt is required');
+    await expect(dispatcher.dispatch('fail', 'prompt')).rejects.toThrow(
+      new Error('External agent fail failed: adapter failed'),
+    );
+    await expect(dispatcher.dispatch('silent', 'prompt')).rejects.toThrow(
+      new Error('External agent silent failed: exit 2'),
+    );
   });
+
+  it('terminates a real long-lived adapter at its timeout without claiming a numeric exit', async () => {
+    const dispatcher = new ExternalAgentDispatcher('/tmp', {
+      enabled: true,
+      timeoutMs: 5_000,
+      maxOutputBytes: 2_000,
+      commands: {
+        // This fixture never exits voluntarily. No sleep or clock comparison is
+        // used to infer timeout: dispatch must settle despite the live handle.
+        hang: adapter(process.execPath, ['-e', 'setInterval(() => {}, 60_000)']),
+      },
+    });
+    await expect(dispatcher.dispatch('hang', 'prompt')).rejects.toThrow(
+      new Error('External agent hang failed: exit unknown'),
+    );
+  }, 10_000);
 
   it('exposes dispatch only with execute permission through the model-facing registry', async () => {
     const dispatcher = new ExternalAgentDispatcher('/tmp', {
