@@ -39,16 +39,27 @@ Native behavior:
   and its three-code contract stay unchanged. Live errors use the fixed live
   allowlist; no upstream error bodies, SDP or credentials are logged.
 - Hello is inert. Only start reads existing native managed credentials using
-  `AuthManager::new`/`auth_cached`, Auto storage and the direct native keyring
-  backend. HOME/CODEX_HOME are trusted host paths, never JSON fields. No manual
+  `AuthManager::new`/`auth_cached` and the pinned native default File storage.
+  Lead verified the host's CLI storage setting is absent/default; nondefault CLI
+  config resolution is NOT claimed. The initial manager and all fresh reads use
+  the same `AuthCredentialsStoreMode::default()`; no Auto/keyring-error fallback.
+  HOME/CODEX_HOME are trusted host paths, never JSON fields. No manual
   credential-file parsing, forced login, refresh, logout or account writes.
   A managed **Unavailable** auth factory exists before the constructor and is
   never enabled. API-key/PAT/Agent/external-token auth is rejected.
 - Actual cached managed ChatGPT B becomes the static native auth provider; exact
-  single Bearer/account header binding, user identity and public persisted owner
-  checks remain mandatory. Plan metadata is NOT a local entitlement gate: the
-  service decides subscription/access/quota via its responses. Frozen auth and
-  manual owner checks are not atomic leases or refresh/freshness guarantees.
+  single Bearer/account header binding and user identity remain mandatory.
+  Nonempty login-owner marker requires the strict public persisted-owner API;
+  false/error NEVER downgrades, and an empty marker is invalid. Legacy absent
+  marker uses public native `load_auth_dot_json` in the same strict File store,
+  with errors/missing/malformed/non-ChatGPT records rejected. Fresh account and
+  optional user identity must match exactly (present user cannot disappear or
+  change), and a newly appearing marker rejects the old legacy session. No own
+  auth/config parsing, credential mutation or refresh. This legacy guard is a
+  manual persisted identity check, NOT an atomic login-generation guarantee.
+  Plan metadata is NOT a local entitlement gate: the service decides
+  subscription/access/quota via its responses. Frozen auth/manual checks are
+  not atomic leases or token freshness guarantees.
 - Fixed ChatGPT backend JSON call POST, native V3 query/session configuration,
   bounded response131072 and deadline25s. Real answer is emitted/flushed before
   joining the official public SDK existing-call control sideband at its default

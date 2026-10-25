@@ -289,6 +289,7 @@ async fn native<T: Send + 'static>(
 }
 struct Authority {
     manager: std::sync::Arc<AuthManager>,
+    home: PathBuf,
     snapshot: CodexAuth,
     frozen: SharedAuthProvider,
     // Keep permanently Unavailable auth controller separate from content authority.
@@ -296,10 +297,11 @@ struct Authority {
 }
 impl Authority {
     async fn load(home: PathBuf) -> Result<Self> {
-        let (manager, controller) = read_manager(home).await;
+        let (manager, controller) = read_manager(home.clone()).await;
         let (snapshot, frozen) = freeze_snapshot(manager.auth_cached())?;
         Ok(Self {
             manager: std::sync::Arc::new(manager),
+            home,
             snapshot,
             frozen,
             _auth_controller: controller,
@@ -308,15 +310,32 @@ impl Authority {
     async fn check(&self) -> Result<()> {
         let manager = self.manager.clone();
         let snapshot = self.snapshot.clone();
+        let home = self.home.clone();
         native(async move {
-            if manager
-                .account_login_is_current(&snapshot)
-                .await
+            let owner = snapshot
+                .get_token_data()
                 .map_err(|_| Code::Authority)?
-            {
-                Ok(())
-            } else {
-                Err(Code::Authority)
+                .login_owner_id;
+            match owner_guard(owner.as_deref())? {
+                // New-format credentials MUST pass the strict public login-generation API.
+                // False/error/empty marker NEVER falls through to the legacy guard.
+                OwnerGuard::Modern => require_current(
+                    manager
+                        .account_login_is_current(&snapshot)
+                        .await
+                        .map_err(|_| Code::Authority)?,
+                ),
+                OwnerGuard::Legacy => {
+                    // Confirmed host uses the pinned native default File store. No Auto
+                    // fallback, auth-file parsing, PAT constructor, refresh or write.
+                    let stored = codex_login::load_auth_dot_json(
+                        &home,
+                        AuthCredentialsStoreMode::default(),
+                        AuthKeyringBackendKind::Direct,
+                    )
+                    .map_err(|_| Code::Authority)?;
+                    legacy_current(&snapshot, stored.as_ref())
+                }
             }
         })
         .await
@@ -329,7 +348,9 @@ async fn read_manager(home: PathBuf) -> (AuthManager, NetworkPolicyController) {
     let manager = AuthManager::new(
         home,
         false,
-        AuthCredentialsStoreMode::Auto,
+        // Lead verified cli_auth_credentials_store absent on this host: pinned
+        // native default is File. Nondefault CLI config resolution is NOT claimed.
+        AuthCredentialsStoreMode::default(),
         None,
         Some("https://chatgpt.com".into()),
         AuthKeyringBackendKind::Direct,
@@ -337,6 +358,68 @@ async fn read_manager(home: PathBuf) -> (AuthManager, NetworkPolicyController) {
     )
     .await;
     (manager, controller)
+}
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerGuard {
+    Modern,
+    Legacy,
+}
+fn owner_guard(marker: Option<&str>) -> Result<OwnerGuard> {
+    match marker {
+        None => Ok(OwnerGuard::Legacy),
+        Some("") => Err(Code::Authority),
+        Some(_) => Ok(OwnerGuard::Modern),
+    }
+}
+fn require_current(current: bool) -> Result<()> {
+    if current {
+        Ok(())
+    } else {
+        Err(Code::Authority)
+    }
+}
+fn same_legacy_identity(
+    expected_account: Option<&str>,
+    expected_user: Option<&str>,
+    expected_owner: Option<&str>,
+    stored_account: Option<&str>,
+    stored_user: Option<&str>,
+    stored_owner: Option<&str>,
+) -> bool {
+    expected_owner.is_none()
+        && stored_owner.is_none()
+        && expected_account.is_some_and(|account| !account.is_empty())
+        && expected_account == stored_account
+        && expected_user == stored_user
+}
+fn legacy_current(snapshot: &CodexAuth, stored: Option<&codex_login::AuthDotJson>) -> Result<()> {
+    if !matches!(snapshot, CodexAuth::Chatgpt(_)) {
+        return Err(Code::Authority);
+    }
+    let stored = stored.ok_or(Code::Authority)?;
+    // resolved_mode is not public in this pin. Validate the public native typed
+    // record explicitly: no competing auth material, and no non-ChatGPT mode.
+    if stored
+        .auth_mode
+        .is_some_and(|mode| mode != snapshot.auth_mode())
+        || stored.openai_api_key.is_some()
+        || stored.personal_access_token.is_some()
+        || stored.agent_identity.is_some()
+        || stored.bedrock_api_key.is_some()
+        || stored.bedrock_access_keys.is_some()
+    {
+        return Err(Code::Authority);
+    }
+    let fresh = stored.tokens.as_ref().ok_or(Code::Authority)?;
+    let original = snapshot.get_token_data().map_err(|_| Code::Authority)?;
+    require_current(same_legacy_identity(
+        original.account_id.as_deref(),
+        snapshot.get_chatgpt_user_id().as_deref(),
+        original.login_owner_id.as_deref(),
+        fresh.account_id.as_deref(),
+        fresh.id_token.chatgpt_user_id.as_deref(),
+        fresh.login_owner_id.as_deref(),
+    ))
 }
 fn empty_auth_metadata() -> Value {
     json!({"stage":"not_started","managedChatgpt":false,"hasAccount":false,"hasUserId":false,
@@ -843,6 +926,79 @@ async fn session(home: Option<PathBuf>, io: &impl Wire) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn confirmed_legacy_file_identity_is_supported_without_optional_owner_marker() {
+        assert_eq!(
+            AuthCredentialsStoreMode::default(),
+            AuthCredentialsStoreMode::File
+        );
+        assert_eq!(owner_guard(None), Ok(OwnerGuard::Legacy));
+        assert!(same_legacy_identity(
+            Some("account-B"),
+            Some("user-B"),
+            None,
+            Some("account-B"),
+            Some("user-B"),
+            None
+        ));
+        // Optional user identity is compared as an Option, not ignored when absent.
+        assert!(same_legacy_identity(
+            Some("account-B"),
+            None,
+            None,
+            Some("account-B"),
+            None,
+            None
+        ));
+        for (account, user, marker) in [
+            (Some("account-C"), Some("user-B"), None),
+            (None, Some("user-B"), None),
+            (Some("account-B"), None, None),
+            (Some("account-B"), Some("user-C"), None),
+            (Some("account-B"), Some("user-B"), Some("new-login")),
+            (Some("account-B"), Some("user-B"), Some("")),
+        ] {
+            assert!(!same_legacy_identity(
+                Some("account-B"),
+                Some("user-B"),
+                None,
+                account,
+                user,
+                marker
+            ));
+        }
+        assert!(!same_legacy_identity(
+            None,
+            Some("user-B"),
+            None,
+            None,
+            Some("user-B"),
+            None
+        ));
+        assert!(!same_legacy_identity(
+            Some(""),
+            Some("user-B"),
+            None,
+            Some(""),
+            Some("user-B"),
+            None
+        ));
+    }
+    #[test]
+    fn modern_marker_never_downgrades_after_strict_false_error_or_empty_marker() {
+        assert_eq!(owner_guard(Some("generation-B")), Ok(OwnerGuard::Modern));
+        assert_eq!(owner_guard(Some("")), Err(Code::Authority));
+        assert_eq!(require_current(false), Err(Code::Authority));
+        assert_eq!(require_current(true), Ok(()));
+        assert!(!same_legacy_identity(
+            Some("B"),
+            Some("user"),
+            Some("generation-B"),
+            Some("B"),
+            Some("user"),
+            None
+        ));
+    }
     #[test]
     fn diagnostic_is_only_fixed_metadata_never_native_identity_or_error_values() {
         let empty = snapshot_metadata(None);
