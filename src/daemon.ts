@@ -43,7 +43,7 @@ import { loadFilesystemSkills } from './skills/loader.js';
 import { SkillRegistry } from './skills/registry.js';
 import { ToolRegistry } from './tools/registry.js';
 import { VoiceBroker, VoiceError } from './voice/broker.js';
-import { unsupportedCodexVoiceProvider } from './voice/codex-transport.js';
+import { createNativeVoiceProvider } from './voice/native-provider.js';
 import { initWorkspace } from './workspace/fs.js';
 
 export interface DaemonHandle {
@@ -312,10 +312,10 @@ async function startOwnedDaemon(
       );
     }
   });
-  // Installed Codex has no proven no-execution policy over App Server stdio.
-  // Keep production unavailable; injected transports exercise the complete broker boundary.
+  // Trusted local operator opt-in only; no browser/provider RPC selects a binary.
+  // Absent a validated native helper, remain unavailable (never App Server fallback).
   const voice = new VoiceBroker({
-    provider: unsupportedCodexVoiceProvider,
+    provider: createNativeVoiceProvider(process.env.NUAAI_VOICE_HELPER),
     authorize: (_owner, binding) => {
       const thread = store.getThread(binding.threadId);
       const snapshot = store.getSessionIdentity(binding.sessionId);

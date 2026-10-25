@@ -7,6 +7,27 @@ import {
 import { type NativeVoiceWire, nativeText } from './native-wire.js';
 import { voiceLimits } from './types.js';
 
+export type NativeVoiceProfile = 'offline-memory-v1' | 'subscription-webrtc-v3';
+const offlineErrors = [
+  'VOICE_PROTOCOL_ERROR',
+  'VOICE_PROVIDER_ERROR',
+  'VOICE_PAYLOAD_TOO_LARGE',
+] as const;
+const liveErrors = [
+  ...offlineErrors,
+  'VOICE_CODEX_LOGIN_REQUIRED',
+  'VOICE_SUBSCRIPTION_REQUIRED',
+  'VOICE_ACCESS_DENIED',
+  'VOICE_QUOTA_EXCEEDED',
+  'VOICE_RATE_LIMITED',
+  'VOICE_AUTHORITY_VIOLATION',
+  'VOICE_PROVIDER_DISCONNECTED',
+  'VOICE_NEGOTIATION_TIMEOUT',
+  'VOICE_CLEANUP_FAILED',
+] as const;
+type NativeErrorCode = (typeof liveErrors)[number];
+type ReadyEvent = Extract<VoiceProviderEvent, { type: 'handoff' | 'transcript' }>;
+
 export type ToHelper =
   | { v: 1; type: 'hello' | 'close'; commandId: number }
   | { v: 1; type: 'start'; commandId: number; offer: string }
@@ -23,12 +44,20 @@ export type FromHelper =
       v: 1;
       type: 'hello';
       commandId: number;
-      profile: 'offline-memory-v1';
+      profile: NativeVoiceProfile;
       interruption: 'unsupported';
     }
   | { v: 1; type: 'answer'; commandId: number; sdp: string }
   | { v: 1; type: 'control_ready' | 'closed'; commandId: number }
   | { v: 1; type: 'handoff'; handoffId: string; text: string }
+  | {
+      v: 1;
+      type: 'transcript';
+      itemId: string;
+      role: 'user' | 'assistant';
+      text: string;
+      status: 'partial' | 'final';
+    }
   | {
       v: 1;
       type: 'delivery';
@@ -41,7 +70,7 @@ export type FromHelper =
       v: 1;
       type: 'error';
       commandId?: number;
-      code: 'VOICE_PROTOCOL_ERROR' | 'VOICE_PROVIDER_ERROR' | 'VOICE_PAYLOAD_TOO_LARGE';
+      code: NativeErrorCode;
     };
 
 function deferred<T>() {
@@ -56,7 +85,7 @@ function deferred<T>() {
 }
 const id = (value: unknown): value is number =>
   typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 2_147_483_647;
-function decode(value: unknown): FromHelper {
+function decode(value: unknown, expectedProfile: NativeVoiceProfile): FromHelper {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new VoiceError('VOICE_PROTOCOL_ERROR');
   const m = value as Record<string, unknown>;
@@ -75,7 +104,7 @@ function decode(value: unknown): FromHelper {
     case 'hello':
       exact('commandId', 'profile', 'interruption');
       command();
-      if (m.profile !== 'offline-memory-v1' || m.interruption !== 'unsupported')
+      if (m.profile !== expectedProfile || m.interruption !== 'unsupported')
         throw new VoiceError('VOICE_PROTOCOL_ERROR');
       break;
     case 'answer':
@@ -93,6 +122,17 @@ function decode(value: unknown): FromHelper {
       if (!nativeText(m.handoffId, 256) || !nativeText(m.text, voiceLimits.maxTranscriptBytes))
         throw new VoiceError('VOICE_PROTOCOL_ERROR');
       break;
+    case 'transcript':
+      exact('itemId', 'role', 'text', 'status');
+      if (
+        expectedProfile !== 'subscription-webrtc-v3' ||
+        !nativeText(m.itemId, 256) ||
+        !nativeText(m.text, voiceLimits.maxTranscriptBytes) ||
+        (m.role !== 'user' && m.role !== 'assistant') ||
+        (m.status !== 'partial' && m.status !== 'final')
+      )
+        throw new VoiceError('VOICE_PROTOCOL_ERROR');
+      break;
     case 'delivery':
       exact('commandId', 'handoffId', 'deliveryId', 'status');
       command();
@@ -108,8 +148,8 @@ function decode(value: unknown): FromHelper {
       if (Object.hasOwn(m, 'commandId')) command();
       if (
         typeof m.code !== 'string' ||
-        !['VOICE_PROTOCOL_ERROR', 'VOICE_PROVIDER_ERROR', 'VOICE_PAYLOAD_TOO_LARGE'].includes(
-          m.code,
+        !(expectedProfile === 'subscription-webrtc-v3' ? liveErrors : offlineErrors).some(
+          (code) => code === m.code,
         )
       )
         throw new VoiceError('VOICE_PROTOCOL_ERROR');
@@ -120,7 +160,7 @@ function decode(value: unknown): FromHelper {
   return m as FromHelper;
 }
 
-/** Injected offline-memory-v1 only. Never installed as the production provider. */
+/** Profile is chosen by the trusted host, never negotiated from untrusted frames. */
 export class NativeVoiceTransport implements VoiceTransport {
   private receive: (event: VoiceProviderEvent) => void = () => {};
   private unsubscribe = () => {};
@@ -132,7 +172,8 @@ export class NativeVoiceTransport implements VoiceTransport {
   private terminal = false;
   private answered = false;
   private answerAccepted = false;
-  private queuedHandoffs: Extract<VoiceProviderEvent, { type: 'handoff' }>[] = [];
+  private queuedEvents: ReadyEvent[] = [];
+  private queuedBytes = 0;
   private ready = false;
   private hello = deferred<void>();
   private answer = deferred<string>();
@@ -153,7 +194,10 @@ export class NativeVoiceTransport implements VoiceTransport {
   private consumed = new Set<string>();
   private deliveryIds = new Set<string>();
 
-  constructor(private readonly wire: NativeVoiceWire) {
+  constructor(
+    private readonly wire: NativeVoiceWire,
+    private readonly expectedProfile: NativeVoiceProfile = 'offline-memory-v1',
+  ) {
     this.unsubscribe = wire.subscribe(
       (value) => {
         if (this.terminal) {
@@ -161,7 +205,7 @@ export class NativeVoiceTransport implements VoiceTransport {
           // Only the matching close ack can finish this bounded stop transaction.
           if (this.closeId) {
             try {
-              this.drain(decode(value));
+              this.drain(decode(value, this.expectedProfile));
             } catch {
               this.closed.reject(new VoiceError('VOICE_PROTOCOL_ERROR'));
             }
@@ -169,7 +213,7 @@ export class NativeVoiceTransport implements VoiceTransport {
           return;
         }
         try {
-          this.message(decode(value));
+          this.message(decode(value, this.expectedProfile));
         } catch (error) {
           this.fail(error instanceof VoiceError ? error : new VoiceError('VOICE_PROTOCOL_ERROR'));
         }
@@ -211,8 +255,9 @@ export class NativeVoiceTransport implements VoiceTransport {
         this.ready = true;
         return;
       case 'handoff':
+      case 'transcript':
         if (!this.ready) throw new VoiceError('VOICE_PROTOCOL_ERROR');
-        return; // Never enqueue or admit tasks during stop.
+        return; // Never enqueue, project speech or admit tasks during stop.
       case 'closed':
         if (frame.commandId !== this.closeId) throw new VoiceError('VOICE_PROTOCOL_ERROR');
         this.closed.resolve();
@@ -312,19 +357,17 @@ export class NativeVoiceTransport implements VoiceTransport {
         if (!this.ready || (!this.handoffs.has(frame.handoffId) && this.handoffs.size >= 48))
           throw new VoiceError('VOICE_PROTOCOL_ERROR');
         this.handoffs.add(frame.handoffId);
-        if (this.answerAccepted) {
-          this.receive({ type: 'handoff', handoffId: frame.handoffId, text: frame.text });
-        } else {
-          // Only already-control-ready events enter this bounded lifecycle queue.
-          // Broker explicitly releases them after validating the answer and lease.
-          if (this.queuedHandoffs.length >= voiceLimits.maxEvents)
-            throw new VoiceError('VOICE_PROTOCOL_ERROR');
-          this.queuedHandoffs.push({
-            type: 'handoff',
-            handoffId: frame.handoffId,
-            text: frame.text,
-          });
-        }
+        this.forward({ type: 'handoff', handoffId: frame.handoffId, text: frame.text });
+        return;
+      case 'transcript':
+        if (!this.ready) throw new VoiceError('VOICE_PROTOCOL_ERROR');
+        this.forward({
+          type: 'transcript',
+          itemId: frame.itemId,
+          role: frame.role,
+          text: frame.text,
+          final: frame.status === 'final',
+        });
         return;
       case 'delivery': {
         const pending = this.appends.get(frame.commandId);
@@ -346,11 +389,27 @@ export class NativeVoiceTransport implements VoiceTransport {
     }
   }
 
+  private forward(event: ReadyEvent): void {
+    if (this.answerAccepted) {
+      this.receive(event);
+      return;
+    }
+    const bytes = Buffer.byteLength(JSON.stringify(event));
+    if (
+      this.queuedEvents.length >= voiceLimits.maxEvents ||
+      this.queuedBytes + bytes > voiceLimits.maxEventBytes
+    )
+      throw new VoiceError('VOICE_PROTOCOL_ERROR');
+    this.queuedBytes += bytes;
+    this.queuedEvents.push(event);
+  }
+
   acceptAnswer(): void {
     if (this.terminal) return;
     if (!this.answered) throw new VoiceError('VOICE_PROTOCOL_ERROR');
     this.answerAccepted = true;
-    for (const event of this.queuedHandoffs.splice(0)) {
+    this.queuedBytes = 0;
+    for (const event of this.queuedEvents.splice(0)) {
       if (this.terminal) break;
       this.receive(event);
     }
@@ -398,7 +457,8 @@ export class NativeVoiceTransport implements VoiceTransport {
   }
 
   private cancel(error: VoiceError) {
-    this.queuedHandoffs.length = 0;
+    this.queuedEvents.length = 0;
+    this.queuedBytes = 0;
     clearTimeout(this.timer);
     this.removeAbort();
     this.hello.reject(error);

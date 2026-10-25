@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'node:child_process';
+import type { EventEmitter } from 'node:events';
 import type { Readable, Writable } from 'node:stream';
 import { VoiceError } from './broker.js';
 import type { ToHelper } from './native-transport.js';
@@ -7,14 +8,12 @@ import { voiceLimits } from './types.js';
 /** Host-owned streams may be ordinary Node fixture pipes or reviewed FIFO FDs.
  * This adapter neither selects descriptors nor asserts native auth-FD approval.
  */
-export type NativeVoiceChild = Pick<
-  ChildProcess,
-  'on' | 'off' | 'kill' | 'exitCode' | 'signalCode'
-> & {
-  stdin: Writable;
-  stdout: Readable;
-  stderr: Readable;
-};
+export type NativeVoiceChild = Pick<ChildProcess, 'kill' | 'exitCode' | 'signalCode'> &
+  Pick<EventEmitter, 'on' | 'off'> & {
+    stdin: Writable;
+    stdout: Readable;
+    stderr: Readable;
+  };
 
 export interface NativeVoiceWire {
   send(frame: ToHelper): void;
