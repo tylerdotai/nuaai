@@ -6012,10 +6012,15 @@ dependencies = [
 name = "nuaai-voice-probe"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "codex-api",
  "codex-http-client",
  "codex-login",
  "codex-model-provider",
+ "http 1.4.0",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

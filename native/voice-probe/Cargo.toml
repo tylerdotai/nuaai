@@ -3,10 +3,25 @@ name = "nuaai-voice-probe"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "nuaai-voice-probe"
+
+[features]
+synthetic-auth-tests = []
+synthetic-auth-faults = ["synthetic-auth-tests"]
+
+[[bin]]
+name = "synthetic-auth-probe"
+path = "src/bin/synthetic_auth_probe.rs"
+required-features = ["synthetic-auth-tests"]
 
 [workspace]
 
 [dependencies]
+base64 = "=0.22.1"
+http = "=1.4.0"
+serde_json = "=1.0.149"
+tempfile = "=3.27.0"
+tokio = { version = "=1.52.3", features = ["rt", "macros", "time", "net", "io-util", "io-std"] }
 codex-api = { git = "https://github.com/openai/codex", rev = "6aaac694803004a63c6f393d153c96d22521a6b9" }
 codex-login = { git = "https://github.com/openai/codex", rev = "6aaac694803004a63c6f393d153c96d22521a6b9" }
 codex-model-provider = { git = "https://github.com/openai/codex", rev = "6aaac694803004a63c6f393d153c96d22521a6b9" }
