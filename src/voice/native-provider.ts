@@ -16,6 +16,7 @@ import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { VoiceError, type VoiceProvider } from './broker.js';
 import { unsupportedCodexVoiceProvider } from './codex-transport.js';
+import { NativeVoiceDiagnostics, nativeVoiceExit } from './native-diagnostics.js';
 import { NativeVoiceTransport } from './native-transport.js';
 import {
   type NativeVoiceChild,
@@ -28,6 +29,7 @@ export interface NativeVoiceHostOptions {
   home?: string;
   codexHome?: string;
   temporaryRoot?: string;
+  logger?: Pick<Console, 'warn'>;
 }
 
 export function nativeHelperEnvironment(options: NativeVoiceHostOptions = {}): NodeJS.ProcessEnv {
@@ -91,6 +93,7 @@ function composeChild(
   stdin: Socket,
   stdout: Socket,
   stderr: Socket,
+  logger: Pick<Console, 'warn'>,
 ): NativeVoiceChild {
   const bridge = Object.assign(new EventEmitter(), {
     stdin,
@@ -116,7 +119,15 @@ function composeChild(
     drained = true;
     finish();
   });
-  child.on('exit', () => {
+  child.once('exit', (code, signal) => {
+    const classification = nativeVoiceExit(code, signal);
+    if (classification) {
+      try {
+        logger.warn('NUAAI native voice helper exited', classification);
+      } catch {
+        /* Logging cannot interrupt stdout drain. */
+      }
+    }
     exited = true;
     finish();
   });
@@ -185,7 +196,14 @@ function openWire(path: string, options: NativeVoiceHostOptions): NativeVoiceWir
       stdio: [input, output, error, execFd],
     });
     for (const fd of [input, output, error, execFd, ...holders]) closeFd(fd);
-    const base = createNativeChildWire(composeChild(child, stdin, stdout, stderr));
+    const logger = options.logger ?? console;
+    const diagnostics = new NativeVoiceDiagnostics((diagnostic) =>
+      logger.warn('NUAAI native voice operation failed', diagnostic),
+    );
+    stderr.on('data', (bytes: Buffer) => diagnostics.write(bytes));
+    stderr.once('end', () => diagnostics.end());
+    stderr.once('close', () => diagnostics.end());
+    const base = createNativeChildWire(composeChild(child, stdin, stdout, stderr, logger));
     const ownedDirectory = directory;
     const ownedChild = child;
     let closing: Promise<void> | undefined;

@@ -20,7 +20,13 @@ afterEach(() => {
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-function fixture(profile = 'subscription-webrtc-v3', failure = '', hang = false) {
+function fixture(
+  profile = 'subscription-webrtc-v3',
+  failure = '',
+  hang = false,
+  diagnostic = false,
+  exitCode = 0,
+) {
   const root = mkdtempSync(join(tmpdir(), 'nuaai-live-host-test-'));
   roots.push(root);
   const binary = join(root, 'helper');
@@ -32,6 +38,7 @@ function fixture(profile = 'subscription-webrtc-v3', failure = '', hang = false)
     binary,
     `#!${process.execPath}
 const fs=require('node:fs');
+process.exitCode=${exitCode};
 fs.writeFileSync(${JSON.stringify(join(root, 'pid'))},String(process.pid),{mode:0o600});
 if(${JSON.stringify(hang)}){process.on('SIGTERM',()=>{});setInterval(()=>{},1000);}
 if(![0,1,2].every(fd=>fs.fstatSync(fd).isFIFO()))process.exit(7);
@@ -42,6 +49,7 @@ process.stdin.on('data',chunk=>{bytes=Buffer.concat([bytes,chunk]);while(bytes.l
 const length=bytes.readUInt32BE();const m=JSON.parse(bytes.subarray(4,4+length));bytes=bytes.subarray(4+length);
 if(m.type==='hello')send({type:'hello',commandId:m.commandId,profile:${JSON.stringify(profile)},interruption:'unsupported'});
 if(m.type==='start'){
+if(${JSON.stringify(diagnostic)})process.stderr.write(${JSON.stringify('unapproved synthetic-private\nNUAAI_VOICE_DIAGNOSTIC operation=call kind=http status=403\nNUAAI_VOICE_DIAGNOSTIC operation=call kind=http status=403 token=synthetic-private\n')});
 if(${JSON.stringify(failure)}){process.stderr.write('synthetic-private-diagnostic\\n');send({type:'error',commandId:m.commandId,code:${JSON.stringify(failure)}});process.stdin.destroy();process.stdout.end();process.stderr.end();}
 else {send({type:'answer',commandId:m.commandId,sdp:'synthetic-answer'});send({type:'control_ready',commandId:m.commandId});send({type:'handoff',handoffId:'h',text:'task'});send({type:'transcript',itemId:'u',role:'user',text:'transcript-not-task',status:'final'});}}
 if(m.type==='append')send({type:'delivery',commandId:m.commandId,handoffId:m.handoffId,deliveryId:m.deliveryId,status:'accepted'});
@@ -55,7 +63,8 @@ if(m.type==='close'&&!${JSON.stringify(hang)}){send({type:'closed',commandId:m.c
     binary,
     temporaryRoot,
     home,
-    provider: () => createNativeVoiceProvider(binary, { temporaryRoot, home }),
+    provider: (logger?: Pick<Console, 'warn'>) =>
+      createNativeVoiceProvider(binary, { temporaryRoot, home, logger }),
   };
 }
 
@@ -136,6 +145,37 @@ describe('trusted native voice provider and actual owned FIFO host', () => {
       expect(readFileSync(f.binary, 'utf8')).not.toContain('auth.json');
     },
   );
+  it('logs only parsed safe diagnostic fields from owned helper stderr', async () => {
+    const f = fixture('subscription-webrtc-v3', 'VOICE_ACCESS_DENIED', false, true);
+    const warn = vi.fn();
+    const transport = f.provider({ warn }).create();
+    await expect(
+      transport.start('offer', () => {}, new AbortController().signal),
+    ).rejects.toMatchObject({ code: 'VOICE_ACCESS_DENIED' });
+    await transport.stop();
+    expect(warn).toHaveBeenCalledExactlyOnceWith('NUAAI native voice operation failed', {
+      operation: 'call',
+      kind: 'http',
+      status: 403,
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('synthetic-private');
+    expect(readdirSync(f.temporaryRoot)).toEqual([]);
+  });
+  it('logs only the numeric nonzero exit classification, never raw panic-like stderr', async () => {
+    const f = fixture('subscription-webrtc-v3', 'VOICE_PROVIDER_ERROR', false, false, 101);
+    const warn = vi.fn();
+    const transport = f.provider({ warn }).create();
+    await expect(
+      transport.start('offer', () => {}, new AbortController().signal),
+    ).rejects.toMatchObject({ code: 'VOICE_PROVIDER_ERROR' });
+    await transport.stop();
+    expect(warn).toHaveBeenCalledExactlyOnceWith('NUAAI native voice helper exited', {
+      code: 101,
+      signal: null,
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('synthetic-private');
+    expect(readdirSync(f.temporaryRoot)).toEqual([]);
+  });
   it('hosts two concurrent FIFO children without thread-pool stalls or cross-generation events', async () => {
     const f = fixture();
     const provider = f.provider();
