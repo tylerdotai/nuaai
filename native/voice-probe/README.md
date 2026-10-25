@@ -94,6 +94,32 @@ remaining unchanged after drift do not authorize their use after owner rejection
 No content client is constructed, token freshness remains unvalidated, and no
 401 handling, request binding, WebRTC or speech acceptance is claimed here.
 
+### Opt-in native B -> in-memory call composition
+
+Feature `synthetic-bound-call-tests` (default OFF, implies `synthetic-auth-tests`)
+adds only `bound_create_uses_B`, `bound_owner_drift_before_create` and
+`bound_frozen_B_after_rotation`. It reuses the same internally generated FILE
+fixtures, actual native A/B constructors, permanently Unavailable auth factory,
+native FD guard and time-only runtime. The existing 23-case JSON v1 is unchanged;
+only these three cases use JSON v2 with fixed `bound_request` checks.
+
+The actual native frozen B provider, not a replacement AuthProvider, is passed
+to public `RealtimeCallClient<RecordingTransport>`. Its real execute method counts
+entry attempts and invokes actual `Request::prepare_body_for_send()`, checking
+exactly one B bearer/account pair, not A or the internally rotated C. The reserved
+`.invalid` URL is request data only; this transport never resolves or connects.
+An inert recorder is allocated before the public persisted-owner recheck so a
+zero call count is measured. Owner drift must deny client construction/dispatch;
+same-owner token rotation after freeze must not silently change B's header pair.
+
+The RED candidate is separately fingerprinted before the missing owner admission
+check is repaired; its actual ownerfalse/request1 result must fail the strict
+zero-request oracle under the same reviewed syscall-denial harness. No constructor
+execution is permitted before complete source/compiler/feature/ELF review and
+canary validation. The guarded candidate must be built/frozen independently after
+an explicit RED-run release. These tests prove neither atomic/idle revocation nor
+real content networking, freshness, entitlement, WebSocket, helper or activation.
+
 ### Separate RED counterfactuals
 
 Feature `synthetic-auth-faults` (default OFF, implies `synthetic-auth-tests`) adds

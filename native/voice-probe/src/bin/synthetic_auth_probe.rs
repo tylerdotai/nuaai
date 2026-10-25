@@ -41,6 +41,10 @@ use codex_login::{
 use nuaai_voice_probe::{UPSTREAM_COMMIT, auth_guard::valid_bound_headers};
 use serde_json::{Value, json};
 
+#[cfg(feature = "synthetic-bound-call-tests")]
+#[path = "../bound_call.rs"]
+mod bound_call;
+
 const BASE: &str = "http://127.0.0.1:9";
 const CASES: &[&str] = &[
     "no_auth",
@@ -67,6 +71,18 @@ const CASES: &[&str] = &[
     "managed_ab_store_removed",
     "managed_idle_owner_switch",
 ];
+
+fn is_bound_case(case: &str) -> bool {
+    #[cfg(feature = "synthetic-bound-call-tests")]
+    {
+        bound_call::CASES.contains(&case)
+    }
+    #[cfg(not(feature = "synthetic-bound-call-tests"))]
+    {
+        let _ = case;
+        false
+    }
+}
 
 fn is_fault_case(case: &str) -> bool {
     cfg!(feature = "synthetic-auth-faults")
@@ -345,6 +361,16 @@ async fn run(case: &str, home: &Path) -> std::io::Result<Value> {
                 "plus",
             ),
         )?,
+        case if is_bound_case(case) => write_fixture(
+            home,
+            &managed(
+                Some("fixture-account"),
+                Some("fixture-user"),
+                Some("fixture-login"),
+                "fixture-access-B",
+                "plus",
+            ),
+        )?,
         "managed_ab_store_removed" => std::fs::remove_file(home.join("auth.json"))?,
         _ => {}
     }
@@ -424,6 +450,53 @@ async fn run(case: &str, home: &Path) -> std::io::Result<Value> {
         if eligible {
             report["result"] = json!("eligible_frozen_snapshot");
         }
+        #[cfg(feature = "synthetic-bound-call-tests")]
+        if is_bound_case(case) {
+            if !eligible {
+                return Err(std::io::Error::other("synthetic bound setup rejected"));
+            }
+            match case {
+                "bound_owner_drift_before_create" => write_fixture(
+                    home,
+                    &managed(
+                        Some("fixture-account-C"),
+                        Some("fixture-user-C"),
+                        Some("fixture-login-C"),
+                        "fixture-access-C",
+                        "plus",
+                    ),
+                )?,
+                "bound_frozen_B_after_rotation" => write_fixture(
+                    home,
+                    &managed(
+                        Some("fixture-account"),
+                        Some("fixture-user"),
+                        Some("fixture-login"),
+                        "fixture-access-C",
+                        "plus",
+                    ),
+                )?,
+                _ => {}
+            }
+            let observed = bound_call::exercise(
+                &manager,
+                snapshot_a
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("synthetic A absent"))?,
+                auth,
+                provider.clone(),
+            )
+            .await?;
+            report["version"] = json!(2);
+            report["measurement"] = json!("native_bound_call");
+            report["result"] = json!(if observed["admission_denied"] == true {
+                "owner_rejected"
+            } else {
+                "create_recorded"
+            });
+            report["content_constructed"] = observed["call_client_constructed"].clone();
+            report["bound_request"] = observed;
+        }
         if matches!(
             case,
             "frozen_provider_after_store_drift" | "managed_idle_owner_switch"
@@ -475,7 +548,9 @@ fn main() {
     }
     if args.len() != 3
         || args[1] != "--case"
-        || !(CASES.contains(&args[2].as_str()) || is_fault_case(&args[2]))
+        || !(CASES.contains(&args[2].as_str())
+            || is_fault_case(&args[2])
+            || is_bound_case(&args[2]))
     {
         std::process::exit(2);
     }
@@ -582,6 +657,23 @@ mod tests {
                     .find("syscall(436, 3_usize, usize::MAX, 0_usize)")
                     .unwrap()
         );
+    }
+
+    #[cfg(feature = "synthetic-bound-call-tests")]
+    #[test]
+    fn bound_cases_are_fixed_managed_and_never_select_fault_policy() {
+        let policy = NetworkPolicyController::default().policy();
+        let endpoint = format!("{BASE}/oauth/token").parse().unwrap();
+        for case in bound_call::CASES {
+            assert!(is_bound_case(case));
+            assert!(!is_fault_case(case));
+            assert!(matches!(
+                factory_for_case(case, &policy)
+                    .network_policy()
+                    .acquire(&endpoint),
+                Err(NetworkPolicyDenied::Unavailable)
+            ));
+        }
     }
 
     #[test]

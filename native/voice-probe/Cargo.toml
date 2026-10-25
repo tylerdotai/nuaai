@@ -8,6 +8,7 @@ default-run = "nuaai-voice-probe"
 [features]
 synthetic-auth-tests = []
 synthetic-auth-faults = ["synthetic-auth-tests"]
+synthetic-bound-call-tests = ["synthetic-auth-tests"]
 
 [[bin]]
 name = "synthetic-auth-probe"
