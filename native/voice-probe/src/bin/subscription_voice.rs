@@ -36,7 +36,7 @@ fn authority_env(name: &str) -> bool {
                 | "NODE_EXTRA_CA_CERTS"
         )
 }
-fn prepare() -> Result<Option<PathBuf>, Code> {
+pub(crate) fn prepare() -> Result<Option<PathBuf>, Code> {
     if std::env::args_os().len() != 1 {
         return Err(Code::Protocol);
     }

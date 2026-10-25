@@ -33,6 +33,11 @@ name = "nuaai-subscription-voice"
 path = "src/bin/subscription_voice.rs"
 required-features = ["subscription-voice"]
 
+[[bin]]
+name = "nuaai-voice-auth-metadata"
+path = "src/bin/voice_auth_metadata.rs"
+required-features = ["subscription-voice"]
+
 [workspace]
 
 [dependencies]

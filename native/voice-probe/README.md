@@ -77,6 +77,17 @@ channel. This adapter drains ignored audio cooperatively and bounds its own
 stdio, transcripts, handoff memory and result queue; it does not claim the SDK
 channel itself is bounded. No supported provider interruption API is asserted.
 
+### Private read-only auth metadata diagnosis
+
+The same default-OFF feature also builds `nuaai-voice-auth-metadata`, a separate
+private no-argument diagnostic, not a helper profile or signaling client. It
+reuses the exact entry guard and permanently Unavailable auth factory. It emits
+only fixed booleans for managed identity/account/user/login-owner/header/strict
+owner-check presence plus stages and numeric timings. No native identity/token
+values, paths, raw errors, content factory, refresh or credential writes.
+Execute against a real managed store ONLY after Lead source/artifact clearance.
+This diagnostic does not relax production admission or claim a legacy root cause.
+
 ## What executes by default
 
 The default `nuaai-voice-probe` executable resolves exported function items and

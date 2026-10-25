@@ -296,20 +296,7 @@ struct Authority {
 }
 impl Authority {
     async fn load(home: PathBuf) -> Result<Self> {
-        let controller = NetworkPolicyController::default(); // Unavailable before constructor.
-        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
-            .with_network_policy(controller.policy());
-        let route = AuthRouteConfig::from_http_client_factory(factory);
-        let manager = AuthManager::new(
-            home,
-            false,
-            AuthCredentialsStoreMode::Auto,
-            None,
-            Some("https://chatgpt.com".into()),
-            AuthKeyringBackendKind::Direct,
-            route,
-        )
-        .await;
+        let (manager, controller) = read_manager(home).await;
         let (snapshot, frozen) = freeze_snapshot(manager.auth_cached())?;
         Ok(Self {
             manager: std::sync::Arc::new(manager),
@@ -334,6 +321,96 @@ impl Authority {
         })
         .await
     }
+}
+async fn read_manager(home: PathBuf) -> (AuthManager, NetworkPolicyController) {
+    let controller = NetworkPolicyController::default(); // Unavailable before constructor.
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+        .with_network_policy(controller.policy());
+    let manager = AuthManager::new(
+        home,
+        false,
+        AuthCredentialsStoreMode::Auto,
+        None,
+        Some("https://chatgpt.com".into()),
+        AuthKeyringBackendKind::Direct,
+        AuthRouteConfig::from_http_client_factory(factory),
+    )
+    .await;
+    (manager, controller)
+}
+fn empty_auth_metadata() -> Value {
+    json!({"stage":"not_started","managedChatgpt":false,"hasAccount":false,"hasUserId":false,
+        "hasLoginOwner":false,"validUniqueHeaders":false,"ownerCheck":false,
+        "loadMs":0,"ownerCheckMs":0,"elapsedMs":0})
+}
+fn snapshot_metadata(snapshot: Option<&CodexAuth>) -> Value {
+    let mut report = empty_auth_metadata();
+    if let Some(snapshot) = snapshot.filter(|auth| matches!(auth, CodexAuth::Chatgpt(_))) {
+        report["managedChatgpt"] = json!(true);
+        let account = snapshot.get_account_id();
+        report["hasAccount"] = json!(account.as_ref().is_some_and(|value| !value.is_empty()));
+        report["hasUserId"] = json!(
+            snapshot
+                .get_chatgpt_user_id()
+                .is_some_and(|value| !value.is_empty())
+        );
+        report["hasLoginOwner"] = json!(
+            snapshot
+                .get_token_data()
+                .ok()
+                .and_then(|data| data.login_owner_id)
+                .is_some_and(|value| !value.is_empty())
+        );
+        report["validUniqueHeaders"] = json!(
+            codex_model_provider::auth_provider_from_auth(snapshot)
+                .to_auth_headers()
+                .ok()
+                .is_some_and(|headers| account.as_ref().is_some_and(|account| {
+                    crate::auth_guard::valid_bound_headers(&headers, account)
+                }))
+        );
+    }
+    report
+}
+/// Private metadata-only diagnosis. No content factory, refresh, raw errors or identity values.
+/// Caller must have explicit review clearance before using a real managed home.
+pub async fn auth_metadata(home: Option<PathBuf>) -> Value {
+    let started = std::time::Instant::now();
+    let report = std::sync::Arc::new(std::sync::Mutex::new(empty_auth_metadata()));
+    if let Some(home) = home {
+        let updated = report.clone();
+        let result = native(async move {
+            let loading = std::time::Instant::now();
+            let (manager, _never_enable_auth) = read_manager(home).await;
+            let snapshot = manager.auth_cached();
+            let mut fields = snapshot_metadata(snapshot.as_ref());
+            fields["loadMs"] = json!(loading.elapsed().as_millis() as u64);
+            fields["stage"] = json!("snapshot_loaded");
+            *updated.lock().map_err(|_| Code::Provider)? = fields;
+            if let Some(snapshot) = snapshot.filter(|auth| matches!(auth, CodexAuth::Chatgpt(_))) {
+                let checking = std::time::Instant::now();
+                let checked = manager.account_login_is_current(&snapshot).await;
+                let mut fields = updated.lock().map_err(|_| Code::Provider)?;
+                fields["ownerCheckMs"] = json!(checking.elapsed().as_millis() as u64);
+                fields["ownerCheck"] = json!(checked.as_ref().is_ok_and(|current| *current));
+                fields["stage"] = json!(if checked.is_ok() {
+                    "complete"
+                } else {
+                    "owner_check_error"
+                });
+            }
+            Ok(())
+        })
+        .await;
+        if result.is_err() {
+            report.lock().expect("metadata lock")["stage"] = json!("native_read_incomplete");
+        }
+    } else {
+        report.lock().expect("metadata lock")["stage"] = json!("missing_home");
+    }
+    let mut fields = report.lock().expect("metadata lock").clone();
+    fields["elapsedMs"] = json!(started.elapsed().as_millis() as u64);
+    fields
 }
 fn freeze_snapshot(snapshot: Option<CodexAuth>) -> Result<(CodexAuth, SharedAuthProvider)> {
     let snapshot = snapshot.ok_or(Code::Login)?;
@@ -766,6 +843,36 @@ async fn session(home: Option<PathBuf>, io: &impl Wire) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_is_only_fixed_metadata_never_native_identity_or_error_values() {
+        let empty = snapshot_metadata(None);
+        assert_eq!(
+            empty,
+            snapshot_metadata(Some(&CodexAuth::from_api_key(
+                "fabricated-private-not-output"
+            )))
+        );
+        let object = empty.as_object().unwrap();
+        assert_eq!(object.len(), 10);
+        for key in [
+            "managedChatgpt",
+            "hasAccount",
+            "hasUserId",
+            "hasLoginOwner",
+            "validUniqueHeaders",
+            "ownerCheck",
+        ] {
+            assert_eq!(object[key], false);
+        }
+        for key in ["loadMs", "ownerCheckMs", "elapsedMs"] {
+            assert_eq!(object[key], 0);
+        }
+        assert_eq!(object["stage"], "not_started");
+        assert!(!empty.to_string().contains("fabricated-private"));
+        rt().block_on(async {
+            assert_eq!(auth_metadata(None).await["stage"], "missing_home");
+        });
+    }
     #[test]
     fn strict_live_command_admission_and_delivery_correlation() {
         let mut state = State::default();
