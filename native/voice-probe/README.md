@@ -78,6 +78,16 @@ Native behavior:
   joining the official public SDK existing-call control sideband at its default
   `wss://api.openai.com/v1/live/{encoded-call-id}`; same frozen native auth. No
   API-key fallback or inherited endpoint/proxy/TLS/auth override is accepted.
+- Static NUAAI task instructions identify the voice front-end of the host daemon,
+  distinguish governed backend CLI/files/tools from voice speech, and direct
+  actionable do/try/run/check/inspect requests through the provider's existing
+  client delegation rather than a tutorial or blanket capability denial. Safety,
+  permissions, approvals and execution remain backend-owned; no invented runs,
+  results or approvals. This is serialized verbatim into the actual new HTTP
+  call's `session.instructions`, alongside native `delegation.type=client`.
+  Existing-call sideband join intentionally does not update instructions: apply
+  prompt changes through a NEW voice call. Prepared-request tests establish the
+  prompt reaches the request, not that a real model will choose to delegate.
 - SDK Speakable append binds the actual handoff ID; delivery ID remains local
   for exact echo. Accepted means SDK write, NOT audible playback. Partial/error
   sends report unknown without retries. Identical handoff replay is ignored;
