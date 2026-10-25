@@ -53,6 +53,8 @@ export interface VoiceTransport {
     receive: (event: VoiceProviderEvent) => void,
     signal: AbortSignal,
   ): Promise<string>;
+  /** Host lifecycle fence: called only after answer validation and lease transition. */
+  acceptAnswer?(): void;
   stop(): Promise<void>;
   deliver(text: string, context: VoiceDeliveryContext): Promise<void>;
   interrupt(): Promise<void>;
@@ -261,6 +263,8 @@ export class VoiceBroker {
         lease.start = Promise.resolve(undefined as never);
       });
       this.state(lease, 'negotiating');
+      lease.transport.acceptAnswer?.();
+      if (terminal(lease)) throw new VoiceError('VOICE_NEGOTIATION_EXPIRED', 409, 'signaling');
       return { voice: this.snapshot(lease), answer: { type: 'answer', sdp: answer } };
     } catch (error) {
       const failure = lease.snapshot.failure
