@@ -218,11 +218,17 @@ it(
 
 it('T06 retries a lost acceptance across reconnect with the same key and preserves edits made in flight', async () => {
   const held = gate();
+  const nextAcceptance = gate();
+  const acceptedRefresh = gate();
   const submissions: Array<{ threadId: string; input: string; idempotencyKey?: string }> = [];
   const durable = new Map<string, string>();
   let drop = true;
   let hold = false;
   const f = await fixture(async (req, res) => {
+    if (req.url === '/api/sessions' && submissions.length === 2) {
+      await acceptedRefresh.promise;
+      return false;
+    }
     if (req.url !== '/api/runs') return false;
     let body = '';
     for await (const chunk of req) body += String(chunk);
@@ -236,6 +242,7 @@ it('T06 retries a lost acceptance across reconnect with the same key and preserv
       return true;
     }
     if (hold) await held.promise;
+    if (submissions.length === 3) await nextAcceptance.promise;
     json(res, { id: `run-${key}` });
     return true;
   });
@@ -259,13 +266,26 @@ it('T06 retries a lost acceptance across reconnect with the same key and preserv
     expect(submissions[0]?.idempotencyKey).toMatch(/^[a-zA-Z0-9-]+$/u);
     expect(submissions[1]?.idempotencyKey).toBe(submissions[0]?.idempotencyKey);
     expect([...durable.values()]).toEqual(['retry safely']);
+    // Acceptance precedes the refresh awaited by runAction. Enter is intentionally
+    // ignored while that action is busy, so wait for its actual completion first.
+    expect(f.frame()).toContain('Applying…');
+    acceptedRefresh.release();
+    await expect.poll(f.frame).not.toContain('Applying…');
     f.stdin.write('\r');
     await expect.poll(() => submissions.length).toBe(3);
     expect(submissions[2]?.idempotencyKey).not.toBe(submissions[0]?.idempotencyKey);
-    await expect.poll(f.frame).toContain('Run accepted');
-    expect(f.frame()).not.toContain('› retry safely plus next draft');
+    await expect.poll(f.frame).toContain('Applying…');
+    // The previous acceptance notice is still visible while this response is held;
+    // it cannot prove that the new submission has been accepted or rendered.
+    expect(f.frame()).toContain('Run accepted');
+    expect(f.frame()).toContain('› retry safely plus next draft');
+    nextAcceptance.release();
+    await expect.poll(f.frame).not.toContain('› retry safely plus next draft');
+    expect([...durable.values()]).toEqual(['retry safely', 'retry safely plus next draft']);
   } finally {
     held.release();
+    acceptedRefresh.release();
+    nextAcceptance.release();
     await f.close();
   }
 });

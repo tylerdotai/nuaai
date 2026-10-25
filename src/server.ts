@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
@@ -18,6 +18,7 @@ import { ApprovalStateError, approvalStatuses } from './core/approvals.js';
 import { executionRequestSchema } from './core/execution-policy.js';
 import type { AgentRuntime } from './core/runtime.js';
 import type { Scheduler } from './core/scheduler.js';
+import { effectiveRequestOrigin } from './gateway/origin.js';
 import { createToken, inspectToken, validateToken } from './gateway/token.js';
 import { decodeInputAttachments } from './integrations/input-attachments.js';
 import type { McpManager } from './integrations/mcp.js';
@@ -34,6 +35,9 @@ import type { SecretsManager } from './security/secrets.js';
 import { SkillLearner } from './skills/learner.js';
 import type { SkillRegistry } from './skills/registry.js';
 import { getVersion } from './version.js';
+import { VoiceBroker, VoiceError } from './voice/broker.js';
+import { unsupportedCodexVoiceProvider } from './voice/codex-transport.js';
+import { installVoiceRoutes } from './voice/http.js';
 import { attachmentMaxCount } from './web/attachments.js';
 import { buildThreadPresentation } from './web/presentation.js';
 
@@ -195,6 +199,7 @@ export interface GatewayServices {
   secrets: SecretsManager;
   mcp?: McpManager;
   knowledge?: KnowledgeLearner;
+  voice?: VoiceBroker;
 }
 
 function tokenFromRequest(request: Request): string | null {
@@ -307,6 +312,23 @@ export function createApp(services: GatewayServices): Hono {
     return context.json({ ok: true });
   });
   app.use('/api/*', protectedRoute);
+  const voice =
+    services.voice ??
+    new VoiceBroker({
+      provider: unsupportedCodexVoiceProvider,
+      authorize: () => {
+        throw new VoiceError('VOICE_DISABLED', 503, 'preflight');
+      },
+      admit: () => {
+        throw new VoiceError('VOICE_DISABLED', 503, 'preflight');
+      },
+    });
+  installVoiceRoutes(app, voice, (request) => {
+    const token = tokenFromRequest(request);
+    const auth = token ? validateToken(token, services.authSecret, now()) : null;
+    if (!token || !auth || !isRequestCredential(auth)) throw new VoiceError('VOICE_FORBIDDEN', 403);
+    return { owner: createHash('sha256').update(token).digest('hex'), expiresAt: auth.exp * 1_000 };
+  });
   app.get('/api/status', async (context) =>
     context.json({
       ...services.runtime.status(),
@@ -1361,8 +1383,9 @@ export async function startServer(services: GatewayServices): Promise<GatewayHan
         }
         chunks.push(buffer);
       }
-      const url = `http://${request.headers.host ?? `${services.host}:${services.port}`}${request.url ?? '/'}`;
-      const requestUrl = new URL(url);
+      const origin = effectiveRequestOrigin(request.socket.remoteAddress, request.rawHeaders);
+      const requestUrl = new URL(request.url ?? '/', origin);
+      if (requestUrl.origin !== origin) throw new Error('Invalid request target');
       const mountedAtNuaai =
         requestUrl.pathname === '/nuaai' || requestUrl.pathname.startsWith('/nuaai/');
       if (mountedAtNuaai) {

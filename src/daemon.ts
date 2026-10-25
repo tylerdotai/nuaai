@@ -42,6 +42,9 @@ import { SkillLearner } from './skills/learner.js';
 import { loadFilesystemSkills } from './skills/loader.js';
 import { SkillRegistry } from './skills/registry.js';
 import { ToolRegistry } from './tools/registry.js';
+import { VoiceBroker, VoiceError } from './voice/broker.js';
+import { createNativeVoiceProvider } from './voice/native-provider.js';
+import { voiceRunResult } from './voice/run-result.js';
 import { initWorkspace } from './workspace/fs.js';
 
 export interface DaemonHandle {
@@ -310,6 +313,36 @@ async function startOwnedDaemon(
       );
     }
   });
+  // Trusted local operator opt-in only; no browser/provider RPC selects a binary.
+  // Absent a validated native helper, remain unavailable (never App Server fallback).
+  const voice = new VoiceBroker({
+    provider: createNativeVoiceProvider(process.env.NUAAI_VOICE_HELPER),
+    authorize: (_owner, binding) => {
+      const thread = store.getThread(binding.threadId);
+      const snapshot = store.getSessionIdentity(binding.sessionId);
+      if (!thread || thread.sessionId !== binding.sessionId || !snapshot)
+        throw new VoiceError('VOICE_BINDING_CONFLICT', 409);
+      return {
+        identitySnapshotId: snapshot.id,
+        workspaceRoot: snapshot.workspaceRoot,
+        authorityKey: JSON.stringify(effectiveConfig.permissions.web),
+      };
+    },
+    admit: (binding, text, key, authority) => {
+      const run = runtime.startRun({
+        threadId: binding.threadId,
+        input: text,
+        idempotencyKey: key,
+        identitySnapshotId: authority.identitySnapshotId,
+        permissionSource: 'web',
+        permissions: permissionContextForProfile(effectiveConfig.permissions.web),
+      });
+      return {
+        runId: run.id,
+        result: voiceRunResult(runtime.waitForRun(run.id)),
+      };
+    },
+  });
   let gateway: GatewayHandle;
   try {
     scheduler.start();
@@ -332,8 +365,10 @@ async function startOwnedDaemon(
       plugins,
       secrets,
       mcp,
+      voice,
     });
   } catch (error) {
+    await voice.shutdown();
     mcp.stop();
     await scheduler.stop();
     await runtime.shutdown();
@@ -762,6 +797,7 @@ async function startOwnedDaemon(
     unsubscribeMatrixRuntime?.();
     unsubscribeKnowledge();
     continuity?.close();
+    await voice.shutdown();
     await scheduler.stop();
     await runtime.shutdown();
     await scheduler.drain();
