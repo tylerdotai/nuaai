@@ -89,3 +89,40 @@ request-site denial message is lossy and paired with a separate TCP fault trace;
 it is not a typed error cause. No content/401/freshness/WS/helper/daemon/provider
 entitlement/microphone/audio acceptance follows from these probes. Full mutation
 remains deliberately stopped; these are explicit bounded counterfactual tests.
+
+## Manual actual daemon/runtime + offline Rust helper smoke
+
+After reviewing this runner, the explicit arguments, and the reviewed e048 helper,
+run ONE session from the repository root using Node22 and existing `tsx`:
+
+```sh
+node --import tsx tests/native/daemon-voice.manual.ts \
+  --binary /absolute/protected/offline-voice-helper \
+  --sha256 e048e1f808ca92671d3a85ce73debbc3a1fbbf16e5ddaa9d1ccce3f82c50c73f
+```
+
+The filename is deliberately NOT `.test.ts`: ordinary npm tests, install and daemon
+startup never execute it. It rejects missing/extra args, any other digest and a
+mismatched binary before daemon/native startup. It uses existing Vitest and
+`identityHarness` (real authenticated port0 daemon, SQLite and AgentRuntime), with
+a module-scoped test VoiceProvider wrapping actual NativeVoiceTransport. It does
+not change production source/default providers, public HTTP or permissions.
+
+The child wrapper is the extracted Eval-tested `actual-helper-host.ts`: owned0600
+FIFOs, integer stdio, closed bootstrap holders, empty/fake child environment,
+existing strace all-network/io_uring denial, and host close after BOTH process exit
+and FIFO stdout EOF. No socket-stdio exception or new fence/profile. Parent daemon
+loopback HTTP is ordinary test I/O, not subjected to the child's denial belt.
+
+Two actual Rust handoffs become two durable real runtime runs and correlated
+native accepted deliveries. The real runtime serializes a thread, so this smoke
+asserts honest normal A->B completion (the separate process/adapter test covered
+reverse completion). An additional ordinary HTTP text run is deliberately held
+running during hangup, then finishes afterward; all three completed rows must
+survive a real daemon/SQLite restart. SSE and durable events must omit SDP. Native
+exit0/EOF/empty stderr/close_range/zero network attempts and binary hash stability
+are required. A new private evidence directory retains trace, stderr and a bounded
+metadata-only summary, including failures. No automatic retry or Rust build.
+
+This establishes offline daemon/runtime/helper integration only, never real auth,
+provider/SDK WS, service entitlement, microphone, playback or installed activation.
