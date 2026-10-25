@@ -14,6 +14,7 @@ import {
 import { Socket } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import type { Readable, Writable } from 'node:stream';
 import { VoiceError, type VoiceProvider } from './broker.js';
 import { unsupportedCodexVoiceProvider } from './codex-transport.js';
 import { NativeVoiceDiagnostics, nativeVoiceExit } from './native-diagnostics.js';
@@ -88,11 +89,12 @@ function fifoStream(fd: number, readable: boolean): Socket {
   return new Socket({ fd, readable, writable: !readable, allowHalfOpen: false });
 }
 
-function composeChild(
-  child: ChildProcess,
-  stdin: Socket,
-  stdout: Socket,
-  stderr: Socket,
+/** Internal lifecycle adapter, exported for deterministic stream-order tests. */
+export function composeNativeVoiceChild(
+  child: Pick<ChildProcess, 'exitCode' | 'signalCode' | 'kill'> & Pick<EventEmitter, 'on' | 'once'>,
+  stdin: Writable,
+  stdout: Readable,
+  stderr: Readable,
   logger: Pick<Console, 'warn'>,
 ): NativeVoiceChild {
   const bridge = Object.assign(new EventEmitter(), {
@@ -105,10 +107,11 @@ function composeChild(
       child.exitCode === null && child.signalCode === null && child.kill(signal),
   });
   let exited = child.exitCode !== null || child.signalCode !== null;
-  let drained = false;
+  let drained = stdout.readableEnded;
+  let stderrDrained = stderr.readableEnded;
   let closed = false;
   const finish = () => {
-    if (!exited || !drained || closed) return;
+    if (!exited || !drained || !stderrDrained || closed) return;
     closed = true;
     bridge.exitCode = child.exitCode;
     bridge.signalCode = child.signalCode;
@@ -117,6 +120,10 @@ function composeChild(
   };
   stdout.on('end', () => {
     drained = true;
+    finish();
+  });
+  stderr.on('end', () => {
+    stderrDrained = true;
     finish();
   });
   child.once('exit', (code, signal) => {
@@ -203,7 +210,9 @@ function openWire(path: string, options: NativeVoiceHostOptions): NativeVoiceWir
     stderr.on('data', (bytes: Buffer) => diagnostics.write(bytes));
     stderr.once('end', () => diagnostics.end());
     stderr.once('close', () => diagnostics.end());
-    const base = createNativeChildWire(composeChild(child, stdin, stdout, stderr, logger));
+    const base = createNativeChildWire(
+      composeNativeVoiceChild(child, stdin, stdout, stderr, logger),
+    );
     const ownedDirectory = directory;
     const ownedChild = child;
     let closing: Promise<void> | undefined;
