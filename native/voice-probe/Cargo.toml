@@ -6,6 +6,7 @@ publish = false
 default-run = "nuaai-voice-probe"
 
 [features]
+synthetic-ws-runtime = []
 synthetic-auth-tests = []
 synthetic-auth-faults = ["synthetic-auth-tests"]
 synthetic-bound-call-tests = ["synthetic-auth-tests"]
@@ -20,6 +21,11 @@ required-features = ["synthetic-auth-tests"]
 name = "offline-voice-helper"
 path = "src/bin/offline_voice_helper.rs"
 required-features = ["offline-helper-tests"]
+
+[[bin]]
+name = "synthetic-ws-runtime"
+path = "src/bin/synthetic_ws_runtime.rs"
+required-features = ["synthetic-ws-runtime"]
 
 [workspace]
 

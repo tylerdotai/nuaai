@@ -30,6 +30,22 @@ external Rust API visibility/type availability only—not service support,
 execution-isolation acceptance, entitlement, audibility, interruption or safety of
 an unimplemented future auth flow.
 
+## Separate actual-SDK existing-call component
+
+Opt-in feature `synthetic-ws-runtime` adds only `synthetic-ws-runtime`
+(`src/bin/synthetic_ws_runtime.rs`). Its companion Node `ws` fixture is
+`fixtures/ws_happy_cycle.mjs`. This is **not** the native helper or its framing:
+the fixture pre-registers `rtc_fixture_A`, requires zero HTTP attempts/creates,
+and exercises the pinned public existing-call join, typed A/B handoffs,
+Speakable B-then-A emoji results split at <=500 UTF-8 bytes, and one SDK close.
+It uses fixed fake headers, never AuthManager or real credentials.
+
+Build only after exclusive-cache handoff and source review. Execute only after
+ELF/bundle/profile review inside the approved private Docker network/filesystem
+namespace with both fixture and client inside it. Do not run this component on
+the host or under a relaxed auth harness. It adds no dependencies, changes no
+helper wire lock, and remains excluded from npm packaging/default capability.
+
 ## Explicit commands (from repository root)
 
 ```sh
