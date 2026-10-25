@@ -1,9 +1,22 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
-import { voiceLimits } from '../src/voice/types.js';
+import { type VoiceCapabilities, voiceLimits } from '../src/voice/types.js';
 import { VoicePanelView } from '../src/web/components/VoicePanel.js';
 import type { VoiceState } from '../src/web/voice.js';
+
+const liveCapability: VoiceCapabilities = {
+  v: 1,
+  available: true,
+  transport: 'webrtc',
+  protocol: 'v3',
+  outputModality: 'audio',
+  billing: 'subscription-only',
+  taskMode: 'daemon',
+  interruption: 'unsupported',
+  limits: voiceLimits,
+  blockers: [],
+};
 
 function render(patch: Partial<VoiceState> = {}) {
   const state: VoiceState = {
@@ -48,6 +61,17 @@ function render(patch: Partial<VoiceState> = {}) {
 }
 
 describe('voice UI evidence and accessible controls', () => {
+  it('offers available subscription WebRTC voice without implying provider interruption or new login', () => {
+    const markup = render({ phase: 'idle', capabilities: liveCapability });
+    expect(markup).toContain('ChatGPT subscription · WebRTC v3');
+    expect(markup).toContain('<button type="button">Start voice</button>');
+    expect(markup).toContain('existing Codex/ChatGPT sign-in');
+    expect(markup).toContain('voice quota');
+    const connected = render({ capabilities: liveCapability });
+    expect(connected).toContain('Speech interruption is unsupported');
+    expect(connected).toContain('Muting only affects your microphone');
+    expect(connected).not.toContain('>Interrupt speech<');
+  });
   it('separates mute, hang-up, playback unblock, and task/delivery truth', () => {
     const markup = render();
     expect(markup).toContain('aria-pressed="true"');

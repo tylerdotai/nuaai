@@ -13,6 +13,7 @@ import {
   type VoiceAudio,
   type VoiceDependencies,
   VoicePublicError,
+  voiceFailureMessage,
 } from './voice.js';
 
 type VoiceFetch = (path: string, init?: RequestInit) => Promise<Response>;
@@ -55,7 +56,9 @@ export function createVoiceApi(
         data.error.code.startsWith('VOICE_') &&
         typeof data.error.message === 'string'
       )
-        throw new VoicePublicError(data.error.message.slice(0, 500));
+        throw new VoicePublicError(
+          voiceFailureMessage({ code: data.error.code, message: data.error.message.slice(0, 500) }),
+        );
       throw new VoicePublicError(
         `Voice daemon request failed (${response.status}). Text chat remains available.`,
       );

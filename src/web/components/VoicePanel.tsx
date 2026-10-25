@@ -127,12 +127,24 @@ export function VoicePanelView({
       }}
     >
       <summary>
-        Voice · {state.phase === 'blocked' ? 'unavailable' : state.phase} · managed subscription
+        Voice · {state.phase === 'blocked' ? 'unavailable' : state.phase} · ChatGPT subscription ·
+        WebRTC v3
       </summary>
       <p className="voice-guidance">
         Start voice explicitly to send microphone audio to the provider. Requires HTTPS or
         browser-local localhost. No Platform API-key fallback. Text chat remains available.
       </p>
+      <p className="voice-guidance">
+        Live voice requires the existing Codex/ChatGPT sign-in on this computer, an eligible ChatGPT
+        subscription, and available voice quota. Availability is not a quota or connection
+        guarantee.
+      </p>
+      {state.capabilities?.interruption === 'unsupported' && (
+        <p className="voice-guidance">
+          Speech interruption is unsupported for this profile. Muting only affects your microphone;
+          it does not interrupt provider speech. Hang up to stop local playback and end voice.
+        </p>
+      )}
       <div className="voice-controls">
         <button
           type="button"

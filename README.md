@@ -142,6 +142,11 @@ The **Commands** palette is NUAAI-native, not Element-native. It is available fr
 
 The service worker caches only the static shell. `/api/*` and Server-Sent Events traffic are never cached, so sessions and agent state remain live.
 
+For an operator-enabled subscription voice preview, follow the [local voice trial](docs/VOICE_TRIAL.md).
+Voice uses the existing Codex/ChatGPT sign-in, starts microphone capture only on **Start voice**,
+and reports speech interruption unsupported; local microphone mute is not provider interruption.
+Unconfigured installations remain unavailable, with no API-key fallback.
+
 ## Onboarding
 
 Run onboarding again at any time:

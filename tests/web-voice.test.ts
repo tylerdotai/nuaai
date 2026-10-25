@@ -118,6 +118,111 @@ function fixture() {
 }
 
 describe('foreground voice lifecycle', () => {
+  it('starts unsupported-interruption subscription voice only explicitly and releases media on a typed quota failure', async () => {
+    const f = fixture();
+    f.api.capabilities.mockResolvedValue({ ...capabilities, interruption: 'unsupported' });
+    await f.controller.loadCapabilities();
+    expect(f.dependencies.capture).not.toHaveBeenCalled();
+    expect(f.api.start).not.toHaveBeenCalled();
+    await f.controller.connect();
+    expect(f.dependencies.capture).toHaveBeenCalledTimes(1);
+    await f.controller.interrupt();
+    expect(f.api.interrupt).not.toHaveBeenCalled();
+    f.api.subscribe.mock.calls[0][1]({
+      v: 1,
+      ...binding,
+      voiceId: lease.id,
+      generation: 1,
+      revision: 1,
+      seq: 1,
+      type: 'voice.error',
+      payload: {
+        code: 'VOICE_QUOTA_EXCEEDED',
+        message: 'PRIVATE_UPSTREAM_DETAILS',
+        retryable: false,
+        stage: 'active',
+      },
+    });
+    await vi.waitFor(() => expect(f.controller.getState().phase).toBe('error'));
+    expect(f.controller.getState().error).toContain('voice quota');
+    expect(f.controller.getState().error).not.toContain('PRIVATE_UPSTREAM_DETAILS');
+    expect(f.track.stop).toHaveBeenCalledTimes(1);
+    expect(f.peer.close).toHaveBeenCalledTimes(1);
+    expect(f.channel.close).toHaveBeenCalledTimes(1);
+    expect(f.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(f.audio.pause).toHaveBeenCalled();
+    expect(f.audio.srcObject).toBeNull();
+    expect(f.timers.size).toBe(0);
+    expect(f.api.stop).toHaveBeenCalledWith(lease.id, { generation: 1, reason: 'client_error' });
+    expect(f.api.start).toHaveBeenCalledTimes(1);
+  });
+  it('explains a typed login preflight blocker without capturing or starting a provider', async () => {
+    const f = fixture();
+    f.api.capabilities.mockResolvedValue({
+      ...capabilities,
+      available: false,
+      blockers: [
+        {
+          code: 'VOICE_CODEX_LOGIN_REQUIRED',
+          message: 'PRIVATE_UPSTREAM_DETAILS',
+          retryable: false,
+          stage: 'preflight',
+        },
+      ],
+    });
+    await f.controller.loadCapabilities();
+    await f.controller.connect();
+    expect(f.controller.getState().phase).toBe('blocked');
+    expect(f.controller.getState().error).toContain('existing Codex/ChatGPT sign-in');
+    expect(f.controller.getState().error).not.toContain('PRIVATE_UPSTREAM_DETAILS');
+    expect(f.dependencies.capture).not.toHaveBeenCalled();
+    expect(f.api.start).not.toHaveBeenCalled();
+  });
+
+  it.each(['start', 'state'] as const)(
+    'explains a failed %s snapshot and releases media',
+    async (source) => {
+      const f = fixture();
+      const failed: VoiceSnapshot = {
+        ...lease,
+        phase: 'failed',
+        revision: 2,
+        failure: {
+          code: 'VOICE_RATE_LIMITED',
+          message: 'PRIVATE_UPSTREAM_DETAILS',
+          retryable: false,
+          stage: 'start',
+        },
+      };
+      if (source === 'start')
+        f.api.start.mockResolvedValueOnce({
+          voice: failed,
+          answer: { type: 'answer', sdp: 'answer-only-fixture' },
+        });
+      await f.controller.loadCapabilities();
+      await f.controller.connect();
+      if (source === 'state')
+        f.api.subscribe.mock.calls[0][1]({
+          v: 1,
+          ...binding,
+          voiceId: lease.id,
+          generation: 1,
+          revision: 2,
+          seq: 1,
+          type: 'voice.state',
+          payload: failed,
+        });
+      await vi.waitFor(() => expect(f.controller.getState().phase).toBe('error'));
+      expect(f.controller.getState().error).toContain('start again explicitly');
+      expect(f.controller.getState().error).not.toContain('PRIVATE_UPSTREAM_DETAILS');
+      expect(f.track.stop).toHaveBeenCalledTimes(1);
+      expect(f.peer.close).toHaveBeenCalledTimes(1);
+      expect(f.channel.close).toHaveBeenCalledTimes(1);
+      expect(f.api.stop).toHaveBeenCalledTimes(1);
+      expect(f.timers.size).toBe(0);
+    },
+  );
+
   it('does not create duplicate connections while permission is pending and disposal fences late capture', async () => {
     const f = fixture();
     const pending = deferred<MediaStream>();

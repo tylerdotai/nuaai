@@ -3,6 +3,36 @@ import { voiceLimits } from '../src/voice/types.js';
 import { createVoiceApi, voiceBrowserSupport } from '../src/web/voice-client.js';
 
 describe('voice browser daemon boundary', () => {
+  it.each([
+    ['VOICE_CODEX_LOGIN_REQUIRED', 'existing Codex/ChatGPT sign-in'],
+    ['VOICE_SUBSCRIPTION_REQUIRED', 'eligible ChatGPT subscription'],
+    ['VOICE_ACCESS_DENIED', 'does not have access'],
+    ['VOICE_QUOTA_EXCEEDED', 'voice quota'],
+    ['VOICE_RATE_LIMITED', 'start again explicitly'],
+  ])(
+    'explains %s without exposing upstream details or suggesting an API-key fallback',
+    async (code, guidance) => {
+      const api = createVoiceApi(
+        '/',
+        vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({
+                error: {
+                  code,
+                  message: 'PRIVATE_UPSTREAM_DETAILS',
+                  retryable: false,
+                  stage: 'start',
+                },
+              }),
+              { status: 503 },
+            ),
+        ),
+      );
+      await expect(api.capabilities()).rejects.toThrow(guidance);
+      await expect(api.capabilities()).rejects.not.toThrow('PRIVATE_UPSTREAM_DETAILS');
+    },
+  );
   it('accepts named lease events and closes once on a malformed or lost stream without reconnecting', () => {
     const listeners = new Map<string, (event: MessageEvent) => void>();
     const source = {

@@ -81,6 +81,108 @@ test('unavailable subscription voice shows the isolation blocker without capture
   await expect(page.getByPlaceholder('Message NUAAI…')).toBeEnabled();
 });
 
+for (const [code, guidance] of [
+  ['VOICE_CODEX_LOGIN_REQUIRED', 'existing Codex/ChatGPT sign-in'],
+  ['VOICE_QUOTA_EXCEEDED', 'voice quota'],
+] as const) {
+  test(`live subscription ${code} is actionable and cleans synthetic capture without automatic retry`, async ({
+    page,
+  }) => {
+    let starts = 0;
+    await page.route('**/api/voice/capabilities', (route) =>
+      route.fulfill({
+        json: { ...capability, interruption: 'unsupported' },
+      }),
+    );
+    await page.route('**/api/voice/sessions', (route) => {
+      starts += 1;
+      return route.fulfill({
+        status: 503,
+        json: {
+          error: { code, message: 'PRIVATE_UPSTREAM_DETAILS', retryable: false, stage: 'start' },
+        },
+      });
+    });
+    await page.addInitScript(() => {
+      const fixture = { captures: 0, stopped: 0, peersClosed: 0, channelsClosed: 0 };
+      Object.assign(window, { liveVoiceFixture: fixture });
+      const track = {
+        enabled: true,
+        onended: null,
+        stop: () => {
+          fixture.stopped += 1;
+        },
+      };
+      navigator.mediaDevices.getUserMedia = async () =>
+        ({
+          getTracks: () => [track],
+          getAudioTracks: () => [track],
+        }) as unknown as MediaStream;
+      const capture = navigator.mediaDevices.getUserMedia;
+      navigator.mediaDevices.getUserMedia = async (constraints) => {
+        fixture.captures += 1;
+        return capture(constraints);
+      };
+      window.RTCPeerConnection = class {
+        connectionState = 'new';
+        iceGatheringState = 'complete';
+        localDescription = { type: 'offer', sdp: 'synthetic-ui-offer' };
+        createDataChannel() {
+          return {
+            onclose: null,
+            onerror: null,
+            close: () => {
+              fixture.channelsClosed += 1;
+            },
+          };
+        }
+        addTrack() {}
+        async createOffer() {
+          return this.localDescription;
+        }
+        async setLocalDescription() {}
+        async setRemoteDescription() {}
+        close() {
+          fixture.peersClosed += 1;
+        }
+      } as unknown as typeof RTCPeerConnection;
+    });
+    await openVoice(page);
+    const panel = page.getByLabel('Foreground voice');
+    await expect(panel.getByText(/Speech interruption is unsupported/)).toBeVisible();
+    await expect(panel.getByRole('button', { name: 'Interrupt speech', exact: true })).toHaveCount(
+      0,
+    );
+    expect(
+      await page.evaluate(
+        () =>
+          (window as unknown as { liveVoiceFixture: { captures: number } }).liveVoiceFixture
+            .captures,
+      ),
+    ).toBe(0);
+    expect(starts).toBe(0);
+    await panel.getByRole('button', { name: 'Start voice', exact: true }).click();
+    await expect(panel.getByRole('alert')).toContainText(guidance);
+    await expect(panel.getByRole('alert')).not.toContainText('PRIVATE_UPSTREAM_DETAILS');
+    await expect(panel.getByRole('status')).toContainText('Microphone: ended');
+    await expect(panel.getByRole('status')).toContainText('Transport: closed');
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { liveVoiceFixture: Record<string, number> }).liveVoiceFixture,
+      ),
+    ).toEqual({
+      captures: 1,
+      stopped: 1,
+      peersClosed: 1,
+      channelsClosed: 1,
+    });
+    await panel.getByRole('button', { name: 'Check voice availability', exact: true }).click();
+    await expect(panel.getByRole('button', { name: 'Start voice', exact: true })).toBeEnabled();
+    expect(starts).toBe(1);
+    await expect(page.getByPlaceholder('Message NUAAI…')).toBeEnabled();
+  });
+}
+
 for (const exit of ['hangup', 'hidden', 'pagehide', 'session', 'thread', 'view'] as const) {
   test(`${exit} while permission is pending releases late synthetic input without creating a peer or admitting work`, async ({
     page,

@@ -152,7 +152,7 @@ export class VoiceController {
         capabilities,
         phase: safe && capabilities.available ? 'idle' : 'blocked',
         error: safe
-          ? capabilities.blockers.map((blocker) => blocker.message).join(' ') || null
+          ? capabilities.blockers.map(voiceFailureMessage).join(' ') || null
           : 'Unsupported subscription voice contract.',
       });
     } catch (error) {
@@ -271,7 +271,9 @@ export class VoiceController {
       this.update({ voice: response.voice });
       if (['closed', 'failed', 'stopping'].includes(response.voice.phase))
         throw new VoicePublicError(
-          response.voice.failure?.message ?? 'Voice session ended during negotiation.',
+          response.voice.failure
+            ? voiceFailureMessage(response.voice.failure)
+            : 'Voice session ended during negotiation.',
         );
       if (
         response.answer.type !== 'answer' ||
@@ -311,7 +313,9 @@ export class VoiceController {
     this.revision = snapshot.revision;
     this.update({ voice: snapshot });
     if (snapshot.phase === 'failed')
-      void this.fail(snapshot.failure?.message ?? 'Voice session failed.');
+      void this.fail(
+        snapshot.failure ? voiceFailureMessage(snapshot.failure) : 'Voice session failed.',
+      );
     else if (snapshot.phase === 'closed' || snapshot.phase === 'stopping') void this.hangup();
   }
   private acceptEvent(event: VoiceEvent): void {
@@ -378,7 +382,7 @@ export class VoiceController {
         });
         break;
       case 'voice.error':
-        void this.fail(event.payload.message);
+        void this.fail(voiceFailureMessage(event.payload));
         break;
       case 'voice.observation':
         break; // Browser observations are not authoritative playback evidence.
@@ -523,6 +527,24 @@ export class VoiceController {
     void this.hangup('navigation');
     this.disposed = true;
     this.listeners.clear();
+  }
+}
+
+/** Fixed actionable guidance for typed subscription failures, never upstream diagnostics. */
+export function voiceFailureMessage(failure: { code: string; message: string }): string {
+  switch (failure.code) {
+    case 'VOICE_CODEX_LOGIN_REQUIRED':
+      return 'Check the existing Codex/ChatGPT sign-in on this computer, then check voice availability and start again. No API key is used.';
+    case 'VOICE_SUBSCRIPTION_REQUIRED':
+      return 'An eligible ChatGPT subscription is required for voice. Text chat remains available.';
+    case 'VOICE_ACCESS_DENIED':
+      return 'This account does not have access to subscription voice. Text chat remains available.';
+    case 'VOICE_QUOTA_EXCEEDED':
+      return 'The account voice quota has been reached. Try again when quota is available; there is no paid API fallback.';
+    case 'VOICE_RATE_LIMITED':
+      return 'Voice is rate limited. Wait before you start again explicitly; voice will not reconnect automatically.';
+    default:
+      return failure.message;
   }
 }
 
