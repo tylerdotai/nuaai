@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -52,7 +53,7 @@ if(m.type==='start'){
 if(${JSON.stringify(diagnostic)})process.stderr.write(${JSON.stringify('unapproved synthetic-private\nNUAAI_VOICE_DIAGNOSTIC operation=call kind=http status=403\nNUAAI_VOICE_DIAGNOSTIC operation=call kind=http status=403 token=synthetic-private\n')});
 if(${JSON.stringify(failure)}){process.stderr.write('synthetic-private-diagnostic\\n');send({type:'error',commandId:m.commandId,code:${JSON.stringify(failure)}});process.stdin.destroy();process.stdout.end();process.stderr.end();}
 else {send({type:'answer',commandId:m.commandId,sdp:'synthetic-answer'});send({type:'control_ready',commandId:m.commandId});send({type:'handoff',handoffId:'h',text:'task'});send({type:'transcript',itemId:'u',role:'user',text:'transcript-not-task',status:'final'});}}
-if(m.type==='append')send({type:'delivery',commandId:m.commandId,handoffId:m.handoffId,deliveryId:m.deliveryId,status:'accepted'});
+if(m.type==='append'){fs.appendFileSync(${JSON.stringify(join(root, 'appends.jsonl'))},JSON.stringify(m)+'\\n',{mode:0o600});send({type:'delivery',commandId:m.commandId,handoffId:m.handoffId,deliveryId:m.deliveryId,status:'accepted'});}
 if(m.type==='close'&&!${JSON.stringify(hang)}){send({type:'closed',commandId:m.commandId});process.stdin.destroy();process.stdout.end();process.stderr.end();}
 }});
 `,
@@ -254,6 +255,122 @@ describe('trusted native voice provider and actual owned FIFO host', () => {
       await h.close();
     }
   });
+  it.each(['failed', 'cancelled', 'hangup', 'revoked', 'unconfirmed'] as const)(
+    'real daemon delivers only the correlated safe %s outcome, never failed output or late speech',
+    async (mode) => {
+      const f = fixture();
+      vi.stubEnv('HOME', f.home);
+      vi.stubEnv('NUAAI_VOICE_HELPER', f.binary);
+      let release = () => {};
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const h = await identityHarness(async () => {
+        await held;
+        throw new Error('synthetic-private-provider-failure');
+      });
+      let waiting: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        const session = await h.api('/api/sessions', {
+          title: 'Terminal outcome',
+          workspaceRoot: h.project,
+        });
+        if (mode === 'unconfirmed')
+          waiting = vi
+            .spyOn(h.daemon.runtime, 'waitForRun')
+            .mockRejectedValueOnce(new Error('synthetic-private-observer-failure'));
+        const started = await h.api('/api/voice/sessions', {
+          sessionId: session.body.session.id,
+          threadId: session.body.thread.id,
+          requestId: 'terminal',
+          offer: { type: 'offer', sdp: 'synthetic-offer' },
+        });
+        expect(started.status).toBe(201);
+        await vi.waitFor(() =>
+          expect(h.daemon.store.listRuns(session.body.thread.id)).toHaveLength(1),
+        );
+        const [run] = h.daemon.store.listRuns(session.body.thread.id);
+        waiting?.mockRestore();
+        waiting = undefined;
+        if (mode === 'cancelled') h.daemon.runtime.cancelRun(run.id);
+        if (mode === 'hangup') {
+          expect(
+            (
+              await h.api(`/api/voice/sessions/${started.body.voice.id}/stop`, {
+                generation: started.body.voice.generation,
+                reason: 'hangup',
+              })
+            ).status,
+          ).toBe(200);
+          expect(h.daemon.store.getRun(run.id)?.cancelRequested).toBe(false);
+        }
+        if (mode === 'revoked')
+          expect(
+            (await h.api(`/api/sessions/${session.body.session.id}/identity/refresh`, {})).status,
+          ).toBe(200);
+        release();
+        const terminal = await h.daemon.runtime.waitForRun(run.id);
+        expect(terminal.status).toBe(mode === 'cancelled' ? 'cancelled' : 'failed');
+        expect(h.daemon.store.getRunExecutionContext(run.id)?.permissionSource).toBe('web');
+        const file = join(f.root, 'appends.jsonl');
+        if (mode === 'hangup' || mode === 'revoked') {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(existsSync(file)).toBe(false);
+          expect(h.daemon.store.listRuns(session.body.thread.id)).toHaveLength(1);
+          return;
+        }
+        await vi.waitFor(() => expect(existsSync(file)).toBe(true));
+        const appends = readFileSync(file, 'utf8')
+          .trim()
+          .split('\n')
+          .map(
+            (line) => JSON.parse(line) as { handoffId: string; deliveryId: string; text: string },
+          );
+        expect(appends).toHaveLength(1);
+        expect(appends[0].handoffId).toBe('h');
+        expect(appends[0].text).toBe(
+          mode === 'failed'
+            ? 'The delegated task failed. No completed result is available.'
+            : mode === 'cancelled'
+              ? 'The delegated task was cancelled. No completed result is available.'
+              : 'The delegated task result could not be confirmed. Do not report it as completed.',
+        );
+        expect(JSON.stringify(appends)).not.toContain('synthetic-private');
+        await h.api(`/api/voice/sessions/${started.body.voice.id}/stop`, {
+          generation: started.body.voice.generation,
+          reason: 'hangup',
+        });
+        const response = await fetch(
+          `http://127.0.0.1:${h.daemon.gateway.port}/api/voice/sessions/${started.body.voice.id}/events`,
+          {
+            headers: { authorization: `Bearer ${h.daemon.token}` },
+            signal: AbortSignal.timeout(2000),
+          },
+        );
+        const events = [...(await response.text()).matchAll(/^data: (.*)$/gm)].map((match) =>
+          JSON.parse(match[1]),
+        );
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: 'voice.run.linked',
+            payload: { runId: run.id, handoffId: 'h' },
+          }),
+        );
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: 'voice.result.delivery',
+            payload: { runId: run.id, deliveryId: appends[0].deliveryId, status: 'accepted' },
+          }),
+        );
+        expect(h.daemon.store.getRun(run.id)?.status).toBe(terminal.status);
+        expect(h.daemon.store.listRuns(session.body.thread.id)).toHaveLength(1);
+      } finally {
+        waiting?.mockRestore();
+        release();
+        await h.close();
+      }
+    },
+  );
   it('real daemon returns structured managed-login failure without leaking helper diagnostics', async () => {
     const f = fixture('subscription-webrtc-v3', 'VOICE_CODEX_LOGIN_REQUIRED');
     vi.stubEnv('HOME', f.home);

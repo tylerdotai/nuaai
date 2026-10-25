@@ -44,6 +44,7 @@ import { SkillRegistry } from './skills/registry.js';
 import { ToolRegistry } from './tools/registry.js';
 import { VoiceBroker, VoiceError } from './voice/broker.js';
 import { createNativeVoiceProvider } from './voice/native-provider.js';
+import { voiceRunResult } from './voice/run-result.js';
 import { initWorkspace } from './workspace/fs.js';
 
 export interface DaemonHandle {
@@ -338,11 +339,7 @@ async function startOwnedDaemon(
       });
       return {
         runId: run.id,
-        result: runtime.waitForRun(run.id).then((completed) => {
-          if (completed.status !== 'completed')
-            throw new VoiceError('VOICE_PROVIDER_ERROR', 502, 'delivery');
-          return completed.output;
-        }),
+        result: voiceRunResult(runtime.waitForRun(run.id)),
       };
     },
   });
