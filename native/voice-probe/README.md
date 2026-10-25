@@ -37,7 +37,12 @@ Native behavior:
 - Same strict u32BE v1 flat JSON/limits/command IDs as the frozen offline codec;
   hello advertises only `subscription-webrtc-v3`/`unsupported`. Offline profile
   and its three-code contract stay unchanged. Live errors use the fixed live
-  allowlist; no upstream error bodies, SDP or credentials are logged.
+  allowlist; no upstream error bodies, SDP or credentials are logged. Actual
+  call/sideband SDK errors additionally emit one short stderr metadata line:
+  `NUAAI_VOICE_DIAGNOSTIC operation=call|sideband kind=api|http|timeout|build|transport|stream|invalid_request|other status=0|100..599`.
+  Fields come only from native enum variants/status integers, never error
+  Display/Debug, URLs, messages, bodies, headers, account or call IDs. Host
+  logging must parse only this bounded whitelist and discard all other stderr.
 - Hello is inert. Only start reads existing native managed credentials using
   `AuthManager::new`/`auth_cached` and the pinned native default File storage.
   Lead verified the host's CLI storage setting is absent/default; nondefault CLI
@@ -60,6 +65,14 @@ Native behavior:
   Plan metadata is NOT a local entitlement gate: the service decides
   subscription/access/quota via its responses. Frozen auth/manual checks are
   not atomic leases or token freshness guarantees.
+- Production V3 defaults are audited against pinned Core, not SDK test fixtures:
+  `gpt-live-1-codex`, native voice `cove` (V3 default_v1), FramelessBidi,
+  conversational audio. Both call/control carry `openai-alpha: quicksilver=v2`
+  and public native `default_headers()` (real process originator/User-Agent,
+  optional residency), with no auth/account replacement. No new dependencies,
+  fake originator value or TLS/proxy/root-policy relaxation. Constructor-only
+  unit coverage proves the managed pool builds without auth/store/send/DNS;
+  route/TLS creation is lazy, so this is NOT a TLS/connectivity proof.
 - Fixed ChatGPT backend JSON call POST, native V3 query/session configuration,
   bounded response131072 and deadline25s. Real answer is emitted/flushed before
   joining the official public SDK existing-call control sideband at its default

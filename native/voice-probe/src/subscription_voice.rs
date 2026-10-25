@@ -71,6 +71,44 @@ impl Code {
         }
     }
 }
+#[derive(Clone, Copy)]
+enum Operation {
+    Call,
+    Sideband,
+}
+fn diagnostic_line(operation: Operation, error: &ApiError) -> String {
+    let (kind, status) = match error {
+        ApiError::Api { status, .. } => ("api", status.as_u16()),
+        ApiError::Transport(TransportError::Http { status, .. }) => ("http", status.as_u16()),
+        ApiError::Transport(TransportError::Timeout) => ("timeout", 0),
+        ApiError::Transport(TransportError::Build(_)) => ("build", 0),
+        ApiError::Transport(_) => ("transport", 0),
+        ApiError::Stream(_) => ("stream", 0),
+        ApiError::InvalidRequest { .. } => ("invalid_request", 0),
+        _ => ("other", 0),
+    };
+    let operation = match operation {
+        Operation::Call => "call",
+        Operation::Sideband => "sideband",
+    };
+    let status = if (100..=599).contains(&status) {
+        status
+    } else {
+        0
+    };
+    format!("NUAAI_VOICE_DIAGNOSTIC operation={operation} kind={kind} status={status}")
+}
+fn api_error_at(operation: Operation, error: ApiError) -> Code {
+    use std::io::Write;
+    // Do NOT format Debug/Display, URLs, messages, bodies, headers or identifiers.
+    // Exactly one short fixed-grammar line, parsed by the host's bounded whitelist.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        diagnostic_line(operation, &error)
+    );
+    api_error(error)
+}
 fn api_error(error: ApiError) -> Code {
     match error {
         ApiError::Api { status, .. } => http_error(status, None),
@@ -242,14 +280,28 @@ impl Transcript {
     }
 }
 
+// Production defaults audited against pinned Core (not the in-memory SDK fixtures):
+// realtime_conversation.rs DEFAULT_FRAMELESS_REALTIME_MODEL + default_realtime_voice(V3).
 fn config() -> Result<RealtimeSessionConfig> {
     Ok(RealtimeSessionConfig {
         instructions: "You are NUAAI's conversational voice interface. Delegate tasks requiring tools or durable work to the client. The client owns permissions, tools and task execution. Speak verified client results; do not claim work or delivery before it is observed.".into(),
-        initial_items: vec![], delegation_ack_filler: None, model: Some("gpt-live".into()), session_id: None,
+        initial_items: vec![], delegation_ack_filler: None, model: Some("gpt-live-1-codex".into()), session_id: None,
         event_parser: RealtimeEventParser::FramelessBidi, session_mode: RealtimeSessionMode::Conversational,
         output_modality: RealtimeOutputModality::Audio,
-        voice: serde_json::from_value(json!("marin")).map_err(|_| Code::Provider)?,
+        voice: serde_json::from_value(json!("cove")).map_err(|_| Code::Provider)?,
     })
+}
+fn realtime_headers() -> HeaderMap {
+    // Core realtime_request_headers(FramelessBidi) supplies this version header;
+    // Core's default HTTP client / sideband default_headers supplies native
+    // originator, User-Agent and optional residency metadata. Our plain content
+    // factory does NOT add those, so carry the public native defaults explicitly.
+    let mut headers = codex_login::default_client::default_headers();
+    headers.insert(
+        "openai-alpha",
+        http::HeaderValue::from_static("quicksilver=v2"),
+    );
+    headers
 }
 fn provider() -> Provider {
     Provider {
@@ -713,9 +765,9 @@ async fn start(home: Option<PathBuf>, offer: String, id: u64, io: &impl Wire) ->
         provider(),
         authority.frozen.clone(),
     )
-    .create_with_session_and_headers(offer, config()?, HeaderMap::new())
+    .create_with_session_and_headers(offer, config()?, realtime_headers())
     .await
-    .map_err(api_error)?;
+    .map_err(|error| api_error_at(Operation::Call, error))?;
     authority.check().await?;
     if call.sdp.is_empty()
         || call.sdp.len() > 98_304
@@ -745,10 +797,11 @@ async fn start(home: Option<PathBuf>, offer: String, id: u64, io: &impl Wire) ->
     authority.check().await?;
     let factory =
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault).with_network_policy(policy);
-    let headers = authority
+    let mut headers = authority
         .frozen
         .to_auth_headers()
         .map_err(|_| Code::Authority)?;
+    headers.extend(realtime_headers()); // metadata only; native defaults contain no auth/account
     let connection = RealtimeWebsocketClient::new(provider(), factory)
         .connect_existing_call_sideband(
             config()?,
@@ -758,7 +811,7 @@ async fn start(home: Option<PathBuf>, offer: String, id: u64, io: &impl Wire) ->
             RealtimeTranscriptState::default(),
         )
         .await
-        .map_err(api_error)?;
+        .map_err(|error| api_error_at(Operation::Sideband, error))?;
     authority.check().await?;
     Ok(Live {
         authority,
@@ -926,6 +979,138 @@ async fn session(home: Option<PathBuf>, io: &impl Wire) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn production_v3_defaults_match_audited_pinned_core_not_sdk_fixture_values() {
+        let actual = config().unwrap();
+        assert_eq!(actual.model.as_deref(), Some("gpt-live-1-codex"));
+        assert_eq!(actual.event_parser, RealtimeEventParser::FramelessBidi);
+        assert_eq!(actual.session_mode, RealtimeSessionMode::Conversational);
+        assert_eq!(actual.output_modality, RealtimeOutputModality::Audio);
+        // codex-api does not re-export RealtimeVoicesList. These wire names/default
+        // are audited verbatim from this exact pin's protocol.rs builtin().v3 and
+        // default_v1, used by Core default_realtime_voice(V3); no Core dependency.
+        let builtin_v3 = [
+            "juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol", "cove",
+            "aube", "bubbie", "haetsal", "hanul", "himari", "leher", "miko", "neer", "porto",
+            "rindo", "rio", "rivage", "selva", "sonna", "tinta", "viola",
+        ];
+        assert!(builtin_v3.contains(&actual.voice.wire_name()));
+        assert_eq!(actual.voice.wire_name(), "cove"); // exact builtin().default_v1
+        assert!(!builtin_v3.contains(&"marin")); // V2 default is invalid for V3
+        assert!(actual.initial_items.is_empty());
+        assert!(actual.session_id.is_none()); // native create strips the session ID
+        assert_eq!(actual.delegation_ack_filler, None);
+    }
+    #[test]
+    fn call_and_control_version_metadata_never_replace_or_duplicate_frozen_auth() {
+        let metadata = realtime_headers();
+        assert!(!metadata.contains_key("authorization"));
+        assert!(!metadata.contains_key("chatgpt-account-id"));
+        assert_eq!(metadata["openai-alpha"], "quicksilver=v2");
+        assert_eq!(
+            metadata["originator"],
+            codex_login::default_client::originator().header_value
+        );
+        let auth = codex_model_provider::BearerAuthProvider::for_test(
+            Some("fabricated-token"),
+            Some("fabricated-account"),
+        );
+        use codex_api::AuthProvider;
+        let mut control_headers = auth.to_auth_headers().unwrap();
+        control_headers.extend(metadata);
+        assert_eq!(control_headers["authorization"], "Bearer fabricated-token");
+        assert!(crate::auth_guard::valid_bound_headers(
+            &control_headers,
+            "fabricated-account"
+        ));
+        for name in [
+            "authorization",
+            "chatgpt-account-id",
+            "openai-alpha",
+            "originator",
+        ] {
+            assert_eq!(control_headers.get_all(name).iter().count(), 1);
+        }
+    }
+    #[test]
+    fn production_managed_content_factory_constructs_without_auth_or_dispatch() {
+        rt().block_on(async {
+            let content = Content::new().unwrap();
+            // Pinned client_builder.rs managed-policy branch only allocates a
+            // RouteAwareClientPool; it does not send, resolve DNS or read auth.
+            // Actual route/TLS construction remains lazy until dispatch, so this
+            // test must not be represented as successful TLS or connectivity.
+            assert!(
+                content
+                    .factory
+                    .build_client_without_request_logging(CALL_ENDPOINT, ClientRouteClass::Api)
+                    .is_ok()
+            );
+        });
+    }
+    #[test]
+    fn error_diagnostic_contains_only_static_operation_kind_and_sanitized_status() {
+        let secret = "Bearer PRIVATE_ACCOUNT URL=https://private.invalid/call_ID\r\nINJECTED";
+        let cases = [
+            (
+                ApiError::Api {
+                    status: http::StatusCode::FORBIDDEN,
+                    message: secret.into(),
+                },
+                "api",
+                403,
+            ),
+            (
+                ApiError::Transport(TransportError::Http {
+                    status: http::StatusCode::TOO_MANY_REQUESTS,
+                    url: Some(secret.into()),
+                    headers: None,
+                    body: Some(secret.into()),
+                    retry_after: None,
+                }),
+                "http",
+                429,
+            ),
+            (ApiError::Transport(TransportError::Timeout), "timeout", 0),
+            (
+                ApiError::Transport(TransportError::Build(secret.into())),
+                "build",
+                0,
+            ),
+            (
+                ApiError::Transport(TransportError::Network(secret.into())),
+                "transport",
+                0,
+            ),
+            (ApiError::Stream(secret.into()), "stream", 0),
+            (
+                ApiError::InvalidRequest {
+                    message: secret.into(),
+                },
+                "invalid_request",
+                0,
+            ),
+            (ApiError::QuotaExceeded, "other", 0),
+            (
+                ApiError::Api {
+                    status: http::StatusCode::from_u16(799).unwrap(),
+                    message: secret.into(),
+                },
+                "api",
+                0,
+            ),
+        ];
+        for (error, kind, status) in cases {
+            assert_eq!(
+                diagnostic_line(Operation::Call, &error),
+                format!("NUAAI_VOICE_DIAGNOSTIC operation=call kind={kind} status={status}")
+            );
+            assert_eq!(
+                diagnostic_line(Operation::Sideband, &error),
+                format!("NUAAI_VOICE_DIAGNOSTIC operation=sideband kind={kind} status={status}")
+            );
+        }
+    }
     #[test]
     fn confirmed_legacy_file_identity_is_supported_without_optional_owner_marker() {
         assert_eq!(
@@ -1340,9 +1525,24 @@ mod tests {
                 "Bearer fabricated-test-only"
             );
             assert_eq!(prepared.headers["chatgpt-account-id"], "fabricated-account");
+            assert_eq!(prepared.headers["openai-alpha"], "quicksilver=v2");
+            assert_eq!(
+                prepared.headers["originator"],
+                codex_login::default_client::originator().header_value
+            );
+            for name in [
+                "authorization",
+                "chatgpt-account-id",
+                "openai-alpha",
+                "originator",
+            ] {
+                assert_eq!(prepared.headers.get_all(name).iter().count(), 1);
+            }
             let body: Value = serde_json::from_slice(&prepared.body.unwrap()).unwrap();
             assert_eq!(body["sdp"], "synthetic offer");
             assert_eq!(body["session"]["delegation"]["type"], "client");
+            assert_eq!(body["session"]["model"], "gpt-live-1-codex");
+            assert_eq!(body["session"]["audio"]["output"]["voice"], "cove");
             assert!(body["session"].get("id").is_none());
             let mut headers = HeaderMap::new();
             headers.insert("location", "/v1/realtime/calls/rtc_fake".parse().unwrap());
@@ -1387,7 +1587,7 @@ mod tests {
                     .create_with_session_and_headers(
                         "synthetic offer".into(),
                         config().unwrap(),
-                        HeaderMap::new(),
+                        realtime_headers(),
                     )
                     .await
                     .unwrap();
