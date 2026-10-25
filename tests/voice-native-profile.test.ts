@@ -34,6 +34,57 @@ function fixture(expected: 'offline-memory-v1' | 'subscription-webrtc-v3', actua
 }
 
 describe('host-chosen native voice profiles', () => {
+  it('logs the fixed live control-ready marker exactly once, never for invalid or offline readiness', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    try {
+      for (const values of [
+        { commandId: 2, preAnswer: true },
+        { commandId: 3 },
+        { commandId: 2, extra: 'private' },
+      ]) {
+        const f = fixture('subscription-webrtc-v3');
+        const started = f.start();
+        await Promise.resolve();
+        if (!('preAnswer' in values)) f.event('answer', { commandId: 2, sdp: 'answer' });
+        const { preAnswer: _, ...frame } = values as {
+          commandId: number;
+          preAnswer?: boolean;
+          extra?: string;
+        };
+        f.event('control_ready', frame);
+        if ('preAnswer' in values)
+          await expect(started).rejects.toMatchObject({ code: 'VOICE_PROTOCOL_ERROR' });
+        else {
+          await started;
+          expect(f.events.at(-1)).toMatchObject({
+            type: 'error',
+            error: { code: 'VOICE_PROTOCOL_ERROR' },
+          });
+        }
+        await f.transport.stop();
+      }
+      const offline = fixture('offline-memory-v1');
+      const offlineStart = offline.start();
+      await Promise.resolve();
+      offline.event('answer', { commandId: 2, sdp: 'answer' });
+      await offlineStart;
+      offline.event('control_ready', { commandId: 2 });
+      await offline.transport.stop();
+      expect(info).not.toHaveBeenCalled();
+      const live = fixture('subscription-webrtc-v3');
+      const liveStart = live.start();
+      await Promise.resolve();
+      live.event('answer', { commandId: 2, sdp: 'answer' });
+      await liveStart;
+      live.event('control_ready', { commandId: 2 });
+      expect(info).toHaveBeenCalledExactlyOnceWith('NUAAI native voice control ready');
+      live.event('control_ready', { commandId: 2 });
+      expect(info).toHaveBeenCalledTimes(1);
+      await live.transport.stop();
+    } finally {
+      info.mockRestore();
+    }
+  });
   it.each([
     ['offline-memory-v1', 'subscription-webrtc-v3'],
     ['subscription-webrtc-v3', 'offline-memory-v1'],

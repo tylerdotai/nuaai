@@ -352,6 +352,13 @@ export class NativeVoiceTransport implements VoiceTransport {
           throw new VoiceError('VOICE_PROTOCOL_ERROR');
         this.ready = true;
         clearTimeout(this.timer);
+        if (this.expectedProfile === 'subscription-webrtc-v3') {
+          try {
+            console.info('NUAAI native voice control ready');
+          } catch {
+            /* Observability must not alter transport state. */
+          }
+        }
         return;
       case 'handoff':
         if (!this.ready || (!this.handoffs.has(frame.handoffId) && this.handoffs.size >= 48))
