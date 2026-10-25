@@ -94,6 +94,31 @@ remaining unchanged after drift do not authorize their use after owner rejection
 No content client is constructed, token freshness remains unvalidated, and no
 401 handling, request binding, WebRTC or speech acceptance is claimed here.
 
+### Functional offline private helper
+
+`offline-helper-tests` (default OFF, independent of auth-test features) builds
+`offline-voice-helper`. It implements the fixed `helper-u32be-v1-FROZEN` contract:
+4-byte BE length + strict UTF-8 flat JSON (max131072 bytes), hello/start/append/close,
+answer before control_ready, exact command/handoff/delivery IDs, and closed/EOF.
+No NDJSON, generic RPC, URLs, auth fields, provider selection or interrupt command.
+The only backend is inert memory: it returns synthetic SDP, emits two fixed
+`offline-handoff-A`/`offline-handoff-B` tasks, accepts exact-ID results in either
+order, chunks text at500 UTF-8 bytes, and closes once. `accepted` means local memory
+acceptance, never provider delivery/audio playback. The daemon-installed provider
+remains unavailable.
+
+```sh
+cargo +1.99.1 test --offline --locked --features offline-helper-tests --bin offline-voice-helper --jobs 2
+cargo +1.99.1 build --offline --locked --features offline-helper-tests --bin offline-voice-helper --jobs 2
+```
+
+The executable rejects socket stdio and closes FD3+ before clearing its environment
+and reading frames. It creates no runtime, auth manager, credential store or network
+client. Do not host it with Node `stdio:'pipe'` socketpairs: use owned regular files
+for finite fixtures or real OS pipes/FIFOs inherited as integer descriptors for
+interactive Node transport tests. EOF, malformed/truncated frames, unknown/duplicate
+fields, replay and mismatched IDs terminate safely with bounded static errors.
+
 ### Opt-in native B -> in-memory call composition
 
 Feature `synthetic-bound-call-tests` (default OFF, implies `synthetic-auth-tests`)
