@@ -50,7 +50,8 @@ describe('private native voice safe diagnostics', () => {
       (status) => line.replace('403', status),
     ),
     line.replace(' status', '\0 status'),
-    line.replace('\n', '\r\n'),
+    // Deliberate malformed CRLF input, not a string-escaping operation.
+    'NUAAI_VOICE_DIAGNOSTIC operation=call kind=http status=403\r\n',
     ` ${line}`,
     '{"message":"synthetic-private"}\n',
   ])('discards unapproved stderr without forwarding any source text %j', (value) => {
