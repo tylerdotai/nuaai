@@ -123,6 +123,45 @@ describe('voice broker authority and lifecycle', () => {
     expect(f.transport.deliver).not.toHaveBeenCalled();
     expect(f.broker.get('owner', voice.id).phase).toBe('closed');
   });
+  it('preserves original handoff and delivery IDs when task results finish in reverse order', async () => {
+    const f = fixture();
+    let finishA!: (value: string) => void;
+    let finishB!: (value: string) => void;
+    const resultA = new Promise<string>((resolve) => {
+      finishA = resolve;
+    });
+    const resultB = new Promise<string>((resolve) => {
+      finishB = resolve;
+    });
+    f.admit
+      .mockImplementationOnce(() => ({ runId: 'run-A', result: resultA }))
+      .mockImplementationOnce(() => ({ runId: 'run-B', result: resultB }));
+    const { voice } = await f.broker.start('owner', f.request);
+    f.event({ type: 'handoff', handoffId: 'handoff-A', text: 'task A' });
+    f.event({ type: 'handoff', handoffId: 'handoff-B', text: 'task B' });
+    finishB('verified B');
+    await Promise.resolve();
+    finishA('verified A');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const calls = vi.mocked(f.transport.deliver).mock.calls;
+    expect(calls).toEqual([
+      ['verified B', { handoffId: 'handoff-B', deliveryId: expect.any(String) }],
+      ['verified A', { handoffId: 'handoff-A', deliveryId: expect.any(String) }],
+    ]);
+    expect(calls[0][1].deliveryId).not.toBe(calls[1][1].deliveryId);
+    const accepted = f.broker
+      .events('owner', voice.id, 0)
+      .filter(
+        (event) => event.type === 'voice.result.delivery' && event.payload.status === 'accepted',
+      );
+    expect(accepted.map((event) => event.payload)).toEqual([
+      { runId: 'run-B', deliveryId: calls[0][1].deliveryId, status: 'accepted' },
+      { runId: 'run-A', deliveryId: calls[1][1].deliveryId, status: 'accepted' },
+    ]);
+    await f.broker.stop('owner', voice.id, voice.generation);
+  });
   it('terminates on backing execution or mutated handoff, without dispatch', async () => {
     const f = fixture();
     const { voice } = await f.broker.start('owner', f.request);

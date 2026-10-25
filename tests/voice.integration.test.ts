@@ -90,10 +90,11 @@ lines.on('line', line => {
       expect(await transport.start('fixture-offer', () => {}, new AbortController().signal)).toBe(
         'fixture-answer',
       );
-      await transport.deliver('Verified fixture result');
+      const context = { handoffId: 'handoff-1', deliveryId: 'delivery-1' };
+      await transport.deliver('Verified fixture result', context);
       await transport.stop();
       await transport.stop();
-      await expect(transport.deliver('late delivery')).rejects.toMatchObject({
+      await expect(transport.deliver('late delivery', context)).rejects.toMatchObject({
         code: 'VOICE_PROVIDER_DISCONNECTED',
       });
     } finally {

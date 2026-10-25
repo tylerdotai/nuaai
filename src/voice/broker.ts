@@ -42,6 +42,11 @@ export type VoiceProviderEvent =
   | { type: 'handoff'; handoffId: string; text: string }
   | { type: 'execution' }
   | { type: 'error'; error: VoiceError };
+/** Daemon-internal result correlation; never supplied by browser controls. */
+export interface VoiceDeliveryContext {
+  readonly handoffId: string;
+  readonly deliveryId: string;
+}
 export interface VoiceTransport {
   start(
     offer: string,
@@ -49,7 +54,7 @@ export interface VoiceTransport {
     signal: AbortSignal,
   ): Promise<string>;
   stop(): Promise<void>;
-  deliver(text: string): Promise<void>;
+  deliver(text: string, context: VoiceDeliveryContext): Promise<void>;
   interrupt(): Promise<void>;
 }
 export interface VoiceProvider {
@@ -450,7 +455,7 @@ export class VoiceBroker {
         delivery('pending');
         try {
           this.revalidate(lease);
-          await lease.transport.deliver(result);
+          await lease.transport.deliver(result, { handoffId, deliveryId });
           delivery('accepted');
         } catch {
           delivery('unknown');

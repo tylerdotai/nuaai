@@ -105,6 +105,24 @@ describe('version-pinned Codex voice protocol adapter', () => {
     expect(f.sent.at(-1)?.method).toBe('thread/realtime/stop');
     expect(f.close).toHaveBeenCalledOnce();
   });
+  it('validates delivery IDs but labels legacy append as session-scoped, not delegation resolution', async () => {
+    const f = fixture();
+    await f.transport.start('offer', () => {}, new AbortController().signal);
+    const context = { handoffId: 'handoff-1', deliveryId: 'delivery-1' };
+    await f.transport.deliver('verified result', context);
+    expect(f.sent.find((message) => message.method === 'thread/realtime/appendSpeech')).toEqual({
+      id: expect.any(Number),
+      method: 'thread/realtime/appendSpeech',
+      params: { threadId: 'backing-1', text: 'verified result' },
+    });
+    await expect(
+      f.transport.deliver('result', { ...context, handoffId: '' }),
+    ).rejects.toMatchObject({ code: 'VOICE_PROTOCOL_ERROR' });
+    await expect(
+      f.transport.deliver('result', { ...context, deliveryId: '' }),
+    ).rejects.toMatchObject({ code: 'VOICE_PROTOCOL_ERROR' });
+    await f.transport.stop();
+  });
   it('rejects unsolicited execution and foreign notifications instead of forwarding authority', async () => {
     const f = fixture();
     const events: VoiceProviderEvent[] = [];

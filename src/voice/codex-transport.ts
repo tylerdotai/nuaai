@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { sanitizedSubprocessEnvironment } from '../security/environment.js';
 import {
+  type VoiceDeliveryContext,
   VoiceError,
   type VoiceProvider,
   type VoiceProviderEvent,
@@ -266,8 +267,16 @@ export class CodexVoiceTransport implements VoiceTransport {
       signal.removeEventListener('abort', abort);
     }
   }
-  async deliver(content: string): Promise<void> {
-    if (!text(content) || !this.threadId) throw new VoiceError('VOICE_PROTOCOL_ERROR');
+  async deliver(content: string, context: VoiceDeliveryContext): Promise<void> {
+    if (
+      !text(content) ||
+      !text(context?.handoffId, 256) ||
+      !text(context?.deliveryId, 256) ||
+      !this.threadId
+    )
+      throw new VoiceError('VOICE_PROTOCOL_ERROR');
+    // Legacy injected-host append is session-scoped. Its RPC acceptance is NOT
+    // per-delegation resolution; native helper delivery uses a separate adapter.
     await this.rpc('thread/realtime/appendSpeech', { threadId: this.threadId, text: content });
   }
   async interrupt(): Promise<void> {

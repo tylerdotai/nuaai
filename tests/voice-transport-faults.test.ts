@@ -190,10 +190,13 @@ describe('voice JSON-RPC fault boundaries', () => {
   it('bounds outstanding delivery RPCs and rejects pending calls on disconnect', async () => {
     const f = fixture({ holdAppend: true });
     await f.start();
-    await expect(f.transport.deliver('')).rejects.toMatchObject({ code: 'VOICE_PROTOCOL_ERROR' });
-    const deliveries = Array.from({ length: 16 }, () => f.transport.deliver('verified'));
+    const context = { handoffId: 'handoff-1', deliveryId: 'delivery-1' };
+    await expect(f.transport.deliver('', context)).rejects.toMatchObject({
+      code: 'VOICE_PROTOCOL_ERROR',
+    });
+    const deliveries = Array.from({ length: 16 }, () => f.transport.deliver('verified', context));
     const all = Promise.allSettled(deliveries);
-    await expect(f.transport.deliver('overflow')).rejects.toMatchObject({
+    await expect(f.transport.deliver('overflow', context)).rejects.toMatchObject({
       code: 'VOICE_RATE_LIMITED',
     });
     f.fail(new VoiceError('VOICE_PROVIDER_DISCONNECTED'));
