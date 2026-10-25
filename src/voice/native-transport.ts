@@ -156,13 +156,17 @@ export class NativeVoiceTransport implements VoiceTransport {
     this.unsubscribe = wire.subscribe(
       (value) => {
         if (this.terminal) {
-          // During bounded stop only the exact close acknowledgement is useful.
+          // Drain already-buffered valid events without dispatch or settlement.
+          // Only the matching close ack can finish this bounded stop transaction.
           if (this.closeId) {
             try {
               const frame = decode(value);
-              if (frame.type !== 'closed' || frame.commandId !== this.closeId)
-                throw new VoiceError('VOICE_PROTOCOL_ERROR');
-              this.closed.resolve();
+              if (frame.type === 'closed') {
+                if (frame.commandId !== this.closeId) throw new VoiceError('VOICE_PROTOCOL_ERROR');
+                this.closed.resolve();
+              } else if (frame.type === 'error') {
+                this.closed.reject(new VoiceError(frame.code));
+              }
             } catch {
               this.closed.reject(new VoiceError('VOICE_PROTOCOL_ERROR'));
             }

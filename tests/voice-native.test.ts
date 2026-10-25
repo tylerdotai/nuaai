@@ -206,6 +206,35 @@ describe('private native voice transport', () => {
     expect(f.wire.close).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
   });
+  it('drains valid in-flight delivery before matching closed without reviving pending work', async () => {
+    const f = await running();
+    f.event('handoff', { handoffId: 'a', text: 'task' });
+    const delivery = f.transport.deliver('result', { handoffId: 'a', deliveryId: 'd' });
+    const unknown = expect(delivery).rejects.toMatchObject({ code: 'VOICE_DELIVERY_UNKNOWN' });
+    const stopping = f.transport.stop();
+    const stopped = expect(stopping).resolves.toBeUndefined();
+    f.event('delivery', { commandId: 3, handoffId: 'a', deliveryId: 'd', status: 'accepted' });
+    f.event('handoff', { handoffId: 'late', text: 'must not admit' });
+    f.event('closed', { commandId: 4 });
+    await Promise.all([unknown, stopped]);
+    expect(f.events).toEqual([{ type: 'handoff', handoffId: 'a', text: 'task' }]);
+    expect(f.wire.close).toHaveBeenCalledOnce();
+    expect(f.transport.stop()).toBe(stopping);
+  });
+  it.each([
+    { v: 1, type: 'closed', commandId: 99 },
+    { v: 1, type: 'closed', commandId: 3, extra: 'forbidden' },
+    { v: 1, type: 'error', code: 'VOICE_PROTOCOL_ERROR' },
+  ])('rejects invalid or fatal close acknowledgements %j', async (frame) => {
+    const f = await running();
+    const stopped = expect(f.transport.stop()).rejects.toMatchObject({
+      code: 'VOICE_PROTOCOL_ERROR',
+    });
+    const { type, ...values } = frame;
+    f.event(type, values);
+    await stopped;
+    expect(f.wire.close).toHaveBeenCalledOnce();
+  });
   it('bounds missing close acknowledgement and cleans the wire', async () => {
     const f = await running();
     vi.useFakeTimers();
