@@ -11,6 +11,7 @@ synthetic-auth-tests = []
 synthetic-auth-faults = ["synthetic-auth-tests"]
 synthetic-bound-call-tests = ["synthetic-auth-tests"]
 offline-helper-tests = []
+subscription-voice = []
 
 [[bin]]
 name = "synthetic-auth-probe"
@@ -26,6 +27,11 @@ required-features = ["offline-helper-tests"]
 name = "synthetic-ws-runtime"
 path = "src/bin/synthetic_ws_runtime.rs"
 required-features = ["synthetic-ws-runtime"]
+
+[[bin]]
+name = "nuaai-subscription-voice"
+path = "src/bin/subscription_voice.rs"
+required-features = ["subscription-voice"]
 
 [workspace]
 

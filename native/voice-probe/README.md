@@ -1,7 +1,8 @@
 # Linux-only executor-free voice library compile probe
 
-This standalone crate is an **explicitly invoked feasibility probe**, not the
-NUAAI production voice helper. It is not imported by the daemon, included in the
+The default executable remains an **explicitly invoked feasibility probe**.
+The separate default-OFF `subscription-voice` feature now supplies the actual
+trusted-local subscription helper described below; it is never built by npm. It is not imported by the daemon, included in the
 npm package `files`, or fetched/built by npm install/prepare/build.
 
 Upstream: OpenAI Codex `rust-v0.164.0`, exact commit
@@ -14,7 +15,69 @@ resolved incompatible stable 0.3 transitive packages; preserve this lock rather
 than regenerating it from scratch. Rust toolchain is **1.99.1**; there is no
 fallback toolchain or source pin.
 
-## What executes
+## Actual subscription helper (explicit opt-in)
+
+`subscription-voice` builds `nuaai-subscription-voice`, with **no arguments**.
+This is working adapter source, not a synthetic provider or an executor: native
+managed login -> actual pinned SDK call creation -> actual same-call SDK sideband
+-> exact handoff/result correlation. Lead owns source/build review, the first
+bounded real signaling check, trusted-local daemon integration and user preview.
+Worker source/unit/build verification does not execute real managed auth or a
+provider call. It does not activate a microphone.
+
+```sh
+cargo +1.99.1 build --offline --locked --manifest-path native/voice-probe/Cargo.toml \
+  --features subscription-voice --bin nuaai-subscription-voice --jobs 2
+cargo +1.99.1 test --offline --locked --manifest-path native/voice-probe/Cargo.toml \
+  --features subscription-voice --lib --bin nuaai-subscription-voice --jobs 2
+```
+
+Native behavior:
+
+- Same strict u32BE v1 flat JSON/limits/command IDs as the frozen offline codec;
+  hello advertises only `subscription-webrtc-v3`/`unsupported`. Offline profile
+  and its three-code contract stay unchanged. Live errors use the fixed live
+  allowlist; no upstream error bodies, SDP or credentials are logged.
+- Hello is inert. Only start reads existing native managed credentials using
+  `AuthManager::new`/`auth_cached`, Auto storage and the direct native keyring
+  backend. HOME/CODEX_HOME are trusted host paths, never JSON fields. No manual
+  credential-file parsing, forced login, refresh, logout or account writes.
+  A managed **Unavailable** auth factory exists before the constructor and is
+  never enabled. API-key/PAT/Agent/external-token auth is rejected.
+- Actual cached managed ChatGPT B becomes the static native auth provider; exact
+  single Bearer/account header binding, user identity and public persisted owner
+  checks remain mandatory. Plan metadata is NOT a local entitlement gate: the
+  service decides subscription/access/quota via its responses. Frozen auth and
+  manual owner checks are not atomic leases or refresh/freshness guarantees.
+- Fixed ChatGPT backend JSON call POST, native V3 query/session configuration,
+  bounded response131072 and deadline25s. Real answer is emitted/flushed before
+  joining the official public SDK existing-call control sideband at its default
+  `wss://api.openai.com/v1/live/{encoded-call-id}`; same frozen native auth. No
+  API-key fallback or inherited endpoint/proxy/TLS/auth override is accepted.
+- SDK Speakable append binds the actual handoff ID; delivery ID remains local
+  for exact echo. Accepted means SDK write, NOT audible playback. Partial/error
+  sends report unknown without retries. Identical handoff replay is ignored;
+  conflicting replay is fatal. IDs are retained in bounded256-entry maps;
+  at most16 queued/active result writes.
+- Actual typed user/assistant transcripts have per-role utterance IDs, UTF-8
+  byte-bound16k accumulated partials and authoritative final text. Empty deltas
+  and silent Done events cannot emit invalid empty-text frames. AudioOut and
+  unrelated SDK metadata are discarded before native owner checks; WebRTC owns
+  media. No audio/base64 crosses stdio.
+- Non-socket numeric stdio only; successful close_range(3+) before runtime.
+  Only trusted HOME/CODEX_HOME/PATH/LANG/TZ survive. FIFO I/O is nonblocking;
+  partial prefix/SDK-event futures persist across select, and interrupted
+  stdout frames finish before closed/error framing. Close/EOF cancels join or
+  pending writes, attempts SDK close once and bounds cleanup. Native read-only
+  keyring work is isolated from the reactor, with2s waits and a50ms runtime
+  shutdown cap so a stalled desktop bus cannot pin helper shutdown indefinitely.
+
+Known native-library boundary: the pinned SDK owns an internal unbounded receive
+channel. This adapter drains ignored audio cooperatively and bounds its own
+stdio, transcripts, handoff memory and result queue; it does not claim the SDK
+channel itself is bounded. No supported provider interruption API is asserted.
+
+## What executes by default
 
 The default `nuaai-voice-probe` executable resolves exported function items and
 prints a static provenance line. It does **not** call any referenced auth constructor, native store/keyring

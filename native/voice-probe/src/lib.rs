@@ -1,6 +1,8 @@
 //! Compile-only Linux feasibility probe. No auth construction or transport startup.
 
 pub mod auth_guard;
+#[cfg(feature = "subscription-voice")]
+pub mod subscription_voice;
 
 pub const UPSTREAM_COMMIT: &str = "6aaac694803004a63c6f393d153c96d22521a6b9";
 pub const PROBE_PROTOCOL: u32 = 1;
