@@ -148,6 +148,7 @@ export class NativeVoiceTransport implements VoiceTransport {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  private closingAppends = new Map<number, VoiceDeliveryContext>();
   private handoffs = new Set<string>();
   private consumed = new Set<string>();
   private deliveryIds = new Set<string>();
@@ -160,13 +161,7 @@ export class NativeVoiceTransport implements VoiceTransport {
           // Only the matching close ack can finish this bounded stop transaction.
           if (this.closeId) {
             try {
-              const frame = decode(value);
-              if (frame.type === 'closed') {
-                if (frame.commandId !== this.closeId) throw new VoiceError('VOICE_PROTOCOL_ERROR');
-                this.closed.resolve();
-              } else if (frame.type === 'error') {
-                this.closed.reject(new VoiceError(frame.code));
-              }
+              this.drain(decode(value));
             } catch {
               this.closed.reject(new VoiceError('VOICE_PROTOCOL_ERROR'));
             }
@@ -185,6 +180,54 @@ export class NativeVoiceTransport implements VoiceTransport {
       },
     );
     if (this.terminal) this.unsubscribe();
+  }
+
+  private drain(frame: FromHelper): void {
+    switch (frame.type) {
+      case 'delivery': {
+        const context = this.closingAppends.get(frame.commandId);
+        if (
+          !context ||
+          context.handoffId !== frame.handoffId ||
+          context.deliveryId !== frame.deliveryId
+        )
+          throw new VoiceError('VOICE_PROTOCOL_ERROR');
+        this.closingAppends.delete(frame.commandId);
+        return; // The canceled append stays UNKNOWN, even for a valid late ack.
+      }
+      case 'hello':
+        if (!this.helloId || this.startId || frame.commandId !== this.helloId)
+          throw new VoiceError('VOICE_PROTOCOL_ERROR');
+        this.helloId = 0;
+        return;
+      case 'answer':
+        if (!this.startId || this.answered || frame.commandId !== this.startId)
+          throw new VoiceError('VOICE_PROTOCOL_ERROR');
+        this.answered = true;
+        return;
+      case 'control_ready':
+        if (!this.answered || this.ready || frame.commandId !== this.startId)
+          throw new VoiceError('VOICE_PROTOCOL_ERROR');
+        this.ready = true;
+        return;
+      case 'handoff':
+        if (!this.ready) throw new VoiceError('VOICE_PROTOCOL_ERROR');
+        return; // Never enqueue or admit tasks during stop.
+      case 'closed':
+        if (frame.commandId !== this.closeId) throw new VoiceError('VOICE_PROTOCOL_ERROR');
+        this.closed.resolve();
+        return;
+      case 'error':
+        if (
+          frame.commandId !== undefined &&
+          frame.commandId !== this.closeId &&
+          frame.commandId !== this.helloId &&
+          frame.commandId !== this.startId &&
+          !this.closingAppends.has(frame.commandId)
+        )
+          throw new VoiceError('VOICE_PROTOCOL_ERROR');
+        this.closed.reject(new VoiceError(frame.code));
+    }
   }
 
   private command(): number {
@@ -391,12 +434,15 @@ export class NativeVoiceTransport implements VoiceTransport {
     try {
       await this.bounded(this.wire.close(), 1_500);
     } finally {
+      this.closingAppends.clear();
       this.unsubscribe();
     }
   }
   stop(): Promise<void> {
     if (this.termination) return this.termination;
     this.terminal = true;
+    for (const [commandId, pending] of this.appends)
+      this.closingAppends.set(commandId, pending.context);
     this.cancel(new VoiceError('VOICE_PROVIDER_DISCONNECTED'));
     this.termination = (async () => {
       try {

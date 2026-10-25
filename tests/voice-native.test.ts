@@ -235,6 +235,40 @@ describe('private native voice transport', () => {
     await stopped;
     expect(f.wire.close).toHaveBeenCalledOnce();
   });
+  it.each([
+    { type: 'delivery', commandId: 99, handoffId: 'a', deliveryId: 'd', status: 'accepted' },
+    { type: 'delivery', commandId: 3, handoffId: 'wrong', deliveryId: 'd', status: 'accepted' },
+    { type: 'delivery', commandId: 3, handoffId: 'a', deliveryId: 'wrong', status: 'accepted' },
+    { type: 'answer', commandId: 99, sdp: 'answer' },
+    { type: 'control_ready', commandId: 99 },
+  ])('rejects uncorrelated in-flight frame during close %j', async ({ type, ...values }) => {
+    const f = await running();
+    f.event('handoff', { handoffId: 'a', text: 'task' });
+    const delivery = f.transport.deliver('result', { handoffId: 'a', deliveryId: 'd' });
+    const unknown = expect(delivery).rejects.toMatchObject({ code: 'VOICE_DELIVERY_UNKNOWN' });
+    const stopped = expect(f.transport.stop()).rejects.toMatchObject({
+      code: 'VOICE_PROTOCOL_ERROR',
+    });
+    f.event(type, values);
+    f.event('closed', { commandId: 4 });
+    await Promise.all([unknown, stopped]);
+    expect(f.wire.close).toHaveBeenCalledOnce();
+  });
+  it('fences correlated start replies already in flight during close', async () => {
+    const f = fixture();
+    const start = f.start();
+    f.hello();
+    await Promise.resolve();
+    const canceled = expect(start).rejects.toMatchObject({ code: 'VOICE_PROVIDER_DISCONNECTED' });
+    const stopped = expect(f.transport.stop()).resolves.toBeUndefined();
+    f.answer();
+    f.ready();
+    f.event('handoff', { handoffId: 'late', text: 'must not admit' });
+    f.event('closed', { commandId: 3 });
+    await Promise.all([canceled, stopped]);
+    expect(f.events).toEqual([]);
+    expect(f.wire.close).toHaveBeenCalledOnce();
+  });
   it('bounds missing close acknowledgement and cleans the wire', async () => {
     const f = await running();
     vi.useFakeTimers();
